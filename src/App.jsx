@@ -7,8 +7,10 @@ const GH_BRANCH = "main";
 const GH_FILE   = "db.json";
 const GH_RAW    = `https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${GH_BRANCH}/${GH_FILE}`;
 // Set VITE_GH_TOKEN in Vercel env vars for write access. Reads are always public.
-// Vite exposes env vars via import.meta.env (process.env does NOT exist in the browser).
-const GH_TOKEN  = (import.meta.env?.VITE_GH_TOKEN) || "";
+// __GH_TOKEN__ is injected at build time by Vite (see vite.config.js). Inside
+// Claude artifacts the global doesn't exist — the typeof guard keeps the app
+// running with reads public and writes silently disabled.
+const GH_TOKEN  = (typeof __GH_TOKEN__ !== "undefined" && __GH_TOKEN__) || "";
 
 // ─── ENGINE MODE ───────────────────────────────────────────────────────────────
 // false = FREE MODE (default): local rules engine + Open Food Facts API + GitHub
@@ -360,27 +362,54 @@ async function callAI(prompt, maxTokens = 1500, useWeb = true) {
 // Falls back to the AI-powered lookup only when direct fetch is blocked/fails.
 const OFF_FIELDS = "product_name,brands,image_url,nutriscore_grade,nova_group,ecoscore_grade,quantity,serving_size,ingredients_text,additives_tags,allergens_tags,labels_tags,categories_tags,nutriments";
 
+let _offStatus = "ok"; // status of last direct lookup: "ok" | "nomatch" | "network"
+
+async function offJson(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+async function offByCode(code) {
+  const d = await offJson(`https://world.openfoodfacts.org/api/v2/product/${code}.json?fields=${OFF_FIELDS}`);
+  const p = d.product;
+  if (!p || !p.product_name) return null;
+  const parsed = parseOFF(p); parsed._src = "off-direct"; return parsed;
+}
+
+async function offLegacySearch(terms) {
+  const d = await offJson(`https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(terms)}&search_simple=1&action=process&json=1&page_size=1&fields=${OFF_FIELDS}`);
+  const p = d.products?.[0];
+  if (!p || !p.product_name) return null;
+  const parsed = parseOFF(p); parsed._src = "off-direct"; return parsed;
+}
+
 async function fetchOFFDirect(query) {
   const q = query.trim();
-  const isBarcode = /^\d{8,14}$/.test(q);
-  try {
-    let p = null;
-    if (isBarcode) {
-      const r = await fetch(`https://world.openfoodfacts.org/api/v2/product/${q}.json?fields=${OFF_FIELDS}`);
-      if (!r.ok) return null;
-      const d = await r.json();
-      p = d.product || null;
-    } else {
-      const r = await fetch(`https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=1&fields=${OFF_FIELDS}`);
-      if (!r.ok) return null;
-      const d = await r.json();
-      p = d.products?.[0] || null;
+  let network = 0, attempts = 0;
+  const tryStep = async (fn) => { attempts++; try { return await fn(); } catch { network++; return null; } };
+  let result = null;
+
+  if (/^\d{8,14}$/.test(q)) {
+    result = await tryStep(() => offByCode(q));
+  } else {
+    // 1) Modern OFF search (search-a-licious — far better fuzzy matching) → barcode → full product
+    result = await tryStep(async () => {
+      const s = await offJson(`https://search.openfoodfacts.org/search?q=${encodeURIComponent(q)}&page_size=3`);
+      const code = (s.hits || []).find(h => h.code)?.code;
+      return code ? offByCode(code) : null;
+    });
+    // 2) Legacy search: full phrase, then progressively shorter queries
+    if (!result) result = await tryStep(() => offLegacySearch(q));
+    if (!result) {
+      const words = q.split(/\s+/).filter(Boolean);
+      for (const n of [3, 2]) {
+        if (!result && words.length > n) result = await tryStep(() => offLegacySearch(words.slice(0, n).join(" ")));
+      }
     }
-    if (!p || !p.product_name) return null;
-    const parsed = parseOFF(p);
-    parsed._src = "off-direct"; // free API — image URL can be used as-is
-    return parsed;
-  } catch { return null; }
+  }
+  _offStatus = result ? "ok" : (attempts > 0 && network >= attempts ? "network" : "nomatch");
+  return result;
 }
 
 async function fetchOFF(query) {
@@ -1215,13 +1244,21 @@ export default function App() {
     // Brand history from the shared DB — before this scan is saved
     const bHist = offData?.brand ? brandHistory(offData.brand) : null;
 
-    toCache("scan", key, payload);
-    ghSet(key, payload, setDbCount); // Save to GitHub for all future users
+    // Only cache & persist scans that actually found something — a failed lookup
+    // must NOT poison the session cache or the shared DB for 30 days
+    const worthSaving = !!offData || allSubs.length > 0;
+    if (worthSaving) {
+      toCache("scan", key, payload);
+      ghSet(key, payload, setDbCount); // Save to GitHub for all future users
+    }
 
     const entry = { id:Date.now(), name:offData?.name||label, searchTerm:label, substances:allSubs, offData, aiSugarData, risk, diet:dietType, undeclaredCount:undeclared.length, date:new Date().toLocaleDateString() };
     setTracked(p => [entry, ...p]); setSelected(entry); setScanning(false);
 
     if (offData) toast("off",`Found "${offData.name}"${offData._src==="off-direct"?" via free Open Food Facts API":" on Open Food Facts"}.`);
+    else toast("scan", _offStatus === "network"
+      ? "Couldn't reach Open Food Facts (network/CORS blocked all attempts). Analysis is name-based only — press ↻ to retry."
+      : `No Open Food Facts match for "${label}". Analysis is based on the product name only — nothing was cached, so ↻ rescan will retry fresh.`);
     if (risk==="high") toast("high",`High risk: ${allSubs.filter(s=>s.risk==="high").map(s=>s.name).slice(0,2).join(", ")}.`);
     else if (risk==="medium") toast("medium",`Medium risk substances detected.`);
     if (undeclared.length > 0) toast("undeclared",`${offData?.brand ? offData.brand + " — " : ""}"${offData?.name||label}" may contain ${undeclared.length} substance${undeclared.length!==1?"s":""} NOT listed on the label: ${undeclared.map(s=>s.name).slice(0,3).join(", ")}.`);
@@ -1280,6 +1317,21 @@ export default function App() {
     loadInsight(entry.name, entry.substances, entry.offData?.nut, entry.offData, k);
     if (entry.offData?.brand) loadBrand(entry.offData.brand, entry.name, k);
     loadAlts(entry, k);
+  }
+
+  // Force-refresh: purge every cache layer (session, GitHub, per-feature) and rescan,
+  // so newly-added Open Food Facts data or DB fixes are picked up immediately
+  function rescan(e, entry) {
+    if (e) e.stopPropagation();
+    const term = entry.searchTerm || entry.name;
+    [nk(term), nk(entry.name)].forEach(k => {
+      ["scan","insight","brand","alts","calAlts","panelAlts"].forEach(store => { if (cache.current[store]) delete cache.current[store][k]; });
+      if (_ghDb.products) delete _ghDb.products[k]; // fresh result will re-save
+    });
+    setTracked(p => p.filter(f => f.id !== entry.id));
+    if (selected?.id === entry.id) setSelected(null);
+    toast("scan", `Rescanning "${term}" — all caches bypassed.`);
+    scan(term);
   }
 
   // ── OPEN DB STATS ────────────────────────────────────────────────────────────
@@ -1346,12 +1398,16 @@ export default function App() {
         (async () => {
           try {
             const fa = await freeAnalyze(query);
-            const k = nk(query);
-            const payload = { offData:fa.offData, aiSugarData:fa.aiSugarData, allSubs:fa.allSubs, risk:fa.risk, diet:fa.diet, undeclaredCount:fa.undeclaredCount, hitCount:1, savedAt:Date.now() };
-            toCache("scan", k, payload);
-            await ghSet(k, payload, setDbCount);
-            setSearchRes(prev => prev ? {...prev, savingToDb:false, savedToDb:true, answer:fa.offData?`Found and saved "${fa.offData.name}"${fa.offData.brand?` by ${fa.offData.brand}`:""} — ${fa.risk||"no"} risk, ${fa.allSubs.length} flagged substance${fa.allSubs.length!==1?"s":""}.`:prev.answer} : prev);
-            toast("database",`"${fa.offData?.name||query}" saved to GitHub database.`);
+            if (fa.offData || fa.allSubs.length > 0) {
+              const k = nk(query);
+              const payload = { offData:fa.offData, aiSugarData:fa.aiSugarData, allSubs:fa.allSubs, risk:fa.risk, diet:fa.diet, undeclaredCount:fa.undeclaredCount, hitCount:1, savedAt:Date.now() };
+              toCache("scan", k, payload);
+              await ghSet(k, payload, setDbCount);
+              setSearchRes(prev => prev ? {...prev, savingToDb:false, savedToDb:true, answer:fa.offData?`Found and saved "${fa.offData.name}"${fa.offData.brand?` by ${fa.offData.brand}`:""} — ${fa.risk||"no"} risk, ${fa.allSubs.length} flagged substance${fa.allSubs.length!==1?"s":""}.`:prev.answer} : prev);
+              toast("database",`"${fa.offData?.name||query}" saved to GitHub database.`);
+            } else {
+              setSearchRes(prev => prev ? {...prev, savingToDb:false, answer:`No product data found for "${query}" — nothing was saved.`} : prev);
+            }
           } catch (e) { console.warn("free bgScan:", e); }
         })();
         return;
@@ -1702,6 +1758,7 @@ export default function App() {
                           {f.offData?.nutriScore && <span style={{fontSize:9,fontWeight:700,color:"#fff",background:NS_COLOR[f.offData.nutriScore]||"#999",padding:"1px 6px",borderRadius:4}}>{f.offData.nutriScore.toUpperCase()}</span>}
                           {f.risk && <span style={{fontSize:8,fontWeight:600,color:RISK_CFG[f.risk]?.fg,background:RISK_CFG[f.risk]?.bg,border:`1px solid ${RISK_CFG[f.risk]?.border}`,padding:"1px 6px",borderRadius:4}}>{f.risk.charAt(0).toUpperCase()+f.risk.slice(1)}</span>}
                           {dc && <span title={dc.label} style={{fontSize:11,display:"inline-flex",alignItems:"center",justifyContent:"center",width:18,height:18,borderRadius:4,background:dc.bg,border:`1px solid ${dc.border}`}}>{dc.icon}</span>}
+                          <button onClick={e=>rescan(e,f)} title="Rescan — bypass all caches and fetch fresh data" style={{fontSize:11,display:"inline-flex",alignItems:"center",justifyContent:"center",width:18,height:18,borderRadius:4,background:t.pill,border:`1px solid ${t.border}`,color:t.textSub,cursor:"pointer",padding:0,lineHeight:1}}>↻</button>
                         </div>
                       </div>
                       <div style={{marginTop:4,fontSize:9,color:t.textMuted,fontFamily:"monospace"}}>
@@ -1783,6 +1840,8 @@ export default function App() {
                   <div style={{fontSize:10,fontWeight:600,color:RISK_CFG.medium.fg,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:5}}>No Open Food Facts data</div>
                   <h2 style={{margin:"0 0 5px",fontSize:18,fontWeight:700,color:t.text}}>{selected.name}</h2>
                   <div style={{fontSize:11,color:t.textSub}}>{selected.substances.length} substances detected · {selected.date}</div>
+                  <div style={{marginTop:10,fontSize:11,color:t.textMuted,lineHeight:1.6}}>Product not found — it may not be in Open Food Facts yet, the search terms may need adjusting (try the barcode number for an exact match), or the request was blocked. Failed lookups are never cached, so retrying fetches fresh.</div>
+                  <button onClick={e=>rescan(e,selected)} style={{marginTop:10,background:t.accent,border:"none",color:t.accentFg,padding:"8px 16px",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:600,display:"inline-flex",alignItems:"center",gap:7}}>↻ Rescan — bypass all caches</button>
                 </div>
                 {selected.substances.map((s,i)=>(
                   <div key={i} style={{background:t.surface,borderLeft:`3px solid ${RISK_CFG[s.risk]?.fg||"#999"}`,borderRadius:9,padding:"11px 14px",border:`1px solid ${t.border}`}}>
