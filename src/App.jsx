@@ -7,7 +7,19 @@ const GH_BRANCH = "main";
 const GH_FILE   = "db.json";
 const GH_RAW    = `https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${GH_BRANCH}/${GH_FILE}`;
 // Set VITE_GH_TOKEN in Vercel env vars for write access. Reads are always public.
-const GH_TOKEN  = (typeof process !== "undefined" && process.env?.VITE_GH_TOKEN) || "";
+// Vite exposes env vars via import.meta.env (process.env does NOT exist in the browser).
+const GH_TOKEN  = (import.meta.env?.VITE_GH_TOKEN) || "";
+
+// ─── ENGINE MODE ───────────────────────────────────────────────────────────────
+// false = FREE MODE (default): local rules engine + Open Food Facts API + GitHub
+//         cache. Zero AI calls, zero cost per scan — scales to millions of users.
+// true  = AI MODE: Anthropic API enrichment (web-researched hazards, brand
+//         research, generated insights). Costs per call — use as a premium tier.
+//         NOTE: works out-of-the-box only inside Claude artifacts; on Vercel it
+//         needs a serverless proxy for the API key. Every AI call falls back to
+//         the free engine automatically if it fails.
+// Toggleable at runtime from the ⚡ switch in the header.
+let AI_MODE = false;
 
 // ─── SEED HAZARD DB ────────────────────────────────────────────────────────────
 const SEED = {
@@ -30,6 +42,237 @@ const SEED = {
   e621:      { name:"MSG",              category:"Flavour Enhancer",     risk:"low",    eNumber:"E621", foods:["instant noodles","chips","soups"],      effects:"Headaches in sensitive individuals; GRAS",                        limit:"No ADI" },
   bha:       { name:"BHA",             category:"Preservative",         risk:"medium", eNumber:"E320", foods:["chips","crackers","cereals","butter"],  effects:"Possible carcinogen, endocrine disruptor",                        limit:"0.02% of fat" },
 };
+
+// ─── LOCAL RULES ENGINE (free — replaces per-scan AI calls) ────────────────────
+// ~50 flagged E-number additives. Matched against OFF additives_tags (confirmed)
+// and ingredient text. cat=category, fx=effects, lim=limit, m=ingredient regex.
+const ADDITIVE_DB = {
+  E102:{name:"Tartrazine",cat:"Artificial Dye",risk:"medium",fx:"Hyperactivity in children, allergic reactions",lim:"7.5 mg/kg bw/day",m:/tartrazine/},
+  E104:{name:"Quinoline Yellow",cat:"Artificial Dye",risk:"medium",fx:"Hyperactivity; restricted in EU",lim:"0.5 mg/kg bw/day",m:/quinoline yellow/},
+  E110:{name:"Sunset Yellow FCF",cat:"Artificial Dye",risk:"medium",fx:"Hyperactivity, allergic reactions",lim:"4 mg/kg bw/day",m:/sunset yellow/},
+  E120:{name:"Carmine (Cochineal)",cat:"Colour",risk:"medium",fx:"Severe allergic reactions in sensitive individuals",lim:"2.5 mg/kg bw/day",m:/carmine|cochineal/},
+  E122:{name:"Carmoisine",cat:"Artificial Dye",risk:"medium",fx:"Hyperactivity; banned in several countries",lim:"4 mg/kg bw/day",m:/carmoisine|azorubine/},
+  E124:{name:"Ponceau 4R",cat:"Artificial Dye",risk:"medium",fx:"Hyperactivity; banned in US",lim:"0.7 mg/kg bw/day",m:/ponceau/},
+  E127:{name:"Erythrosine",cat:"Artificial Dye",risk:"medium",fx:"Thyroid effects at high doses",lim:"0.1 mg/kg bw/day",m:/erythrosine/},
+  E129:{name:"Allura Red AC",cat:"Artificial Dye",risk:"medium",fx:"Hyperactivity in children",lim:"7 mg/kg bw/day",m:/allura red/},
+  E131:{name:"Patent Blue V",cat:"Artificial Dye",risk:"medium",fx:"Allergic reactions; banned in US",lim:"5 mg/kg bw/day",m:/patent blue/},
+  E132:{name:"Indigo Carmine",cat:"Artificial Dye",risk:"low",fx:"Occasional hypersensitivity",lim:"5 mg/kg bw/day",m:/indigo carmine|indigotine/},
+  E133:{name:"Brilliant Blue FCF",cat:"Artificial Dye",risk:"low",fx:"Rare allergic reactions",lim:"6 mg/kg bw/day",m:/brilliant blue/},
+  E142:{name:"Green S",cat:"Artificial Dye",risk:"medium",fx:"Hypersensitivity; banned in several countries",lim:"5 mg/kg bw/day",m:/green s\b/},
+  E150D:{name:"Caramel IV (Sulphite Ammonia)",cat:"Colour",risk:"medium",fx:"Contains 4-MEI, possible carcinogen",lim:"100 mg/kg bw/day",m:/caramel col/},
+  E151:{name:"Brilliant Black BN",cat:"Artificial Dye",risk:"medium",fx:"Hypersensitivity; banned in several countries",lim:"5 mg/kg bw/day",m:/brilliant black/},
+  E155:{name:"Brown HT",cat:"Artificial Dye",risk:"medium",fx:"Hypersensitivity, asthma reactions",lim:"1.5 mg/kg bw/day",m:/brown ht/},
+  E171:{name:"Titanium Dioxide",cat:"Colour",risk:"high",fx:"Possible carcinogen; banned in EU foods 2022",lim:"BANNED in EU",m:/titanium dioxide/},
+  E173:{name:"Aluminium",cat:"Colour",risk:"medium",fx:"Neurotoxicity concerns with accumulation",lim:"1 mg/kg bw/week",m:/aluminium powder/},
+  E210:{name:"Benzoic Acid",cat:"Preservative",risk:"medium",fx:"Forms benzene with Vit C; hypersensitivity",lim:"5 mg/kg bw/day",m:/benzoic acid/},
+  E211:{name:"Sodium Benzoate",cat:"Preservative",risk:"medium",fx:"Forms benzene with Vit C; hyperactivity",lim:"5 mg/kg bw/day",m:/sodium benzoate/},
+  E212:{name:"Potassium Benzoate",cat:"Preservative",risk:"medium",fx:"Forms benzene with Vit C",lim:"5 mg/kg bw/day",m:/potassium benzoate/},
+  E214:{name:"Parabens (Ethylparaben)",cat:"Preservative",risk:"high",fx:"Endocrine disruption; approval withdrawn in EU",lim:"Restricted",m:/paraben/},
+  E220:{name:"Sulphur Dioxide",cat:"Preservative",risk:"medium",fx:"Asthma attacks, destroys vitamin B1",lim:"0.7 mg/kg bw/day",m:/sulphur dioxide|sulfur dioxide/},
+  E221:{name:"Sodium Sulphite",cat:"Preservative",risk:"medium",fx:"Asthma and allergic reactions",lim:"0.7 mg/kg bw/day",m:/sodium sulphite|sodium sulfite/},
+  E223:{name:"Sodium Metabisulphite",cat:"Preservative",risk:"medium",fx:"Asthma, hypersensitivity reactions",lim:"0.7 mg/kg bw/day",m:/metabisulphite|metabisulfite/},
+  E249:{name:"Potassium Nitrite",cat:"Preservative",risk:"high",fx:"Forms nitrosamines, colorectal cancer risk",lim:"150 mg/kg",m:/potassium nitrite/},
+  E250:{name:"Sodium Nitrite",cat:"Preservative",risk:"high",fx:"Converts to nitrosamines; colorectal cancer risk",lim:"150 mg/kg",m:/sodium nitrite|\bnitrite\b/},
+  E251:{name:"Sodium Nitrate",cat:"Preservative",risk:"high",fx:"Converts to nitrite then nitrosamines",lim:"150 mg/kg",m:/sodium nitrate/},
+  E252:{name:"Potassium Nitrate",cat:"Preservative",risk:"high",fx:"Converts to nitrite then nitrosamines",lim:"150 mg/kg",m:/potassium nitrate|saltpetre/},
+  E310:{name:"Propyl Gallate",cat:"Preservative",risk:"medium",fx:"Possible endocrine disruptor",lim:"0.5 mg/kg bw/day",m:/propyl gallate/},
+  E319:{name:"TBHQ",cat:"Preservative",risk:"medium",fx:"Possible carcinogen at high doses, immune effects",lim:"0.7 mg/kg bw/day",m:/tbhq|tert-?butylhydroquinone/},
+  E320:{name:"BHA",cat:"Preservative",risk:"medium",fx:"Possible carcinogen, endocrine disruptor",lim:"1 mg/kg bw/day",m:/\bbha\b|butylated hydroxyanisole/},
+  E321:{name:"BHT",cat:"Preservative",risk:"medium",fx:"Possible tumor promoter, endocrine effects",lim:"0.25 mg/kg bw/day",m:/\bbht\b|butylated hydroxytoluene/},
+  E385:{name:"Calcium Disodium EDTA",cat:"Preservative",risk:"medium",fx:"Mineral depletion at high intake",lim:"1.9 mg/kg bw/day",m:/\bedta\b/},
+  E407:{name:"Carrageenan",cat:"Thickener",risk:"medium",fx:"Intestinal inflammation, possible carcinogen (degraded)",lim:"Not established",m:/carrageenan/},
+  E407A:{name:"Processed Eucheuma Seaweed",cat:"Thickener",risk:"medium",fx:"Similar concerns to carrageenan",lim:"Not established",m:/eucheuma/},
+  E425:{name:"Konjac",cat:"Thickener",risk:"medium",fx:"Choking hazard; banned in jelly sweets in EU",lim:"10 g/kg",m:/konjac/},
+  E433:{name:"Polysorbate 80",cat:"Emulsifier",risk:"medium",fx:"Gut microbiome disruption, inflammation",lim:"25 mg/kg bw/day",m:/polysorbate/},
+  E466:{name:"Carboxymethyl Cellulose",cat:"Thickener",risk:"medium",fx:"Gut microbiome disruption, inflammation",lim:"Not established",m:/carboxymethyl ?cellulose|cellulose gum/},
+  E471:{name:"Mono- and Diglycerides",cat:"Emulsifier",risk:"low",fx:"May contain trans fats; generally safe",lim:"Not established",m:/mono-? ?and di-?glycerides/},
+  E551:{name:"Silicon Dioxide",cat:"Anti-caking Agent",risk:"low",fx:"Nanoparticle accumulation concerns",lim:"Under review (EFSA)",m:/silicon dioxide|silica/},
+  E621:{name:"MSG",cat:"Flavour Enhancer",risk:"low",fx:"Headaches in sensitive individuals; GRAS",lim:"No ADI",m:/monosodium glutamate|\bmsg\b/},
+  E627:{name:"Disodium Guanylate",cat:"Flavour Enhancer",risk:"low",fx:"Avoid with gout; often paired with MSG",lim:"Not established",m:/guanylate/},
+  E631:{name:"Disodium Inosinate",cat:"Flavour Enhancer",risk:"low",fx:"Avoid with gout; often paired with MSG",lim:"Not established",m:/inosinate/},
+  E924:{name:"Potassium Bromate",cat:"Flour Treatment",risk:"high",fx:"Carcinogen; banned in EU, UK, Canada",lim:"BANNED in EU",m:/bromate/},
+  E950:{name:"Acesulfame K",cat:"Artificial Sweetener",risk:"medium",fx:"Possible metabolic effects; debated safety",lim:"9 mg/kg bw/day",m:/acesulfame/},
+  E951:{name:"Aspartame",cat:"Artificial Sweetener",risk:"medium",fx:"Possible carcinogen (IARC Group 2B, 2023)",lim:"40 mg/kg bw/day",m:/aspartame/},
+  E952:{name:"Cyclamate",cat:"Artificial Sweetener",risk:"medium",fx:"Banned in US since 1969",lim:"7 mg/kg bw/day",m:/cyclamate/},
+  E954:{name:"Saccharin",cat:"Artificial Sweetener",risk:"medium",fx:"Historical carcinogenicity concerns",lim:"5 mg/kg bw/day",m:/saccharin/},
+  E955:{name:"Sucralose",cat:"Artificial Sweetener",risk:"medium",fx:"Gut microbiome effects; unstable at high heat",lim:"15 mg/kg bw/day",m:/sucralose/},
+  E1520:{name:"Propylene Glycol",cat:"Humectant",risk:"low",fx:"Generally safe; high doses affect CNS",lim:"25 mg/kg bw/day",m:/propylene glycol/},
+};
+
+// Category contaminants — never on labels, flagged as unconfirmed (→ undeclared alerts)
+const CONTAMINANT_RULES = [
+  [/\brice\b/, "arsenic"],
+  [/\btuna\b|swordfish|shark|king mackerel|marlin|bigeye/, "mercury"],
+  [/french fries|\bfries\b|crisps|potato chips|coffee|biscuit|cracker|cookie|toast/, "acrylamide"],
+  [/peanut|groundnut|pistachio|\bcorn\b|maize|chilli powder|chili powder|nutmeg/, "aflatoxin"],
+  [/\bcanned\b|\btinned\b/, "bpa"],
+  [/microwave popcorn|fast.?food/, "pfas"],
+  [/\bwheat\b|\boats?\b|\bbarley\b/, "glyphosate"],
+];
+
+function localHazards(name, ingredients, additives = [], categories = []) {
+  const found = {};
+  const ingr = (ingredients || "").toLowerCase();
+  const mk = (eKey, rec, confirmed, via) => ({
+    key: eKey.toLowerCase(), id: eKey.toLowerCase(), name: rec.name, eNumber: eKey,
+    category: rec.cat, risk: rec.risk, effects: rec.fx, limit: rec.lim,
+    foundInIngredient: via, ingredientConfirmed: confirmed,
+    sourceUrl: `https://world.openfoodfacts.org/additive/${eKey.toLowerCase()}`, sourceName: "Open Food Facts",
+    source: "local",
+  });
+  // 1. E-numbers declared in OFF additives_tags → confirmed
+  (additives || []).forEach(tag => {
+    const e = tag.replace(/^en:/, "").toUpperCase();
+    if (ADDITIVE_DB[e] && !found[e]) found[e] = mk(e, ADDITIVE_DB[e], true, "declared additives");
+  });
+  // 2. E-numbers / names present in ingredient text → confirmed
+  if (ingr) Object.entries(ADDITIVE_DB).forEach(([e, rec]) => {
+    if (found[e]) return;
+    if (ingr.includes(e.toLowerCase()) || (rec.m && rec.m.test(ingr)) || ingr.includes(rec.name.toLowerCase()))
+      found[e] = mk(e, rec, true, rec.name);
+  });
+  // 3. Category-level contaminants → NOT confirmed (feeds undeclared alerts)
+  const hay = (name + " " + ingr + " " + (categories || []).join(" ")).toLowerCase();
+  CONTAMINANT_RULES.forEach(([re, seedKey]) => {
+    if (re.test(hay) && SEED[seedKey] && !found[seedKey]) {
+      const s = SEED[seedKey];
+      found[seedKey] = { key: seedKey, id: seedKey, name: s.name, eNumber: s.eNumber, category: s.category, risk: s.risk, effects: s.effects, limit: s.limit, foundInIngredient: null, ingredientConfirmed: false, sourceUrl: null, sourceName: "Category pattern", source: "local" };
+    }
+  });
+  return Object.values(found);
+}
+
+// Glycemic index estimation by food keyword (per 100g, typical published values)
+const GI_TABLE = [
+  [/glucose|dextrose/,100],[/soda|cola|soft drink/,63],[/juice/,50],[/candy|sweets|gumm/,70],
+  [/white bread|bread|\bbun\b|bagel/,72],[/\brice\b/,70],[/corn ?flakes|breakfast cereal|cereal/,74],
+  [/chocolate/,45],[/cookie|biscuit/,60],[/ice ?cream/,60],[/pasta|noodle/,50],
+  [/yogh?urt/,35],[/\bmilk\b/,32],[/apple|pear|berr/,38],[/banana/,51],
+  [/potato|fries|chips|crisps/,70],[/honey/,58],[/pizza/,60],[/\boats?\b/,55],
+];
+
+function localSugar(offData, name) {
+  const sugars = offData?.nut?.sugars ?? null;
+  if (sugars == null) return null;
+  const hay = (name + " " + (offData?.categories || []).join(" ")).toLowerCase();
+  let gi = null;
+  for (const [re, v] of GI_TABLE) { if (re.test(hay)) { gi = v; break; } }
+  const added = offData?.nut?.added_sugars ?? null;
+  const diabeticRisk = sugars > 22.5 || (gi ?? 0) >= 70 ? "high" : sugars > 11.25 || (gi ?? 0) >= 56 ? "medium" : "low";
+  return { total_sugars: sugars, added_sugars: added, natural_sugars: added != null ? +(sugars - added).toFixed(1) : null, gi: gi ?? 55, diabeticRisk };
+}
+
+function localInsight(name, subs, nut, offData) {
+  const conf = (subs || []).filter(s => s.ingredientConfirmed !== false);
+  const und  = (subs || []).filter(s => s.ingredientConfirmed === false);
+  const parts = [];
+  if (conf.length) {
+    const high = conf.filter(s => s.risk === "high");
+    const names = conf.slice(0, 3).map(s => s.name).join(", ");
+    parts.push(high.length
+      ? `${name} contains ${high.length} high-risk substance${high.length !== 1 ? "s" : ""} (${high.slice(0,2).map(s=>s.name).join(", ")}) — regular consumption is best avoided.`
+      : `${name} contains ${conf.length} flagged additive${conf.length !== 1 ? "s" : ""} (${names}), generally considered acceptable in moderation.`);
+  } else parts.push(`No hazardous substances were confirmed in the ingredient list of ${name}.`);
+  if (und.length) parts.push(`${und.length} potential contaminant${und.length !== 1 ? "s" : ""} (${und.slice(0,2).map(s=>s.name).join(", ")}) ${und.length !== 1 ? "are" : "is"} associated with this food category but not declared on the label.`);
+  const sugars = nut?.sugars ?? null;
+  if (sugars != null) parts.push(sugars > 22.5 ? `At ${sugars}g of sugar per 100g this is a high-sugar product — limit portions, especially for diabetics.` : sugars > 11.25 ? `Sugar content is moderate at ${sugars}g per 100g.` : `Sugar content is low at ${sugars}g per 100g.`);
+  const ns = offData?.nutriScore, nova = offData?.novaGroup;
+  if (ns || nova) {
+    const bits = [];
+    if (ns) bits.push(`Nutri-Score ${ns.toUpperCase()}`);
+    if (nova) bits.push(`NOVA group ${nova}${nova === 4 ? " (ultra-processed)" : ""}`);
+    parts.push(`${bits.join(" and ")} overall${(ns && "de".includes(ns)) || nova === 4 ? " — prefer less processed alternatives where possible" : ""}.`);
+  }
+  return parts.join(" ");
+}
+
+function localBrandCred(brand, tracked) {
+  const stats = computeBrandStats(tracked || []).find(b => b.brand.toLowerCase() === brand.toLowerCase());
+  if (!stats) return null;
+  return {
+    score: Math.round(stats.score), verdict: stats.verdict, founded: null, headquarters: null,
+    certifications: [],
+    controversies: stats.undeclared > 0 ? [`${stats.undeclared} undeclared-substance report${stats.undeclared !== 1 ? "s" : ""} in community data`] : [],
+    positives: (stats.ns.a + stats.ns.b) > 0 ? [`${stats.ns.a + stats.ns.b} product${stats.ns.a + stats.ns.b !== 1 ? "s" : ""} rated Nutri-Score A/B`] : [],
+    summary: `Community rating from ${stats.count} scanned product${stats.count !== 1 ? "s" : ""}: ${stats.high} high-risk, ${stats.undeclared} undeclared substance report${stats.undeclared !== 1 ? "s" : ""}. Based on your scans and the shared database — not AI web research.`,
+    transparency: stats.undeclared === 0 ? "High" : stats.undeclared <= 2 ? "Medium" : "Low",
+    recallHistory: "Unknown",
+  };
+}
+
+// Free healthier alternatives via the Open Food Facts search API
+async function fetchOFFAlternatives(categories, excludeName) {
+  const cat = (categories || [])[0];
+  if (!cat) return [];
+  const catTag = cat.includes(":") ? cat : "en:" + cat;
+  const grab = async (grades) => {
+    try {
+      const r = await fetch(`https://world.openfoodfacts.org/api/v2/search?categories_tags=${encodeURIComponent(catTag)}&nutrition_grades_tags=${grades}&fields=product_name,brands,nutriscore_grade,nutriments&page_size=8&sort_by=unique_scans_n`);
+      if (!r.ok) return [];
+      const d = await r.json();
+      return d.products || [];
+    } catch { return []; }
+  };
+  let prods = await grab("a");
+  if (prods.length < 3) prods = [...prods, ...(await grab("b"))];
+  const seen = new Set(); const ex = (excludeName || "").toLowerCase();
+  return prods
+    .filter(p => { const nm = (p.product_name || "").trim().toLowerCase(); if (!nm || nm === ex || seen.has(nm)) return false; seen.add(nm); return true; })
+    .slice(0, 3)
+    .map(p => {
+      const n = p.nutriments || {}; const sg = n["sugars_100g"]; const fb = n["fiber_100g"];
+      return {
+        name: p.product_name.trim(), brand: (p.brands || "").split(",")[0].trim() || null,
+        reason: `Nutri-Score ${(p.nutriscore_grade || "a").toUpperCase()} option in the same category${sg != null ? ` with ${fmt(Number(sg))}g sugars per 100g` : ""}.`,
+        improvements: [sg != null && sg < 5 ? "Low sugar" : null, fb != null && fb > 3 ? "High fibre" : null, "Better Nutri-Score"].filter(Boolean),
+        nutriScore: p.nutriscore_grade || "a", sourceUrl: null, sourceName: "Open Food Facts",
+      };
+    });
+}
+
+// Free calorie-matched whole-food alternatives via OFF category search
+async function fetchOFFCalorieAlts(kcal) {
+  if (kcal == null) return [];
+  const cats = ["en:fruits", "en:vegetables", "en:nuts", "en:legumes", "en:cereals-and-potatoes"];
+  const out = []; const seen = new Set();
+  for (const c of cats) {
+    try {
+      const r = await fetch(`https://world.openfoodfacts.org/api/v2/search?categories_tags=${c}&nutrition_grades_tags=a&fields=product_name,brands,nutriscore_grade,nutriments&page_size=12&sort_by=unique_scans_n`);
+      if (!r.ok) continue;
+      const d = await r.json();
+      (d.products || []).forEach(p => {
+        const n = p.nutriments || {}; const e = n["energy-kcal_100g"];
+        if (e == null || Math.abs(e - kcal) > 50) return;
+        const nm = (p.product_name || "").trim();
+        if (!nm || seen.has(nm.toLowerCase())) return;
+        seen.add(nm.toLowerCase());
+        const num = (k) => (n[k] != null && n[k] !== "" ? Number(n[k]) : null);
+        const sg = num("sugars_100g"), fb = num("fiber_100g"), pr = num("proteins_100g"), ft = num("fat_100g");
+        out.push({
+          name: nm, calories: Math.round(Number(e)), caloriesPer: "100g",
+          brand: (p.brands || "").split(",")[0].trim() || null, category: c.replace("en:", ""),
+          protein: pr, sugars: sg, fiber: fb, fat: ft,
+          whyBetter: `Nutri-Score A whole-food option at ${Math.round(Number(e))} kcal per 100g.`,
+          benefits: [fb != null && fb > 3 ? "High fibre" : null, sg != null && sg < 5 ? "Low sugar" : null, pr != null && pr > 5 ? "Protein source" : null].filter(Boolean),
+          nutriScore: p.nutriscore_grade || "a", sourceUrl: null, sourceName: "Open Food Facts",
+        });
+      });
+    } catch {}
+    if (out.length >= 10) break;
+  }
+  return out.sort((a, b) => (b.fiber || 0) - (a.fiber || 0)).slice(0, 7);
+}
+
+// One free end-to-end product analysis (used by scan + background search scans)
+async function freeAnalyze(label) {
+  const offData = await fetchOFF(label).catch(() => null);
+  const allSubs = localHazards(offData?.name || label, offData?.ingredients || null, offData?.additives || [], offData?.categories || []);
+  const aiSugarData = localSugar(offData, offData?.name || label);
+  const dietType = await aiDietClassify(offData?.name || label, offData?.ingredients || null, offData?.labels || [], offData?.allergens || []).catch(() => "unknown");
+  const risk = getRisk(allSubs);
+  const undeclared = offData?.ingredients ? allSubs.filter(s => s.ingredientConfirmed === false) : [];
+  return { offData, aiSugarData, allSubs, risk, diet: dietType, undeclared, undeclaredCount: undeclared.length };
+}
 
 // ─── CONSTANTS ─────────────────────────────────────────────────────────────────
 const RISK_CFG = {
@@ -112,7 +355,42 @@ async function callAI(prompt, maxTokens = 1500, useWeb = true) {
   return lastText(d);
 }
 
+// ─── FREE OPEN FOOD FACTS API (no key, no cost) ────────────────────────────────
+// Direct REST calls to world.openfoodfacts.org — completely free & CORS-enabled.
+// Falls back to the AI-powered lookup only when direct fetch is blocked/fails.
+const OFF_FIELDS = "product_name,brands,image_url,nutriscore_grade,nova_group,ecoscore_grade,quantity,serving_size,ingredients_text,additives_tags,allergens_tags,labels_tags,categories_tags,nutriments";
+
+async function fetchOFFDirect(query) {
+  const q = query.trim();
+  const isBarcode = /^\d{8,14}$/.test(q);
+  try {
+    let p = null;
+    if (isBarcode) {
+      const r = await fetch(`https://world.openfoodfacts.org/api/v2/product/${q}.json?fields=${OFF_FIELDS}`);
+      if (!r.ok) return null;
+      const d = await r.json();
+      p = d.product || null;
+    } else {
+      const r = await fetch(`https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=1&fields=${OFF_FIELDS}`);
+      if (!r.ok) return null;
+      const d = await r.json();
+      p = d.products?.[0] || null;
+    }
+    if (!p || !p.product_name) return null;
+    const parsed = parseOFF(p);
+    parsed._src = "off-direct"; // free API — image URL can be used as-is
+    return parsed;
+  } catch { return null; }
+}
+
 async function fetchOFF(query) {
+  const direct = await fetchOFFDirect(query);
+  if (direct) return direct;
+  if (!AI_MODE) return null; // free mode: no AI fallback
+  return fetchOFFviaAI(query); // fallback (e.g. sandboxed previews that block cross-origin fetch)
+}
+
+async function fetchOFFviaAI(query) {
   const isBarcode = /^\d{8,14}$/.test(query.trim());
   const nutFields = `{"energy-kcal_100g":null,"fat_100g":null,"saturated-fat_100g":null,"carbohydrates_100g":null,"sugars_100g":null,"added-sugars_100g":null,"fiber_100g":null,"proteins_100g":null,"salt_100g":null,"sodium_100g":null,"energy-kcal_serving":null,"fat_serving":null,"carbohydrates_serving":null,"sugars_serving":null,"proteins_serving":null,"salt_serving":null}`;
   const prompt = isBarcode
@@ -124,7 +402,9 @@ async function fetchOFF(query) {
     if (!m) return null;
     const p = JSON.parse(m[0]);
     if (!p.product_name) return null;
-    return parseOFF(p);
+    const parsed = parseOFF(p);
+    parsed._src = "off-ai";
+    return parsed;
   } catch { return null; }
 }
 
@@ -226,7 +506,7 @@ async function aiDietClassify(name, ingredients, labels, allergens) {
   if (isVegLbl && !hasFish) return "vegetarian";
   if (!hasMeat && !hasFish && !hasDairy && !hasEgg && !hasHoney && ingredients && ingredients.length > 20) return "vegan";
   if (!hasMeat && !hasFish && (hasDairy || hasEgg)) return "vegetarian";
-  if (!ingredients) return "unknown";
+  if (!ingredients || !AI_MODE) return "unknown";
   try {
     const txt = await callAI(`Product: "${name}". Ingredients: "${(ingredients || "").slice(0, 300)}". Return ONE word: vegan, vegetarian, pescatarian, meat, or unknown.`, 30, false);
     const ans = txt.trim().toLowerCase().replace(/[^a-z]/g, "");
@@ -310,6 +590,61 @@ async function ghSet(ck, data, setDbCount) {
   } catch (e) { console.warn("ghSet:", e); }
 }
 
+// ─── BRAND RATINGS ─────────────────────────────────────────────────────────────
+function undeclaredOf(rec) {
+  // Substances documented for the product but NOT found on its ingredient label
+  if (rec.undeclaredCount != null) return rec.undeclaredCount;
+  if (!rec.offData?.ingredients) return 0;
+  const subs = rec.allSubs || rec.substances || [];
+  return subs.filter(s => s.ingredientConfirmed === false).length;
+}
+
+function brandScoreOf(b) {
+  // Per-product weighted penalty → 0-10 score
+  const penalty = (b.high * 2 + b.medium * 0.75 + b.undeclared * 1.5 + b.ns.c * 0.5 + b.ns.d * 1 + b.ns.e * 1.5) / Math.max(1, b.count);
+  const score = Math.max(0, Math.min(10, +(10 - penalty * 2.2).toFixed(1)));
+  const verdict = score >= 8 ? "Excellent" : score >= 6 ? "Good" : score >= 4 ? "Average" : score >= 2 ? "Poor" : "Concerning";
+  return { score, verdict };
+}
+
+function computeBrandStats(tracked) {
+  const map = {}; const seen = new Set();
+  const push = (brand, rec) => {
+    const bk = brand.toLowerCase().trim();
+    if (!map[bk]) map[bk] = { brand, count:0, high:0, medium:0, low:0, undeclared:0, ns:{a:0,b:0,c:0,d:0,e:0}, hits:0, products:[] };
+    const b = map[bk];
+    b.count++; b.hits += rec.hitCount || 1;
+    if (rec.risk === "high") b.high++; else if (rec.risk === "medium") b.medium++; else if (rec.risk === "low") b.low++;
+    const und = undeclaredOf(rec); b.undeclared += und;
+    const ns = rec.offData?.nutriScore; if (ns && b.ns[ns] != null) b.ns[ns]++;
+    b.products.push({ name: rec.offData?.name || rec.name || "Unknown", risk: rec.risk || null, ns: ns || null, undeclared: und });
+  };
+  tracked.forEach(f => {
+    if (!f.offData?.brand) return;
+    const k = (f.offData.brand + "|" + (f.offData.name || f.name || "")).toLowerCase();
+    if (!seen.has(k)) { seen.add(k); push(f.offData.brand, f); }
+  });
+  Object.values(_ghDb.products || {}).forEach(rec => {
+    if (!rec.offData?.brand) return;
+    const k = (rec.offData.brand + "|" + (rec.offData.name || "")).toLowerCase();
+    if (!seen.has(k)) { seen.add(k); push(rec.offData.brand, rec); }
+  });
+  return Object.values(map).map(b => ({ ...b, ...brandScoreOf(b) })).sort((a, z) => z.score - a.score || z.count - a.count);
+}
+
+function brandHistory(brand) {
+  // Prior record of a brand across the shared DB (for scan-time alerts)
+  if (!brand) return null;
+  const bl = brand.toLowerCase().trim();
+  const recs = Object.values(_ghDb.products || {}).filter(p => (p.offData?.brand || "").toLowerCase().trim() === bl);
+  if (!recs.length) return null;
+  return {
+    count: recs.length,
+    undeclared: recs.reduce((a, p) => a + undeclaredOf(p), 0),
+    high: recs.filter(p => p.risk === "high").length,
+  };
+}
+
 function ghLogSearch(query, category) {
   if (!_ghDb.searchLog) _ghDb.searchLog = [];
   _ghDb.searchLog.unshift({ query, category, at: Date.now() });
@@ -341,8 +676,8 @@ function FoodBg() {
 
 // ─── TOAST ─────────────────────────────────────────────────────────────────────
 function Toast({ items, onDismiss, t }) {
-  const colors = { off:"#2e7d52", high:"#c0392b", medium:"#b07d2b", sugar:"#3d6b99", cache:"#6b7cff", shared:"#3d52c4", database:"#2e7d52", scan:"#3d52c4" };
-  const labels = { off:"Open Food Facts", high:"High Risk", medium:"Medium Risk", sugar:"Sugar Alert", cache:"Cached", shared:"Shared DB", database:"GitHub DB", scan:"AI Scan" };
+  const colors = { off:"#2e7d52", high:"#c0392b", medium:"#b07d2b", sugar:"#3d6b99", cache:"#6b7cff", shared:"#3d52c4", database:"#2e7d52", scan:"#3d52c4", undeclared:"#c0392b", brand:"#8a3a1a" };
+  const labels = { off:"Open Food Facts", high:"High Risk", medium:"Medium Risk", sugar:"Sugar Alert", cache:"Cached", shared:"Shared DB", database:"GitHub DB", scan:"AI Scan", undeclared:"Undeclared Substance", brand:"Brand Alert" };
   return (
     <div style={{position:"fixed",top:16,right:16,zIndex:9999,display:"flex",flexDirection:"column",gap:8,maxWidth:340,pointerEvents:"none"}}>
       {items.map(n => {
@@ -465,7 +800,7 @@ function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, br
       <div style={{...card}}>
         <div style={{display:"flex",flexWrap:"wrap"}}>
           <div style={{width:156,minHeight:156,background:dark?"#1a1c20":"#f8f7f5",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,borderRight:`1px solid ${t.border}`,overflow:"hidden"}}>
-            {offData.image && offData.image.startsWith("data:image/")
+            {offData.image && (offData.image.startsWith("data:image/") || offData.image.startsWith("http"))
               ? <img src={offData.image} alt={offData.name} style={{width:"100%",height:156,objectFit:"contain",padding:10,boxSizing:"border-box"}}/>
               : <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6,padding:14,textAlign:"center"}}><span style={{fontSize:34,opacity:0.2}}>🛒</span><span style={{fontSize:9,color:t.textMuted,lineHeight:1.5}}>No image</span></div>
             }
@@ -511,6 +846,31 @@ function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, br
           </div>
         </div>
       </div>
+
+      {/* UNDECLARED SUBSTANCE WARNING */}
+      {offData.ingredients && (() => {
+        const und = substances.filter(s => s.ingredientConfirmed === false);
+        if (und.length === 0) return null;
+        return (
+          <div style={{background:dark?"rgba(192,57,43,0.09)":"rgba(192,57,43,0.05)",border:"1.5px solid rgba(192,57,43,0.35)",borderRadius:12,padding:"14px 16px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+              <span style={{fontSize:15}}>⚠️</span>
+              <span style={{fontSize:11,fontWeight:700,color:"#c0392b",letterSpacing:"0.06em",textTransform:"uppercase"}}>Substances not listed on the label</span>
+            </div>
+            <div style={{fontSize:12,color:t.textSub,lineHeight:1.7,marginBottom:10}}>
+              {und.length} substance{und.length!==1?"s are":" is"} documented for this product{offData.brand?` by ${offData.brand}`:""} but do{und.length===1?"es":""} not appear in its declared ingredient list. This may indicate contamination, packaging migration, or incomplete labelling.
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+              {und.map((s,i) => (
+                <span key={i} style={{display:"inline-flex",alignItems:"center",gap:5,fontSize:11,fontWeight:600,color:"#c0392b",background:"rgba(192,57,43,0.1)",border:"1px solid rgba(192,57,43,0.25)",padding:"4px 11px",borderRadius:6}}>
+                  {s.name}{s.eNumber?` · ${s.eNumber}`:""}
+                  <span style={{fontSize:9,fontWeight:500,color:t.textMuted}}>({s.risk} risk)</span>
+                </span>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* BRAND CREDIBILITY */}
       <BrandCard cred={brandCred} brand={offData.brand} loading={brandCredLoading} t={t}/>
@@ -691,7 +1051,7 @@ function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, br
 
       {/* AI SAFETY ANALYSIS */}
       <div style={{...card}}>
-        <div style={{...sHdr}}>AI Safety Analysis</div>
+        <div style={{...sHdr}}>{AI_MODE?"AI Safety Analysis":"Safety Analysis"}</div>
         <div style={{padding:"14px 16px"}}>
           {insightLoading
             ? <div style={{color:t.textMuted,fontSize:12,fontStyle:"italic",animation:"pulse 1.4s ease infinite"}}>Generating analysis…</div>
@@ -700,7 +1060,7 @@ function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, br
           }
         </div>
       </div>
-      <div style={{fontSize:9,color:t.textMuted,lineHeight:1.7,paddingBottom:4}}>Data from Open Food Facts · Brand research by AI · Educational purposes only.</div>
+      <div style={{fontSize:9,color:t.textMuted,lineHeight:1.7,paddingBottom:4}}>Data from Open Food Facts · {AI_MODE?"Brand research by AI":"Free local engine — zero AI cost"} · Educational purposes only.</div>
     </div>
   );
 }
@@ -713,6 +1073,7 @@ export default function App() {
   const [scanning,setScanning]   = useState(false);
   const [filterRisk,setFilterRisk] = useState("all");
   const [dark,setDark]           = useState(false);
+  const [aiMode,setAiMode]       = useState(AI_MODE);
   const [toasts,setToasts]       = useState([]);
   const [insight,setInsight]     = useState("");
   const [insightLoading,setInsightLoading] = useState(false);
@@ -751,6 +1112,13 @@ export default function App() {
     setTimeout(() => setToasts(p => p.filter(n => n.id !== id)), 6000);
   };
 
+  const toggleAI = () => {
+    AI_MODE = !AI_MODE; setAiMode(AI_MODE);
+    toast("scan", AI_MODE
+      ? "AI mode on — scans use the Anthropic API (needs a backend proxy outside Claude; falls back to the free engine if calls fail)."
+      : "Free mode — local rules engine + Open Food Facts. Zero cost per scan.");
+  };
+
   const ck = (s) => cache.current;
   const fromCache = (store, key) => cache.current[store]?.[key] ?? null;
   const toCache   = (store, key, val) => { cache.current[store] = cache.current[store] || {}; cache.current[store][key] = val; };
@@ -784,52 +1152,80 @@ export default function App() {
       ghSet(key, { ...ghRec, hitCount:(ghRec.hitCount||0)+1 }, setDbCount);
       setTracked(p => [entry, ...p]); setSelected(entry); setScanning(false);
       toast("shared",`From shared database · searched ${entry.hitCount} time${entry.hitCount!==1?"s":""}`);
+      const undGh = undeclaredOf(ghRec);
+      if (undGh > 0) toast("undeclared",`"${entry.name}" may contain ${undGh} substance${undGh!==1?"s":""} not listed on its label.`);
       loadInsight(entry.name, ghRec.allSubs, ghRec.offData?.nut, ghRec.offData, key);
       if(ghRec.offData?.brand) loadBrand(ghRec.offData.brand, entry.name, key);
       if(ghRec.alts) setAlternatives(ghRec.alts); else loadAlts(entry, key);
       return;
     }
 
-    // 3. Full AI scan
-    const [offData, aiSubs, aiSugarData] = await Promise.all([
-      fetchOFF(label).catch(() => null),
-      aiHazards(label, null).catch(() => []),
-      aiSugar(label).catch(() => null),
-    ]);
+    // 3. Full scan — free local engine by default, AI enrichment when AI_MODE
+    let offData, aiSugarData, allSubs, undeclared, dietType;
 
-    // Fetch image as base64 if available
-    if (offData?.image && !offData.image.startsWith("data:")) {
-      const b64 = await fetchImageB64(offData.image).catch(() => null);
-      if (b64 && offData) offData.image = b64;
-    }
+    if (!AI_MODE) {
+      // FREE PATH: Open Food Facts + local rules engine. Zero cost per scan.
+      const fa = await freeAnalyze(label);
+      offData = fa.offData; aiSugarData = fa.aiSugarData; allSubs = fa.allSubs;
+      undeclared = fa.undeclared; dietType = fa.diet;
+    } else {
+      // AI PATH: web-researched hazards, sugar data, base64 images
+      const [off, aiSubs, sug] = await Promise.all([
+        fetchOFF(label).catch(() => null),
+        aiHazards(label, null).catch(() => []),
+        aiSugar(label).catch(() => null),
+      ]);
+      offData = off; aiSugarData = sug;
 
-    let finalSubs = aiSubs;
-    if (offData?.ingredients && aiSubs.length === 0) {
-      finalSubs = await aiHazards(offData.name, offData.ingredients).catch(() => []);
+      // Image: direct OFF URLs render as-is (free); only AI-sourced lookups need base64 conversion
+      if (offData?.image && !offData.image.startsWith("data:") && offData._src !== "off-direct") {
+        const b64 = await fetchImageB64(offData.image).catch(() => null);
+        if (b64 && offData) offData.image = b64;
+      }
+
+      let finalSubs = aiSubs;
+      if (offData?.ingredients && aiSubs.length === 0) {
+        finalSubs = await aiHazards(offData.name, offData.ingredients).catch(() => []);
+      }
+      allSubs = finalSubs.filter(s => s.key && s.name).map(s => ({...s, id:s.key, source:"ai"}));
+
+      // Safety net: union AI results with the free local engine, so a failed or
+      // empty AI response never blanks the hazard analysis
+      const localSubs = localHazards(offData?.name||label, offData?.ingredients||null, offData?.additives||[], offData?.categories||[]);
+      const have = new Set(allSubs.map(s => (s.key||s.id||"").toLowerCase()));
+      localSubs.forEach(s => { if (!have.has(s.key)) allSubs.push(s); });
+      if (!aiSugarData) aiSugarData = localSugar(offData, offData?.name||label);
+
+      // Undeclared: documented for this product but NOT on its ingredient label
+      undeclared = offData?.ingredients ? allSubs.filter(s => s.ingredientConfirmed === false) : [];
+      dietType = await aiDietClassify(offData?.name||label, offData?.ingredients||null, offData?.labels||[], offData?.allergens||[]).catch(() => "unknown");
     }
-    const allSubs = finalSubs.filter(s => s.key && s.name).map(s => ({...s, id:s.key, source:"ai"}));
 
     // Merge new substances into local hazard DB
     setHazardDb(prev => {
       const next = {...prev}; let added = 0;
-      allSubs.forEach(s => { const k=s.key||s.id; if(k&&!next[k]){next[k]={...s,source:"ai"};added++;} });
+      allSubs.forEach(s => { const k=s.key||s.id; if(k&&!next[k]){next[k]={...s,source:s.source||"ai"};added++;} });
       if(added) toast("scan",`${added} substance${added!==1?"s":""} added to local database.`);
       return next;
     });
 
-    const dietType = await aiDietClassify(offData?.name||label, offData?.ingredients||null, offData?.labels||[], offData?.allergens||[]).catch(() => "unknown");
     const risk = getRisk(allSubs);
-    const payload = { offData, aiSugarData, allSubs, risk, diet:dietType, hitCount:1, savedAt:Date.now() };
+    const payload = { offData, aiSugarData, allSubs, risk, diet:dietType, undeclaredCount:undeclared.length, hitCount:1, savedAt:Date.now() };
+
+    // Brand history from the shared DB — before this scan is saved
+    const bHist = offData?.brand ? brandHistory(offData.brand) : null;
 
     toCache("scan", key, payload);
     ghSet(key, payload, setDbCount); // Save to GitHub for all future users
 
-    const entry = { id:Date.now(), name:offData?.name||label, searchTerm:label, substances:allSubs, offData, aiSugarData, risk, diet:dietType, date:new Date().toLocaleDateString() };
+    const entry = { id:Date.now(), name:offData?.name||label, searchTerm:label, substances:allSubs, offData, aiSugarData, risk, diet:dietType, undeclaredCount:undeclared.length, date:new Date().toLocaleDateString() };
     setTracked(p => [entry, ...p]); setSelected(entry); setScanning(false);
 
-    if (offData) toast("off",`Found "${offData.name}" on Open Food Facts.`);
+    if (offData) toast("off",`Found "${offData.name}"${offData._src==="off-direct"?" via free Open Food Facts API":" on Open Food Facts"}.`);
     if (risk==="high") toast("high",`High risk: ${allSubs.filter(s=>s.risk==="high").map(s=>s.name).slice(0,2).join(", ")}.`);
     else if (risk==="medium") toast("medium",`Medium risk substances detected.`);
+    if (undeclared.length > 0) toast("undeclared",`${offData?.brand ? offData.brand + " — " : ""}"${offData?.name||label}" may contain ${undeclared.length} substance${undeclared.length!==1?"s":""} NOT listed on the label: ${undeclared.map(s=>s.name).slice(0,3).join(", ")}.`);
+    if (bHist && (bHist.undeclared > 0 || bHist.high >= 2)) toast("brand",`${offData.brand}: ${bHist.undeclared > 0 ? `${bHist.undeclared} undeclared-substance report${bHist.undeclared!==1?"s":""}` : `${bHist.high} high-risk products`} across ${bHist.count} product${bHist.count!==1?"s":""} in the shared database.`);
     const sugar = offData?.nut?.sugars ?? aiSugarData?.total_sugars ?? null;
     if (sugar != null && sugar > 22.5) toast("sugar",`High sugar: ${sugar}g per 100g.`);
 
@@ -843,7 +1239,8 @@ export default function App() {
     const cached = fromCache("insight", k);
     if (cached) { setInsight(cached); setInsightLoading(false); return; }
     setInsightLoading(true); setInsight("");
-    const txt = await aiInsight(name, subs, nut, offData);
+    let txt = AI_MODE ? await aiInsight(name, subs, nut, offData) : localInsight(name, subs, nut, offData);
+    if (AI_MODE && (!txt || txt === "Analysis unavailable.")) txt = localInsight(name, subs, nut, offData); // fallback
     toCache("insight", k, txt);
     setInsight(txt); setInsightLoading(false);
   }
@@ -853,7 +1250,8 @@ export default function App() {
     const cached = fromCache("brand", k);
     if (cached) { setBrandCred(cached); setBrandCredLoading(false); return; }
     setBrandCredLoading(true);
-    const cred = await aiBrandCredibility(brand, productName).catch(() => null);
+    let cred = AI_MODE ? await aiBrandCredibility(brand, productName).catch(() => null) : localBrandCred(brand, tracked);
+    if (!cred) cred = localBrandCred(brand, tracked); // fallback: community data
     toCache("brand", k, cred);
     setBrandCred(cred); setBrandCredLoading(false);
   }
@@ -865,7 +1263,10 @@ export default function App() {
     const cached = fromCache("alts", k);
     if (cached) { setAlternatives(cached); return; }
     setAltLoading(true);
-    const alts = await aiAlternatives(entry.name, entry.offData?.brand, entry.offData?.nutriScore, entry.risk, entry.offData?.ingredients).catch(() => []);
+    let alts = AI_MODE
+      ? await aiAlternatives(entry.name, entry.offData?.brand, entry.offData?.nutriScore, entry.risk, entry.offData?.ingredients).catch(() => [])
+      : await fetchOFFAlternatives(entry.offData?.categories, entry.name).catch(() => []);
+    if (AI_MODE && (!alts || !alts.length)) alts = await fetchOFFAlternatives(entry.offData?.categories, entry.name).catch(() => []); // fallback
     toCache("alts", k, alts);
     setAlternatives(alts); setAltLoading(false);
     // Also persist alts to GitHub DB
@@ -921,6 +1322,44 @@ export default function App() {
       setSearchLoading(false); ghLogSearch(query,"database"); return;
     }
 
+    // FREE MODE: answer locally from your scans + shared DB, no AI call
+    if (!AI_MODE) {
+      const trackedMatches = summary.filter(f =>
+        f.name.toLowerCase().includes(qLow) || (f.brand||"").toLowerCase().includes(qLow) ||
+        (qLow.includes("high risk") && f.risk==="high") || (qLow.includes("vegan") && f.diet==="vegan") ||
+        (qLow.includes("vegetarian") && f.diet==="vegetarian") || (qLow.includes("sugar") && (f.sugars??0) > 11.25) ||
+        (qLow.includes("e-number") && f.substances.some(s=>/^E\d/i.test(s))) ||
+        ((qLow.includes("processed")||qLow.includes("nutri")) && ["c","d","e"].includes(f.nutriScore||""))
+      );
+      const all = [
+        ...trackedMatches.map(m=>({ name:m.name+(m.brand?` (${m.brand})`:""), reason:`${m.risk||"unknown"} risk${m.sugars!=null?` · ${m.sugars}g sugar`:""} · your scan`, diet:m.diet })),
+        ...dbMatches.map(m=>({ name:m.name+(m.brand?` (${m.brand})`:""), reason:`${m.risk||"unknown"} risk · searched ${m.hitCount}× · shared DB`, diet:m.diet })),
+      ];
+      const isProductQ = /^[a-z0-9 '&\-]{2,50}$/i.test(query) && !query.includes("?") && !["who","what","why","how","which","are","is","do","does","show","find","list","tell"].some(w => qLow.startsWith(w));
+      if (all.length > 0) {
+        setSearchRes({ answer:`Found ${all.length} matching item${all.length!==1?"s":""} across your scans and the shared database.`, matches:all.slice(0,6), tip:"Free mode searches your data locally — no AI cost.", category:"database" });
+        setSearchLoading(false); ghLogSearch(query,"database"); return;
+      }
+      if (isProductQ && !ghGet(nk(query))) {
+        setSearchRes({ answer:`"${query}" isn't in the database yet — scanning it now with the free engine…`, matches:[], tip:null, category:"database", savingToDb:true });
+        setSearchLoading(false); ghLogSearch(query,"database");
+        (async () => {
+          try {
+            const fa = await freeAnalyze(query);
+            const k = nk(query);
+            const payload = { offData:fa.offData, aiSugarData:fa.aiSugarData, allSubs:fa.allSubs, risk:fa.risk, diet:fa.diet, undeclaredCount:fa.undeclaredCount, hitCount:1, savedAt:Date.now() };
+            toCache("scan", k, payload);
+            await ghSet(k, payload, setDbCount);
+            setSearchRes(prev => prev ? {...prev, savingToDb:false, savedToDb:true, answer:fa.offData?`Found and saved "${fa.offData.name}"${fa.offData.brand?` by ${fa.offData.brand}`:""} — ${fa.risk||"no"} risk, ${fa.allSubs.length} flagged substance${fa.allSubs.length!==1?"s":""}.`:prev.answer} : prev);
+            toast("database",`"${fa.offData?.name||query}" saved to GitHub database.`);
+          } catch (e) { console.warn("free bgScan:", e); }
+        })();
+        return;
+      }
+      setSearchRes({ answer:`No matches found for "${query}" in your scans or the shared database. Try scanning a product first.`, matches:[], tip:`Database has ${dbCount} products total.`, category:"general" });
+      setSearchLoading(false); ghLogSearch(query,"general"); return;
+    }
+
     try {
       const dbCtx = dbMatches.length > 0 ? `DB matches: ${JSON.stringify(dbMatches.slice(0,3))}.` : "";
       const txt = await callAI(`HST food safety app. User scanned: ${JSON.stringify(summary)}. ${dbCtx} DB has ${dbCount} total products. Query: "${query}". Return ONLY JSON: {"answer":"2-4 sentences","matches":[{"name":"item","reason":"why","diet":"vegan|vegetarian|pescatarian|meat|unknown"}],"tip":"one tip","category":"credibility|risk|sugar|additives|nutrition|diet|database|general"}. No markdown.`, 1000, true);
@@ -969,7 +1408,11 @@ export default function App() {
     const cached = fromCache("panelAlts",k) || fromCache("alts",k);
     if (cached) { setPanelAlts(cached); setPanelAltLoading(false); return; }
     setPanelAlts([]); setPanelAltLoading(true);
-    aiAlternatives(entry.name, entry.offData?.brand, entry.offData?.nutriScore, entry.risk, entry.offData?.ingredients)
+    const req = AI_MODE
+      ? aiAlternatives(entry.name, entry.offData?.brand, entry.offData?.nutriScore, entry.risk, entry.offData?.ingredients)
+          .then(a => (a && a.length) ? a : fetchOFFAlternatives(entry.offData?.categories, entry.name)) // fallback
+      : fetchOFFAlternatives(entry.offData?.categories, entry.name);
+    req
       .then(a => { const r=a||[]; setPanelAlts(r); toCache("panelAlts",k,r); setPanelAltLoading(false); })
       .catch(() => setPanelAltLoading(false));
   }
@@ -982,7 +1425,10 @@ export default function App() {
     if (cached) { setAltTabResults(cached); setAltTabLoading(false); toast("cache","Loaded from cache."); return; }
     setAltTabResults([]); setAltTabLoading(true);
     const nut = entry.offData?.nut || {};
-    const alts = await aiCalorieAlts(entry.name, nut.energy_kcal, entry.offData?.categories?.[0], entry.risk, { fat:nut.fat, sugars:nut.sugars, protein:nut.protein, fiber:nut.fiber }).catch(() => []);
+    let alts = AI_MODE
+      ? await aiCalorieAlts(entry.name, nut.energy_kcal, entry.offData?.categories?.[0], entry.risk, { fat:nut.fat, sugars:nut.sugars, protein:nut.protein, fiber:nut.fiber }).catch(() => [])
+      : await fetchOFFCalorieAlts(nut.energy_kcal).catch(() => []);
+    if (AI_MODE && (!alts || !alts.length)) alts = await fetchOFFCalorieAlts(nut.energy_kcal).catch(() => []); // fallback
     toCache("calAlts", k, alts);
     setAltTabResults(alts); setAltTabLoading(false);
   }
@@ -1169,6 +1615,15 @@ export default function App() {
             <div style={{fontSize:9,fontWeight:500,color:t.textMuted,marginTop:1}}>GitHub DB</div>
           </button>
 
+          {/* AI MODE TOGGLE */}
+          <button onClick={toggleAI} title={aiMode?"AI enrichment on (Anthropic API — costs per call)":"Free mode (local engine + Open Food Facts — $0 per scan)"} style={{background:aiMode?`${t.accent}18`:t.pill,border:`1.5px solid ${aiMode?t.accent:t.border}`,borderRadius:20,padding:"6px 14px",cursor:"pointer",display:"flex",alignItems:"center",gap:7,transition:"all 0.25s"}}>
+            <span style={{fontSize:13}}>{aiMode?"⚡":"🆓"}</span>
+            <span style={{fontSize:11,fontWeight:600,color:aiMode?t.accent:t.textSub}}>{aiMode?"AI On":"Free"}</span>
+            <span style={{width:26,height:14,borderRadius:8,background:aiMode?t.accent:t.borderMed,position:"relative",transition:"background 0.2s",flexShrink:0}}>
+              <span style={{position:"absolute",top:2,left:aiMode?14:2,width:10,height:10,borderRadius:"50%",background:"#fff",transition:"left 0.2s"}}/>
+            </span>
+          </button>
+
           {/* DARK TOGGLE */}
           <button onClick={()=>setDark(p=>!p)} style={{background:t.pill,border:`1px solid ${t.border}`,borderRadius:20,padding:"6px 14px",cursor:"pointer",display:"flex",alignItems:"center",gap:7,transition:"all 0.25s"}}>
             <span style={{fontSize:13}}>{dark?"☀️":"🌙"}</span>
@@ -1189,6 +1644,7 @@ export default function App() {
       <div style={{background:t.tabBg,display:"flex",borderBottom:`2px solid ${t.border}`,padding:"0 22px",overflowX:"auto"}}>
         {tabBtn("tracker","Hazard Tracker")}
         {tabBtn("alternatives","Alternative Foods")}
+        {tabBtn("brands","Brand Ratings")}
       </div>
 
       {/* ════ TRACKER TAB ════ */}
@@ -1199,7 +1655,7 @@ export default function App() {
           <div style={{background:t.leftBg,borderRight:`1px solid ${t.border}`,display:"flex",flexDirection:"column",overflow:"hidden",position:"relative"}}>
             <div style={{padding:"16px 16px 10px"}}>
               <div style={{fontSize:12,fontWeight:600,color:t.text,marginBottom:3}}>Scan a product</div>
-              <div style={{fontSize:11,color:t.textMuted,marginBottom:10}}>Open Food Facts + AI hazard analysis</div>
+              <div style={{fontSize:11,color:t.textMuted,marginBottom:10}}>Open Food Facts + {AI_MODE?"AI":"free local"} hazard analysis</div>
               <input value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&scan()} disabled={scanning} placeholder="Product name or barcode…" style={{width:"100%",border:`1.5px solid ${t.inputBorder}`,borderRadius:9,padding:"10px 13px",fontSize:13,outline:"none",background:t.inputBg,color:t.inputText,display:"block"}} onFocus={e=>e.target.style.borderColor=t.accent} onBlur={e=>e.target.style.borderColor=t.inputBorder}/>
               <button onClick={()=>scan()} disabled={scanning||!input.trim()} style={{marginTop:8,width:"100%",background:scanning?t.pill:t.accent,border:"none",color:scanning?t.textMuted:t.accentFg,padding:"11px",borderRadius:9,cursor:scanning||!input.trim()?"default":"pointer",fontSize:13,fontWeight:600,display:"flex",alignItems:"center",justifyContent:"center",gap:8,opacity:!input.trim()&&!scanning?0.45:1,transition:"all 0.2s"}}>
                 {scanning?<><span style={{display:"inline-block",width:13,height:13,border:`2px solid ${t.textMuted}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite"}}/>Scanning…</>:"Scan"}
@@ -1221,7 +1677,7 @@ export default function App() {
               {scanning && (
                 <div style={{padding:"12px",marginBottom:4,background:dark?"rgba(61,82,196,0.08)":"rgba(61,82,196,0.05)",border:`1px solid ${dark?"rgba(61,82,196,0.18)":"rgba(61,82,196,0.12)"}`,borderRadius:9,fontSize:11,color:t.accent,display:"flex",alignItems:"center",gap:8,animation:"pulse 1.2s infinite"}}>
                   <span style={{display:"inline-block",width:10,height:10,border:`2px solid ${t.accent}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite",flexShrink:0}}/>
-                  <div><div>Scanning "{input}"…</div><div style={{fontSize:9,color:t.textMuted,marginTop:2}}>Checking GitHub DB → Open Food Facts → AI</div></div>
+                  <div><div>Scanning "{input}"…</div><div style={{fontSize:9,color:t.textMuted,marginTop:2}}>GitHub DB → Open Food Facts → {AI_MODE?"AI":"Local engine"}</div></div>
                 </div>
               )}
               {filteredTracked.length===0 && !scanning && <div style={{padding:"30px 14px",textAlign:"center",color:t.textMuted,fontSize:11,lineHeight:1.9}}>No products scanned yet.</div>}
@@ -1309,7 +1765,7 @@ export default function App() {
                   </div>
                   <div><div style={{fontSize:20,fontWeight:700,color:t.text,marginBottom:5,letterSpacing:"-0.3px"}}>Hazard Substance Tracker</div><div style={{fontSize:12,color:t.textMuted,fontWeight:500}}>Open Food Facts · AI Hazard Analysis · Brand Credibility · GitHub DB</div></div>
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,width:"100%",marginTop:4}}>
-                    {[["Real product data","Open Food Facts"],["Hazard detection","AI + curated DB"],["Full sugar profile","Total, added & natural"],["Brand credibility","AI research & scoring"],["Diet classification","Vegan / Veg / Meat"],["Shared database","GitHub — instant results"]].map(([title,sub])=>(
+                    {[["Real product data","Free Open Food Facts API"],["Hazard detection",AI_MODE?"AI + curated DB":"Free local rules engine"],["Full sugar profile","Total, added & natural"],["Brand ratings","Aggregate scores & label alerts"],["Diet classification","Vegan / Veg / Meat"],["Shared database","GitHub — instant results"]].map(([title,sub])=>(
                       <div key={title} style={{background:t.surface,borderRadius:10,padding:"12px 14px",border:`1px solid ${t.border}`,textAlign:"left"}}>
                         <div style={{fontSize:12,fontWeight:600,color:t.text,marginBottom:3}}>{title}</div>
                         <div style={{fontSize:10,color:t.textMuted,lineHeight:1.5}}>{sub}</div>
@@ -1338,7 +1794,7 @@ export default function App() {
                   </div>
                 ))}
                 <div style={{background:t.surface,borderRadius:10,padding:"14px 16px",border:`1px solid ${t.border}`}}>
-                  <div style={{fontSize:12,fontWeight:600,color:t.text,marginBottom:8}}>AI Safety Analysis</div>
+                  <div style={{fontSize:12,fontWeight:600,color:t.text,marginBottom:8}}>{AI_MODE?"AI Safety Analysis":"Safety Analysis"}</div>
                   {insightLoading?<div style={{color:t.textMuted,fontSize:12,fontStyle:"italic",animation:"pulse 1.4s ease infinite"}}>Generating…</div>:insight?<p style={{margin:0,fontSize:12,color:t.textSub,lineHeight:1.8}}>{insight}</p>:null}
                 </div>
               </div>
@@ -1346,6 +1802,94 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* ════ BRAND RATINGS TAB ════ */}
+      {activeTab==="brands" && (() => {
+        const brands = computeBrandStats(tracked);
+        const totalUndeclared = brands.reduce((a,b)=>a+b.undeclared,0);
+        const concerning = brands.filter(b=>b.score<4).length;
+        const scoreColor = (sc)=> sc>=8?"#2e7d52":sc>=6?"#b07d2b":sc>=4?"#a0622a":"#c0392b";
+        return (
+          <div style={{overflowY:"auto",height:"calc(100vh - 109px)",background:t.bg,padding:"20px 24px"}}>
+            <div style={{maxWidth:1100,margin:"0 auto"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-end",flexWrap:"wrap",gap:12,marginBottom:16}}>
+                <div>
+                  <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.08em",textTransform:"uppercase",marginBottom:4}}>Aggregated from your scans + shared GitHub DB</div>
+                  <div style={{fontSize:19,fontWeight:800,color:t.text,letterSpacing:"-0.4px"}}>Brand Ratings</div>
+                </div>
+                <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+                  {[["Brands",brands.length,t.accent],["Products",brands.reduce((a,b)=>a+b.count,0),"#2e7d52"],["Undeclared",totalUndeclared,totalUndeclared>0?"#c0392b":"#2e7d52"],["Concerning",concerning,concerning>0?"#c0392b":"#2e7d52"]].map(([l,v,c])=>(
+                    <div key={l} style={{textAlign:"center",padding:"8px 16px",background:t.surface,borderRadius:9,border:`1px solid ${t.border}`}}>
+                      <div style={{fontSize:19,fontWeight:800,color:c,letterSpacing:"-0.5px"}}>{v}</div>
+                      <div style={{fontSize:9,color:t.textMuted,marginTop:1}}>{l}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              {brands.length===0 ? (
+                <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:12,padding:"48px 24px",textAlign:"center"}}>
+                  <div style={{fontSize:30,marginBottom:10,opacity:0.3}}>🏷️</div>
+                  <div style={{fontSize:14,fontWeight:600,color:t.text,marginBottom:5}}>No branded products yet</div>
+                  <div style={{fontSize:12,color:t.textMuted,lineHeight:1.7}}>Scan branded products in the Hazard Tracker tab.<br/>Ratings build automatically from every scan — yours and everyone else's.</div>
+                </div>
+              ) : (
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(320px,1fr))",gap:14}}>
+                  {brands.map(b => {
+                    const sc = scoreColor(b.score);
+                    const arc = (b.score/10)*251;
+                    return (
+                      <div key={b.brand} style={{background:t.surface,border:`1px solid ${t.border}`,borderLeft:`3px solid ${sc}`,borderRadius:12,overflow:"hidden",display:"flex",flexDirection:"column"}}>
+                        <div style={{padding:"14px 16px",borderBottom:`1px solid ${t.border}`,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
+                          <div style={{minWidth:0}}>
+                            <div style={{fontSize:15,fontWeight:700,color:t.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{b.brand}</div>
+                            <div style={{fontSize:10,color:t.textSub,marginTop:2}}>{b.count} product{b.count!==1?"s":""} · searched {b.hits}×</div>
+                            <span style={{display:"inline-block",marginTop:6,fontSize:10,fontWeight:700,color:sc,background:`${sc}14`,border:`1px solid ${sc}30`,padding:"2px 9px",borderRadius:5}}>{b.verdict}</span>
+                          </div>
+                          <div style={{position:"relative",width:58,height:58,flexShrink:0}}>
+                            <svg viewBox="0 0 90 90" width={58} height={58} style={{transform:"rotate(-90deg)"}}>
+                              <circle cx="45" cy="45" r="40" fill="none" stroke={t.border} strokeWidth="7"/>
+                              <circle cx="45" cy="45" r="40" fill="none" stroke={sc} strokeWidth="7" strokeDasharray={`${arc} 251`} strokeLinecap="round"/>
+                            </svg>
+                            <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
+                              <span style={{fontSize:15,fontWeight:800,color:sc,lineHeight:1}}>{b.score}</span>
+                              <span style={{fontSize:8,color:t.textMuted}}>/10</span>
+                            </div>
+                          </div>
+                        </div>
+                        <div style={{padding:"10px 16px",display:"flex",gap:14,flexWrap:"wrap",borderBottom:`1px solid ${t.border}`,background:t.bgSub}}>
+                          {[["High",b.high,"#c0392b"],["Med",b.medium,"#b07d2b"],["Low",b.low,"#2e7d52"],["Undeclared",b.undeclared,b.undeclared>0?"#c0392b":t.textMuted]].map(([l,v,c])=>(
+                            <div key={l} style={{display:"flex",alignItems:"baseline",gap:4}}>
+                              <span style={{fontSize:14,fontWeight:800,color:v>0?c:t.textMuted,fontFamily:"monospace"}}>{v}</span>
+                              <span style={{fontSize:9,color:t.textMuted}}>{l}</span>
+                            </div>
+                          ))}
+                        </div>
+                        {b.undeclared>0 && (
+                          <div style={{padding:"9px 16px",background:dark?"rgba(192,57,43,0.08)":"rgba(192,57,43,0.05)",borderBottom:`1px solid ${t.border}`,display:"flex",gap:8,alignItems:"flex-start"}}>
+                            <span style={{fontSize:12,flexShrink:0}}>⚠️</span>
+                            <span style={{fontSize:10.5,color:"#c0392b",fontWeight:600,lineHeight:1.55}}>{b.undeclared} substance report{b.undeclared!==1?"s":""} not declared on product labels.</span>
+                          </div>
+                        )}
+                        <div style={{padding:"11px 16px",display:"flex",flexWrap:"wrap",gap:5}}>
+                          {b.products.slice(0,6).map((p,i)=>(
+                            <span key={i} onClick={()=>{setInput(p.name);setActiveTab("tracker");}} title="Click to scan" style={{fontSize:10,color:t.textSub,background:t.pill,border:`1px solid ${p.undeclared>0?"rgba(192,57,43,0.35)":t.border}`,padding:"3px 9px",borderRadius:5,cursor:"pointer",display:"inline-flex",alignItems:"center",gap:5,maxWidth:180}}>
+                              <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.name}</span>
+                              {p.risk&&<span style={{width:6,height:6,borderRadius:"50%",background:RISK_CFG[p.risk]?.fg,flexShrink:0}}/>}
+                              {p.undeclared>0&&<span style={{fontSize:9,color:"#c0392b",flexShrink:0}}>⚠</span>}
+                            </span>
+                          ))}
+                          {b.products.length>6&&<span style={{fontSize:10,color:t.textMuted,padding:"3px 4px"}}>+{b.products.length-6} more</span>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              <div style={{fontSize:9,color:t.textMuted,lineHeight:1.7,marginTop:16,paddingBottom:8}}>Score = 10 − weighted per-product penalties (high/medium risk, undeclared substances, poor Nutri-Score). Community-driven data · educational purposes only.</div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ════ ALTERNATIVE FOODS TAB ════ */}
       {activeTab==="alternatives" && (
@@ -1445,7 +1989,7 @@ export default function App() {
                           </div>
                         );
                       })}
-                      <div style={{fontSize:9,color:t.textMuted,lineHeight:1.7,padding:"4px 2px"}}>AI-generated with web search · calories verified · availability may vary.</div>
+                      <div style={{fontSize:9,color:t.textMuted,lineHeight:1.7,padding:"4px 2px"}}>{AI_MODE?"AI-generated with web search · calories verified":"Free Open Food Facts data"} · availability may vary.</div>
                     </div>
                   )}
                 </div>
