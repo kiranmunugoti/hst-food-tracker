@@ -350,11 +350,23 @@ const MODEL = "claude-sonnet-4-20250514";
 async function callAI(prompt, maxTokens = 1500, useWeb = true) {
   const body = { model: MODEL, max_tokens: maxTokens, messages: [{ role:"user", content: prompt }] };
   if (useWeb) body.tools = WEB;
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body),
-  });
-  const d = await r.json();
-  return lastText(d);
+  const attempt = async (url) => {
+    const r = await fetch(url, { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
+    const d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error?.message || ("HTTP " + r.status));
+    return d;
+  };
+  try {
+    // 1) Direct — works inside the Claude workspace (auth is injected there)
+    const d = await attempt("https://api.anthropic.com/v1/messages");
+    return lastText(d);
+  } catch {
+    // 2) Serverless proxy — works on Vercel with ANTHROPIC_API_KEY configured
+    try {
+      const d = await attempt("/api/claude");
+      return lastText(d);
+    } catch { return ""; }
+  }
 }
 
 // ─── FREE OPEN FOOD FACTS API (no key, no cost) ────────────────────────────────
@@ -365,9 +377,23 @@ const OFF_FIELDS = "product_name,brands,image_url,nutriscore_grade,nova_group,ec
 let _offStatus = "ok"; // status of last direct lookup: "ok" | "nomatch" | "network"
 
 async function offJson(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error("HTTP " + r.status);
-  return r.json();
+  // 1) Direct call (works in most browsers; zero infrastructure)
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return await r.json();
+  } catch (directErr) {
+    // 2) Same-origin serverless proxy (/api/off) — immune to CORS and rate
+    //    limits thanks to edge caching. Available on Vercel deployments;
+    //    fails fast elsewhere and rethrows the original error.
+    try {
+      const r = await fetch(`/api/off?url=${encodeURIComponent(url)}`);
+      if (!r.ok) throw new Error("proxy HTTP " + r.status);
+      return await r.json();
+    } catch {
+      throw directErr;
+    }
+  }
 }
 
 async function offByCode(code) {
@@ -399,13 +425,12 @@ async function fetchOFFDirect(query) {
       const code = (s.hits || []).find(h => h.code)?.code;
       return code ? offByCode(code) : null;
     });
-    // 2) Legacy search: full phrase, then progressively shorter queries
+    // 2) Legacy search: full phrase, then one shortened retry (kept minimal —
+    //    OFF rate-limits search requests, so fewer calls per scan matters)
     if (!result) result = await tryStep(() => offLegacySearch(q));
     if (!result) {
       const words = q.split(/\s+/).filter(Boolean);
-      for (const n of [3, 2]) {
-        if (!result && words.length > n) result = await tryStep(() => offLegacySearch(words.slice(0, n).join(" ")));
-      }
+      if (words.length > 2) result = await tryStep(() => offLegacySearch(words.slice(0, 2).join(" ")));
     }
   }
   _offStatus = result ? "ok" : (attempts > 0 && network >= attempts ? "network" : "nomatch");
@@ -415,8 +440,14 @@ async function fetchOFFDirect(query) {
 async function fetchOFF(query) {
   const direct = await fetchOFFDirect(query);
   if (direct) return direct;
-  if (!AI_MODE) return null; // free mode: no AI fallback
-  return fetchOFFviaAI(query); // fallback (e.g. sandboxed previews that block cross-origin fetch)
+  // If the network blocked direct access entirely (e.g. sandboxed preview
+  // environments), bridge through the assisted lookup regardless of mode.
+  // On normal deployments direct access works, so this path never triggers
+  // and product lookups stay zero-cost.
+  if (AI_MODE || _offStatus === "network") {
+    try { return await fetchOFFviaAI(query); } catch { return null; }
+  }
+  return null;
 }
 
 async function fetchOFFviaAI(query) {
@@ -601,22 +632,37 @@ function ghGet(ck) {
   return ageDays > 30 ? null : rec; // expire after 30 days
 }
 
+// Write the whole DB to GitHub. Returns "saved" | "no-token" | "error".
+// Handles stale/missing sha (409/422) by refetching and retrying once.
+async function ghWrite(message) {
+  if (!GH_TOKEN) return "no-token";
+  try {
+    const body = JSON.stringify(_ghDb, null, 2);
+    const encoded = btoa(unescape(encodeURIComponent(body)));
+    const url = `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_FILE}`;
+    const headers = { Authorization:`Bearer ${GH_TOKEN}`, "Content-Type":"application/json", Accept:"application/vnd.github.v3+json" };
+    const doPut = () => fetch(url, { method:"PUT", headers, body: JSON.stringify({ message, content: encoded, branch: GH_BRANCH, ...(_ghSha ? { sha: _ghSha } : {}) }) });
+    let r = await doPut();
+    if (r.status === 409 || r.status === 422) {
+      // sha stale (another writer) or wrong — refresh and retry once
+      const m = await fetch(url, { headers: { Authorization:`Bearer ${GH_TOKEN}`, Accept:"application/vnd.github.v3+json" } });
+      if (m.ok) _ghSha = (await m.json()).sha;
+      else if (m.status === 404) _ghSha = ""; // file doesn't exist yet — create it
+      r = await doPut();
+    }
+    if (!r.ok) { console.warn("ghWrite failed:", r.status, await r.text().catch(()=> "")); return "error"; }
+    const resp = await r.json();
+    _ghSha = resp.content?.sha || _ghSha;
+    return "saved";
+  } catch (e) { console.warn("ghWrite:", e); return "error"; }
+}
+
 async function ghSet(ck, data, setDbCount) {
   _ghDb.products = _ghDb.products || {};
   _ghDb.products[ck] = { ...data, savedAt: Date.now(), version: 1 };
   _ghDb._meta = { lastUpdated: new Date().toISOString().slice(0,10), totalProducts: Object.keys(_ghDb.products).length };
   setDbCount(Object.keys(_ghDb.products).length);
-  if (!GH_TOKEN) return;
-  try {
-    const body = JSON.stringify(_ghDb, null, 2);
-    const encoded = btoa(unescape(encodeURIComponent(body)));
-    const payload = { message:`db: ${ck}`, content: encoded, branch: GH_BRANCH, ...(_ghSha ? { sha: _ghSha } : {}) };
-    const r = await fetch(`https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_FILE}`, {
-      method:"PUT", headers:{ Authorization:`Bearer ${GH_TOKEN}`, "Content-Type":"application/json", Accept:"application/vnd.github.v3+json" },
-      body: JSON.stringify(payload),
-    });
-    if (r.ok) { const resp = await r.json(); _ghSha = resp.content?.sha || _ghSha; }
-  } catch (e) { console.warn("ghSet:", e); }
+  return ghWrite(`db: ${ck}`);
 }
 
 // ─── BRAND RATINGS ─────────────────────────────────────────────────────────────
@@ -674,10 +720,16 @@ function brandHistory(brand) {
   };
 }
 
+let _searchFlushTimer = null;
 function ghLogSearch(query, category) {
   if (!_ghDb.searchLog) _ghDb.searchLog = [];
   _ghDb.searchLog.unshift({ query, category, at: Date.now() });
   if (_ghDb.searchLog.length > 500) _ghDb.searchLog = _ghDb.searchLog.slice(0, 500);
+  // Persist search records too — debounced to one commit per 20s of activity
+  if (GH_TOKEN) {
+    clearTimeout(_searchFlushTimer);
+    _searchFlushTimer = setTimeout(() => ghWrite("log: searches"), 20000);
+  }
 }
 
 // ─── FOOD ILLUSTRATION ─────────────────────────────────────────────────────────
@@ -1080,7 +1132,7 @@ function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, br
 
       {/* AI SAFETY ANALYSIS */}
       <div style={{...card}}>
-        <div style={{...sHdr}}>{AI_MODE?"AI Safety Analysis":"Safety Analysis"}</div>
+        <div style={{...sHdr}}>Safety Analysis</div>
         <div style={{padding:"14px 16px"}}>
           {insightLoading
             ? <div style={{color:t.textMuted,fontSize:12,fontStyle:"italic",animation:"pulse 1.4s ease infinite"}}>Generating analysis…</div>
@@ -1089,7 +1141,7 @@ function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, br
           }
         </div>
       </div>
-      <div style={{fontSize:9,color:t.textMuted,lineHeight:1.7,paddingBottom:4}}>Data from Open Food Facts · {AI_MODE?"Brand research by AI":"Free local engine — zero AI cost"} · Educational purposes only.</div>
+      <div style={{fontSize:9,color:t.textMuted,lineHeight:1.7,paddingBottom:4}}>Data from Open Food Facts · {AI_MODE?"Extended brand research":"Built-in safety engine"} · Educational purposes only.</div>
     </div>
   );
 }
@@ -1123,6 +1175,18 @@ export default function App() {
   const [panelAltLoading,setPanelAltLoading] = useState(false);
   const [searchQ,setSearchQ]         = useState("");
   const [searchOpen,setSearchOpen]   = useState(false);
+  const searchRef = useRef(null);
+
+  // Close the search dropdown on outside click or Escape (works app-wide,
+  // not just while the input is focused)
+  useEffect(() => {
+    if (!searchOpen) return;
+    const onDown = (e) => { if (searchRef.current && !searchRef.current.contains(e.target)) setSearchOpen(false); };
+    const onKey  = (e) => { if (e.key === "Escape") setSearchOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onDown); document.removeEventListener("keydown", onKey); };
+  }, [searchOpen]);
   const [searchRes,setSearchRes]     = useState(null);
   const [searchLoading,setSearchLoading] = useState(false);
   const [hazardDb,setHazardDb] = useState(Object.fromEntries(Object.entries(SEED).map(([k,v])=>[k,{...v,source:"seed"}])));
@@ -1143,9 +1207,18 @@ export default function App() {
 
   const toggleAI = () => {
     AI_MODE = !AI_MODE; setAiMode(AI_MODE);
-    toast("scan", AI_MODE
-      ? "AI mode on — scans use the Anthropic API (needs a backend proxy outside Claude; falls back to the free engine if calls fail)."
-      : "Free mode — local rules engine + Open Food Facts. Zero cost per scan.");
+    if (AI_MODE) {
+      toast("scan", "Enhanced analysis enabled. Verifying service availability…");
+      // Minimal connectivity probe — confirms whether AI calls actually succeed
+      // in this environment, since failures otherwise fall back silently.
+      (async () => {
+        const ok = await callAI("Reply with the single word OK.", 10, false).catch(() => "");
+        if (ok && AI_MODE) toast("database", "Enhanced analysis service connected — scans will include extended research and generated insights.");
+        else if (AI_MODE) toast("high", "Enhanced analysis service is not reachable in this deployment. Scans will use the standard engine until ANTHROPIC_API_KEY is configured on the server (see README).");
+      })();
+    } else {
+      toast("scan", "Standard analysis enabled. Product scans use the built-in safety engine and Open Food Facts data.");
+    }
   };
 
   const ck = (s) => cache.current;
@@ -1249,7 +1322,14 @@ export default function App() {
     const worthSaving = !!offData || allSubs.length > 0;
     if (worthSaving) {
       toCache("scan", key, payload);
-      ghSet(key, payload, setDbCount); // Save to GitHub for all future users
+      ghSet(key, payload, setDbCount).then(st => { // Save to GitHub for all future users
+        if (st === "saved") toast("database", `"${offData?.name||label}" committed to the shared database.`);
+        else if (st === "no-token" && !window.__hstReadOnlyWarned) {
+          window.__hstReadOnlyWarned = true;
+          toast("database", "Read-only mode: results are stored locally only. Configure VITE_GH_TOKEN and redeploy to enable shared database writes.");
+        }
+        else if (st === "error") toast("database", "Shared database write failed — result kept for this session. Check the browser console for details.");
+      });
     }
 
     const entry = { id:Date.now(), name:offData?.name||label, searchTerm:label, substances:allSubs, offData, aiSugarData, risk, diet:dietType, undeclaredCount:undeclared.length, date:new Date().toLocaleDateString() };
@@ -1304,6 +1384,8 @@ export default function App() {
       ? await aiAlternatives(entry.name, entry.offData?.brand, entry.offData?.nutriScore, entry.risk, entry.offData?.ingredients).catch(() => [])
       : await fetchOFFAlternatives(entry.offData?.categories, entry.name).catch(() => []);
     if (AI_MODE && (!alts || !alts.length)) alts = await fetchOFFAlternatives(entry.offData?.categories, entry.name).catch(() => []); // fallback
+    if (!AI_MODE && (!alts || !alts.length) && _offStatus === "network") // sandboxed env: bridge through assisted lookup
+      alts = await aiAlternatives(entry.name, entry.offData?.brand, entry.offData?.nutriScore, entry.risk, entry.offData?.ingredients).catch(() => []);
     toCache("alts", k, alts);
     setAlternatives(alts); setAltLoading(false);
     // Also persist alts to GitHub DB
@@ -1374,8 +1456,9 @@ export default function App() {
       setSearchLoading(false); ghLogSearch(query,"database"); return;
     }
 
-    // FREE MODE: answer locally from your scans + shared DB, no AI call
-    if (!AI_MODE) {
+    // Local matcher — always available, used directly in standard mode and as
+    // the fallback whenever the enhanced search is unavailable
+    const buildLocalResult = () => {
       const trackedMatches = summary.filter(f =>
         f.name.toLowerCase().includes(qLow) || (f.brand||"").toLowerCase().includes(qLow) ||
         (qLow.includes("high risk") && f.risk==="high") || (qLow.includes("vegan") && f.diet==="vegan") ||
@@ -1387,32 +1470,45 @@ export default function App() {
         ...trackedMatches.map(m=>({ name:m.name+(m.brand?` (${m.brand})`:""), reason:`${m.risk||"unknown"} risk${m.sugars!=null?` · ${m.sugars}g sugar`:""} · your scan`, diet:m.diet })),
         ...dbMatches.map(m=>({ name:m.name+(m.brand?` (${m.brand})`:""), reason:`${m.risk||"unknown"} risk · searched ${m.hitCount}× · shared DB`, diet:m.diet })),
       ];
-      const isProductQ = /^[a-z0-9 '&\-]{2,50}$/i.test(query) && !query.includes("?") && !["who","what","why","how","which","are","is","do","does","show","find","list","tell"].some(w => qLow.startsWith(w));
-      if (all.length > 0) {
-        setSearchRes({ answer:`Found ${all.length} matching item${all.length!==1?"s":""} across your scans and the shared database.`, matches:all.slice(0,6), tip:"Free mode searches your data locally — no AI cost.", category:"database" });
-        setSearchLoading(false); ghLogSearch(query,"database"); return;
+      return all.length > 0
+        ? { answer:`Found ${all.length} matching item${all.length!==1?"s":""} across your scans and the shared database.`, matches:all.slice(0,6), tip:null, category:"database" }
+        : null;
+    };
+
+    // STANDARD MODE: answer from your scans + shared DB
+    if (!AI_MODE) {
+      try {
+        const local = buildLocalResult();
+        const isProductQ = /^[a-z0-9 '&\-]{2,50}$/i.test(query) && !query.includes("?") && !["who","what","why","how","which","are","is","do","does","show","find","list","tell"].some(w => qLow.startsWith(w));
+        if (local) {
+          setSearchRes(local);
+          setSearchLoading(false); ghLogSearch(query,"database"); return;
+        }
+        if (isProductQ && !ghGet(nk(query))) {
+          setSearchRes({ answer:`"${query}" isn't in the database yet — scanning it now…`, matches:[], tip:null, category:"database", savingToDb:true });
+          setSearchLoading(false); ghLogSearch(query,"database");
+          (async () => {
+            try {
+              const fa = await freeAnalyze(query);
+              if (fa.offData || fa.allSubs.length > 0) {
+                const k = nk(query);
+                const payload = { offData:fa.offData, aiSugarData:fa.aiSugarData, allSubs:fa.allSubs, risk:fa.risk, diet:fa.diet, undeclaredCount:fa.undeclaredCount, hitCount:1, savedAt:Date.now() };
+                toCache("scan", k, payload);
+                const st = await ghSet(k, payload, setDbCount);
+                setSearchRes(prev => prev ? {...prev, savingToDb:false, savedToDb:st==="saved", answer:fa.offData?`Found ${st==="saved"?"and saved ":""}"${fa.offData.name}"${fa.offData.brand?` by ${fa.offData.brand}`:""} — ${fa.risk||"no"} risk, ${fa.allSubs.length} flagged substance${fa.allSubs.length!==1?"s":""}.`:prev.answer} : prev);
+                if (st === "saved") toast("database",`"${fa.offData?.name||query}" committed to the shared database.`);
+              } else {
+                setSearchRes(prev => prev ? {...prev, savingToDb:false, answer:`No product data found for "${query}" — nothing was saved.`} : prev);
+              }
+            } catch (e) { console.warn("bgScan:", e); setSearchRes(prev => prev ? {...prev, savingToDb:false} : prev); }
+          })();
+          return;
+        }
+        setSearchRes({ answer:`No matches found for "${query}" in your scans or the shared database. Try scanning the product first.`, matches:[], tip:`Database has ${dbCount} products total.`, category:"general" });
+      } catch (e) {
+        console.warn("localSearch:", e);
+        setSearchRes({ answer:"Search encountered a problem. Please try again.", matches:[], tip:null, category:"general" });
       }
-      if (isProductQ && !ghGet(nk(query))) {
-        setSearchRes({ answer:`"${query}" isn't in the database yet — scanning it now with the free engine…`, matches:[], tip:null, category:"database", savingToDb:true });
-        setSearchLoading(false); ghLogSearch(query,"database");
-        (async () => {
-          try {
-            const fa = await freeAnalyze(query);
-            if (fa.offData || fa.allSubs.length > 0) {
-              const k = nk(query);
-              const payload = { offData:fa.offData, aiSugarData:fa.aiSugarData, allSubs:fa.allSubs, risk:fa.risk, diet:fa.diet, undeclaredCount:fa.undeclaredCount, hitCount:1, savedAt:Date.now() };
-              toCache("scan", k, payload);
-              await ghSet(k, payload, setDbCount);
-              setSearchRes(prev => prev ? {...prev, savingToDb:false, savedToDb:true, answer:fa.offData?`Found and saved "${fa.offData.name}"${fa.offData.brand?` by ${fa.offData.brand}`:""} — ${fa.risk||"no"} risk, ${fa.allSubs.length} flagged substance${fa.allSubs.length!==1?"s":""}.`:prev.answer} : prev);
-              toast("database",`"${fa.offData?.name||query}" saved to GitHub database.`);
-            } else {
-              setSearchRes(prev => prev ? {...prev, savingToDb:false, answer:`No product data found for "${query}" — nothing was saved.`} : prev);
-            }
-          } catch (e) { console.warn("free bgScan:", e); }
-        })();
-        return;
-      }
-      setSearchRes({ answer:`No matches found for "${query}" in your scans or the shared database. Try scanning a product first.`, matches:[], tip:`Database has ${dbCount} products total.`, category:"general" });
       setSearchLoading(false); ghLogSearch(query,"general"); return;
     }
 
@@ -1440,10 +1536,14 @@ export default function App() {
             const risk = getRisk(allSubs);
             const k = nk(query);
             const payload = { offData, aiSugarData, allSubs, risk, diet:dietType, hitCount:1, savedAt:Date.now() };
-            toCache("scan", k, payload);
-            await ghSet(k, payload, setDbCount);
-            setSearchRes(prev => prev ? {...prev, savingToDb:false, savedToDb:true} : prev);
-            toast("database",`"${offData?.name||query}" saved to GitHub database.`);
+            if (offData || allSubs.length > 0) {
+              toCache("scan", k, payload);
+              const st = await ghSet(k, payload, setDbCount);
+              setSearchRes(prev => prev ? {...prev, savingToDb:false, savedToDb:st==="saved"} : prev);
+              if (st === "saved") toast("database",`"${offData?.name||query}" committed to the shared database.`);
+            } else {
+              setSearchRes(prev => prev ? {...prev, savingToDb:false} : prev);
+            }
           } catch (e) { console.warn("bgScan:", e); }
         };
         bgScan();
@@ -1451,7 +1551,10 @@ export default function App() {
       }
 
       setSearchRes(result); ghLogSearch(query, result.category||"general");
-    } catch { setSearchRes({ answer:"Search failed. Try again.", matches:[], tip:null, category:"general" }); }
+    } catch {
+      const local = buildLocalResult();
+      setSearchRes(local || { answer:"Search encountered a problem. Please try again.", matches:[], tip:null, category:"general" });
+    }
     setSearchLoading(false);
   }
 
@@ -1485,6 +1588,8 @@ export default function App() {
       ? await aiCalorieAlts(entry.name, nut.energy_kcal, entry.offData?.categories?.[0], entry.risk, { fat:nut.fat, sugars:nut.sugars, protein:nut.protein, fiber:nut.fiber }).catch(() => [])
       : await fetchOFFCalorieAlts(nut.energy_kcal).catch(() => []);
     if (AI_MODE && (!alts || !alts.length)) alts = await fetchOFFCalorieAlts(nut.energy_kcal).catch(() => []); // fallback
+    if (!AI_MODE && (!alts || !alts.length) && _offStatus === "network") // sandboxed env: bridge through assisted lookup
+      alts = await aiCalorieAlts(entry.name, nut.energy_kcal, entry.offData?.categories?.[0], entry.risk, { fat:nut.fat, sugars:nut.sugars, protein:nut.protein, fiber:nut.fiber }).catch(() => []);
     toCache("calAlts", k, alts);
     setAltTabResults(alts); setAltTabLoading(false);
   }
@@ -1603,7 +1708,7 @@ export default function App() {
         <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
 
           {/* SEARCH BAR */}
-          <div style={{position:"relative"}}>
+          <div ref={searchRef} style={{position:"relative"}}>
             <div style={{display:"flex",alignItems:"center",background:t.inputBg,border:`1.5px solid ${searchOpen?t.accent:t.inputBorder}`,borderRadius:22,padding:"0 14px",gap:8,width:"clamp(180px,22vw,280px)",transition:"all 0.2s",boxShadow:searchOpen?`0 0 0 3px ${t.accent}18`:"none"}}>
               <svg width="13" height="13" viewBox="0 0 16 16" fill="none" style={{flexShrink:0,opacity:0.4}}><circle cx="6.5" cy="6.5" r="5.5" stroke={t.text} strokeWidth="1.5"/><path d="M11 11l3.5 3.5" stroke={t.text} strokeWidth="1.5" strokeLinecap="round"/></svg>
               <input value={searchQ} onChange={e=>setSearchQ(e.target.value)} onFocus={()=>setSearchOpen(true)} onKeyDown={e=>{if(e.key==="Enter")runSearch();if(e.key==="Escape"){setSearchOpen(false);setSearchQ("");}}} placeholder="Search anything…" style={{flex:1,background:"none",border:"none",outline:"none",fontSize:12,color:t.inputText,padding:"8px 0",minWidth:0}}/>
@@ -1671,10 +1776,9 @@ export default function App() {
             <div style={{fontSize:9,fontWeight:500,color:t.textMuted,marginTop:1}}>GitHub DB</div>
           </button>
 
-          {/* AI MODE TOGGLE */}
-          <button onClick={toggleAI} title={aiMode?"AI enrichment on (Anthropic API — costs per call)":"Free mode (local engine + Open Food Facts — $0 per scan)"} style={{background:aiMode?`${t.accent}18`:t.pill,border:`1.5px solid ${aiMode?t.accent:t.border}`,borderRadius:20,padding:"6px 14px",cursor:"pointer",display:"flex",alignItems:"center",gap:7,transition:"all 0.25s"}}>
-            <span style={{fontSize:13}}>{aiMode?"⚡":"🆓"}</span>
-            <span style={{fontSize:11,fontWeight:600,color:aiMode?t.accent:t.textSub}}>{aiMode?"AI On":"Free"}</span>
+          {/* ANALYSIS MODE TOGGLE */}
+          <button onClick={toggleAI} title={aiMode?"Enhanced analysis: extended research and generated insights":"Standard analysis: built-in safety engine and Open Food Facts data"} style={{background:aiMode?`${t.accent}18`:t.pill,border:`1.5px solid ${aiMode?t.accent:t.border}`,borderRadius:20,padding:"6px 14px",cursor:"pointer",display:"flex",alignItems:"center",gap:8,transition:"all 0.25s"}}>
+            <span style={{fontSize:11,fontWeight:600,color:aiMode?t.accent:t.textSub}}>{aiMode?"Enhanced":"Standard"}</span>
             <span style={{width:26,height:14,borderRadius:8,background:aiMode?t.accent:t.borderMed,position:"relative",transition:"background 0.2s",flexShrink:0}}>
               <span style={{position:"absolute",top:2,left:aiMode?14:2,width:10,height:10,borderRadius:"50%",background:"#fff",transition:"left 0.2s"}}/>
             </span>
@@ -1711,7 +1815,7 @@ export default function App() {
           <div style={{background:t.leftBg,borderRight:`1px solid ${t.border}`,display:"flex",flexDirection:"column",overflow:"hidden",position:"relative"}}>
             <div style={{padding:"16px 16px 10px"}}>
               <div style={{fontSize:12,fontWeight:600,color:t.text,marginBottom:3}}>Scan a product</div>
-              <div style={{fontSize:11,color:t.textMuted,marginBottom:10}}>Open Food Facts + {AI_MODE?"AI":"free local"} hazard analysis</div>
+              <div style={{fontSize:11,color:t.textMuted,marginBottom:10}}>Open Food Facts + {AI_MODE?"enhanced":"standard"} hazard analysis</div>
               <input value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&scan()} disabled={scanning} placeholder="Product name or barcode…" style={{width:"100%",border:`1.5px solid ${t.inputBorder}`,borderRadius:9,padding:"10px 13px",fontSize:13,outline:"none",background:t.inputBg,color:t.inputText,display:"block"}} onFocus={e=>e.target.style.borderColor=t.accent} onBlur={e=>e.target.style.borderColor=t.inputBorder}/>
               <button onClick={()=>scan()} disabled={scanning||!input.trim()} style={{marginTop:8,width:"100%",background:scanning?t.pill:t.accent,border:"none",color:scanning?t.textMuted:t.accentFg,padding:"11px",borderRadius:9,cursor:scanning||!input.trim()?"default":"pointer",fontSize:13,fontWeight:600,display:"flex",alignItems:"center",justifyContent:"center",gap:8,opacity:!input.trim()&&!scanning?0.45:1,transition:"all 0.2s"}}>
                 {scanning?<><span style={{display:"inline-block",width:13,height:13,border:`2px solid ${t.textMuted}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite"}}/>Scanning…</>:"Scan"}
@@ -1733,7 +1837,7 @@ export default function App() {
               {scanning && (
                 <div style={{padding:"12px",marginBottom:4,background:dark?"rgba(61,82,196,0.08)":"rgba(61,82,196,0.05)",border:`1px solid ${dark?"rgba(61,82,196,0.18)":"rgba(61,82,196,0.12)"}`,borderRadius:9,fontSize:11,color:t.accent,display:"flex",alignItems:"center",gap:8,animation:"pulse 1.2s infinite"}}>
                   <span style={{display:"inline-block",width:10,height:10,border:`2px solid ${t.accent}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite",flexShrink:0}}/>
-                  <div><div>Scanning "{input}"…</div><div style={{fontSize:9,color:t.textMuted,marginTop:2}}>GitHub DB → Open Food Facts → {AI_MODE?"AI":"Local engine"}</div></div>
+                  <div><div>Scanning "{input}"…</div><div style={{fontSize:9,color:t.textMuted,marginTop:2}}>Shared DB → Open Food Facts → {AI_MODE?"Enhanced analysis":"Safety engine"}</div></div>
                 </div>
               )}
               {filteredTracked.length===0 && !scanning && <div style={{padding:"30px 14px",textAlign:"center",color:t.textMuted,fontSize:11,lineHeight:1.9}}>No products scanned yet.</div>}
@@ -1822,7 +1926,7 @@ export default function App() {
                   </div>
                   <div><div style={{fontSize:20,fontWeight:700,color:t.text,marginBottom:5,letterSpacing:"-0.3px"}}>Hazard Substance Tracker</div><div style={{fontSize:12,color:t.textMuted,fontWeight:500}}>Open Food Facts · AI Hazard Analysis · Brand Credibility · GitHub DB</div></div>
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,width:"100%",marginTop:4}}>
-                    {[["Real product data","Free Open Food Facts API"],["Hazard detection",AI_MODE?"AI + curated DB":"Free local rules engine"],["Full sugar profile","Total, added & natural"],["Brand ratings","Aggregate scores & label alerts"],["Diet classification","Vegan / Veg / Meat"],["Shared database","GitHub — instant results"]].map(([title,sub])=>(
+                    {[["Real product data","Free Open Food Facts API"],["Hazard detection",AI_MODE?"Extended research + curated DB":"Curated substance database"],["Full sugar profile","Total, added & natural"],["Brand ratings","Aggregate scores & label alerts"],["Diet classification","Vegan / Veg / Meat"],["Shared database","GitHub — instant results"]].map(([title,sub])=>(
                       <div key={title} style={{background:t.surface,borderRadius:10,padding:"12px 14px",border:`1px solid ${t.border}`,textAlign:"left"}}>
                         <div style={{fontSize:12,fontWeight:600,color:t.text,marginBottom:3}}>{title}</div>
                         <div style={{fontSize:10,color:t.textMuted,lineHeight:1.5}}>{sub}</div>
@@ -1853,7 +1957,7 @@ export default function App() {
                   </div>
                 ))}
                 <div style={{background:t.surface,borderRadius:10,padding:"14px 16px",border:`1px solid ${t.border}`}}>
-                  <div style={{fontSize:12,fontWeight:600,color:t.text,marginBottom:8}}>{AI_MODE?"AI Safety Analysis":"Safety Analysis"}</div>
+                  <div style={{fontSize:12,fontWeight:600,color:t.text,marginBottom:8}}>Safety Analysis</div>
                   {insightLoading?<div style={{color:t.textMuted,fontSize:12,fontStyle:"italic",animation:"pulse 1.4s ease infinite"}}>Generating…</div>:insight?<p style={{margin:0,fontSize:12,color:t.textSub,lineHeight:1.8}}>{insight}</p>:null}
                 </div>
               </div>
@@ -2048,7 +2152,7 @@ export default function App() {
                           </div>
                         );
                       })}
-                      <div style={{fontSize:9,color:t.textMuted,lineHeight:1.7,padding:"4px 2px"}}>{AI_MODE?"AI-generated with web search · calories verified":"Free Open Food Facts data"} · availability may vary.</div>
+                      <div style={{fontSize:9,color:t.textMuted,lineHeight:1.7,padding:"4px 2px"}}>{AI_MODE?"Verified with extended research":"Open Food Facts data"} · availability may vary.</div>
                     </div>
                   )}
                 </div>

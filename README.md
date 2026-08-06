@@ -29,3 +29,17 @@ Zero AI cost per scan. Flip `AI_MODE = true` in `src/App.jsx` to enable Anthropi
 Claude.ai artifacts (which inject auth). On Vercel you must create an `/api/claude` serverless
 function that holds your `ANTHROPIC_API_KEY` and proxies requests, then point `callAI` at it.
 Free mode (default) needs none of this.
+
+## Serverless proxies (v3.6)
+Two functions in `/api` deploy automatically with the app on Vercel:
+
+- **`/api/off`** — proxies Open Food Facts. The app tries OFF directly first and
+  falls back to this proxy, so CORS blocks and rate limits can no longer break
+  Standard mode. Responses are edge-cached for 24h.
+- **`/api/claude`** — proxies the Anthropic API for Enhanced mode. Set
+  `ANTHROPIC_API_KEY` in Vercel → Settings → Environment Variables (server-side
+  name, NO `VITE_` prefix — a VITE_ key would be exposed in the public bundle).
+  Without it, Enhanced mode simply falls back to the built-in engine.
+
+If you previously added an API key directly in client code, remove it — it is
+publicly extractable from the deployed bundle. Use `ANTHROPIC_API_KEY` instead.
