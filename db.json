@@ -124,8 +124,49 @@
       "diet": "vegetarian",
       "undeclaredCount": 3,
       "hitCount": 1,
-      "savedAt": 1786319567633,
-      "version": 1
+      "savedAt": 1786319569955,
+      "version": 1,
+      "alts": [
+        {
+          "name": "Pain de mie grandes tranches Seigle & Graines 500g",
+          "brand": "la Boulangère",
+          "reason": "Nutri-Score A option in the same category with 4.2g sugars per 100g.",
+          "improvements": [
+            "Low sugar",
+            "High fibre",
+            "Better Nutri-Score"
+          ],
+          "nutriScore": "a",
+          "sourceUrl": null,
+          "sourceName": "Open Food Facts"
+        },
+        {
+          "name": "Tartines craquantes au sarrasin imp",
+          "brand": "Ekibio",
+          "reason": "Nutri-Score A option in the same category with 2.6g sugars per 100g.",
+          "improvements": [
+            "Low sugar",
+            "High fibre",
+            "Better Nutri-Score"
+          ],
+          "nutriScore": "a",
+          "sourceUrl": null,
+          "sourceName": "Open Food Facts"
+        },
+        {
+          "name": "KRISPROLLS Complets",
+          "brand": "KRISPROLLS",
+          "reason": "Nutri-Score A option in the same category with 1.1g sugars per 100g.",
+          "improvements": [
+            "Low sugar",
+            "High fibre",
+            "Better Nutri-Score"
+          ],
+          "nutriScore": "a",
+          "sourceUrl": null,
+          "sourceName": "Open Food Facts"
+        }
+      ]
     }
   },
   "searchLog": []
