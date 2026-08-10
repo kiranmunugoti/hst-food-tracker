@@ -266,14 +266,44 @@ async function fetchOFFCalorieAlts(kcal) {
 }
 
 // One free end-to-end product analysis (used by scan + background search scans)
-async function freeAnalyze(label) {
-  const offData = await fetchOFF(label).catch(() => null);
-  const allSubs = localHazards(offData?.name || label, offData?.ingredients || null, offData?.additives || [], offData?.categories || []);
-  const aiSugarData = localSugar(offData, offData?.name || label);
-  const dietType = await aiDietClassify(offData?.name || label, offData?.ingredients || null, offData?.labels || [], offData?.allergens || []).catch(() => "unknown");
-  const risk = getRisk(allSubs);
-  const undeclared = offData?.ingredients ? allSubs.filter(s => s.ingredientConfirmed === false) : [];
-  return { offData, aiSugarData, allSubs, risk, diet: dietType, undeclared, undeclaredCount: undeclared.length };
+// ─── ANALYSIS ──────────────────────────────────────────────────────────────────
+// The single analysis path used by every entry point (manual scan, picker
+// choice, background scan from the search bar). Takes an already-resolved
+// product so it never issues a lookup of its own — that separation is what
+// keeps the request budget predictable.
+//
+// Standard mode is fully deterministic. Enhanced mode layers extra findings on
+// top and can only ever ADD to the baseline, never replace it, so a failed or
+// empty enhanced response degrades silently instead of blanking the analysis.
+async function analyzeProduct(offData, label) {
+  const name = offData?.name || label;
+  const subs = localHazards(name, offData?.ingredients || null, offData?.additives || [], offData?.categories || []);
+  let sugar = localSugar(offData, name);
+
+  if (AI_MODE) {
+    const extra = await aiHazards(name, offData?.ingredients || null).catch(() => []);
+    const seen = new Set(subs.map(s => (s.key || "").toLowerCase()));
+    extra.filter(s => s.key && s.name).forEach(s => {
+      const k = s.key.toLowerCase();
+      if (!seen.has(k)) { seen.add(k); subs.push({ ...s, id: s.key, source: "ai" }); }
+    });
+    if (!sugar) sugar = await aiSugar(name).catch(() => null);
+  }
+
+  const diet = await aiDietClassify(name, offData?.ingredients || null, offData?.labels || [], offData?.allergens || []).catch(() => "unknown");
+  // Undeclared = documented for the product but absent from its ingredient list
+  const undeclared = offData?.ingredients ? subs.filter(s => s.ingredientConfirmed === false) : [];
+  return { offData, aiSugarData: sugar, allSubs: subs, risk: getRisk(subs), diet, undeclared, undeclaredCount: undeclared.length };
+}
+
+// Resolve + analyze, bridging through the assisted path only when the network
+// blocked OFF outright. Returns null when the caller should show a picker.
+async function lookupAndAnalyze(label) {
+  const { product, candidates } = await resolveProduct(label).catch(() => ({ product: null, candidates: [] }));
+  if (candidates.length > 1) return { candidates };
+  let offData = product;
+  if (!offData && (AI_MODE || _offStatus === "network")) offData = await offViaAssisted(label);
+  return { analysis: await analyzeProduct(offData, label) };
 }
 
 // ─── CONSTANTS ─────────────────────────────────────────────────────────────────
@@ -376,90 +406,78 @@ const OFF_FIELDS = "product_name,brands,image_url,nutriscore_grade,nova_group,ec
 
 let _offStatus = "ok"; // status of last direct lookup: "ok" | "nomatch" | "network"
 
+// ─── OPEN FOOD FACTS CLIENT ────────────────────────────────────────────────────
+// One lookup path. Every request goes through offJson, which tries the direct
+// call and falls back to the same-origin /api/off proxy (needed for CORS on the
+// modern search host, and for rate-limit relief via 24h edge caching).
+//
+// Budget matters here: OFF rate-limits search to ~10 requests/minute, so a
+// resolve makes ONE request in the common case and at most three.
+const OFF_HOST = "https://world.openfoodfacts.org";
+const OFF_SEARCH_HOST = "https://search.openfoodfacts.org";
+
 async function offJson(url) {
-  // 1) Direct call (works in most browsers; zero infrastructure)
+  let directErr = null;
   try {
     const r = await fetch(url);
     if (!r.ok) throw new Error("HTTP " + r.status);
     return await r.json();
-  } catch (directErr) {
-    // 2) Same-origin serverless proxy (/api/off) — immune to CORS and rate
-    //    limits thanks to edge caching. Available on Vercel deployments;
-    //    fails fast elsewhere and rethrows the original error.
-    try {
-      const r = await fetch(`/api/off?url=${encodeURIComponent(url)}`);
-      if (!r.ok) throw new Error("proxy HTTP " + r.status);
-      return await r.json();
-    } catch {
-      throw directErr;
-    }
-  }
+  } catch (e) { directErr = e; }
+  const r = await fetch(`/api/off?url=${encodeURIComponent(url)}`);
+  if (!r.ok) throw directErr || new Error("proxy HTTP " + r.status);
+  return r.json();
 }
 
-async function offByCode(code) {
-  const d = await offJson(`https://world.openfoodfacts.org/api/v2/product/${code}.json?fields=${OFF_FIELDS}`);
-  const p = d.product;
-  if (!p || !p.product_name) return null;
-  const parsed = parseOFF(p); parsed._src = "off-direct"; return parsed;
+async function offGetByCode(code) {
+  const d = await offJson(`${OFF_HOST}/api/v2/product/${code}.json?fields=${OFF_FIELDS}`);
+  return d.product?.product_name ? d.product : null;
 }
 
-async function offModernSearch(terms) {
-  // Modern search endpoint — route through /api/off due to CORS restrictions
-  try {
-    const d = await offJson(`/api/off?url=${encodeURIComponent(`https://search.openfoodfacts.org/search?q=${encodeURIComponent(terms)}&page_size=3`)}`);
-    const code = (d.hits || []).find(h => h.code)?.code;
-    return code ? offByCode(code) : null;
-  } catch {
-    return null;
-  }
+async function offSearch(terms, limit) {
+  const d = await offJson(`${OFF_HOST}/cgi/search.pl?search_terms=${encodeURIComponent(terms)}&search_simple=1&action=process&json=1&page_size=${limit}&fields=${OFF_FIELDS}`);
+  return (d.products || []).filter(p => p.product_name);
 }
 
-async function offLegacySearch(terms, limit = 5) {
-  const d = await offJson(`https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(terms)}&search_simple=1&action=process&json=1&page_size=${limit}&fields=${OFF_FIELDS}`);
-  return d.products || [];
-}
-
-async function fetchOFFDirect(query) {
+// Resolve a query to a single product, or to a candidate list for the user to
+// choose from. Returning candidates is what stops "amul milk" silently
+// resolving to "Amul Milk Chocolate".
+async function resolveProduct(query, limit = 6) {
   const q = query.trim();
-  let network = 0, attempts = 0;
-  const tryStep = async (fn) => { attempts++; try { return await fn(); } catch { network++; return null; } };
-  let result = null;
+  let blocked = 0, tried = 0;
+  const step = async (fn) => { tried++; try { return await fn(); } catch { blocked++; return null; } };
+  const done = (product, candidates) => {
+    const found = !!product || (candidates && candidates.length > 0);
+    _offStatus = found ? "ok" : (tried > 0 && blocked >= tried ? "network" : "nomatch");
+    return { product: product ? parseOFF(product) : null, candidates: candidates || [] };
+  };
 
-  if (/^\d{8,14}$/.test(q)) {
-    result = await tryStep(() => offByCode(q));
-  } else {
-    // 1) Modern OFF search (via proxy for CORS)
-    result = await tryStep(() => offModernSearch(q));
-    // 2) Legacy search: full phrase, then one shortened retry
-    if (!result) result = await tryStep(() => offLegacySearch(q));
-    if (!result) {
-      const words = q.split(/\s+/).filter(Boolean);
-      if (words.length > 2) result = await tryStep(() => offLegacySearch(words.slice(0, 2).join(" ")));
-    }
-  }
-  _offStatus = result ? "ok" : (attempts > 0 && network >= attempts ? "network" : "nomatch");
-  return result;
+  // Barcode: exact lookup, one request.
+  if (/^\d{8,14}$/.test(q)) return done(await step(() => offGetByCode(q)), []);
+
+  // Name: one search request; multiple hits become the picker list.
+  const hits = (await step(() => offSearch(q, limit))) || [];
+  if (hits.length === 1) return done(hits[0], []);
+  if (hits.length > 1)   return done(null, hits);
+
+  // Nothing matched — one retry via the modern search host, which handles
+  // fuzzy multi-word queries better, then fetch that product by barcode.
+  const code = await step(async () => {
+    const d = await offJson(`${OFF_SEARCH_HOST}/search?q=${encodeURIComponent(q)}&page_size=3`);
+    return (d.hits || []).find(h => h.code)?.code || null;
+  });
+  if (code) return done(await step(() => offGetByCode(code)), []);
+  return done(null, []);
 }
 
-async function fetchOFF(query) {
-  const direct = await fetchOFFDirect(query);
-  if (direct) return direct;
-  // If the network blocked direct access entirely (e.g. sandboxed preview
-  // environments), bridge through the assisted lookup regardless of mode.
-  // On normal deployments direct access works, so this path never triggers
-  // and product lookups stay zero-cost.
-  if (AI_MODE || _offStatus === "network") {
-    try { return await fetchOFFviaAI(query); } catch { return null; }
-  }
-  return null;
-}
-
-async function fetchOFFviaAI(query) {
+// Sandboxed environments (e.g. preview iframes) can block OFF entirely. Only
+// then do we bridge the lookup through the assisted path.
+async function offViaAssisted(query) {
   const isBarcode = /^\d{8,14}$/.test(query.trim());
   const nutFields = `{"energy-kcal_100g":null,"fat_100g":null,"saturated-fat_100g":null,"carbohydrates_100g":null,"sugars_100g":null,"added-sugars_100g":null,"fiber_100g":null,"proteins_100g":null,"salt_100g":null,"sodium_100g":null,"energy-kcal_serving":null,"fat_serving":null,"carbohydrates_serving":null,"sugars_serving":null,"proteins_serving":null,"salt_serving":null}`;
+  const shape = `{"product_name":"","brands":"","image_url":null,"nutriscore_grade":null,"nova_group":null,"ecoscore_grade":null,"quantity":null,"serving_size":null,"ingredients_text":null,"additives_tags":[],"allergens_tags":[],"labels_tags":[],"categories_tags":[],"nutriments":${nutFields}}`;
   const prompt = isBarcode
-    ? `Look up Open Food Facts product barcode "${query.trim()}". Return ONLY a JSON object (no markdown): {"product_name":"","brands":"","image_url":null,"nutriscore_grade":null,"nova_group":null,"ecoscore_grade":null,"quantity":null,"serving_size":null,"ingredients_text":null,"additives_tags":[],"allergens_tags":[],"labels_tags":[],"categories_tags":[],"nutriments":${nutFields}}`
-    : `Search Open Food Facts for "${query}". Best match only. Return ONLY a JSON object (no markdown): {"product_name":"","brands":"","image_url":null,"nutriscore_grade":null,"nova_group":null,"ecoscore_grade":null,"quantity":null,"serving_size":null,"ingredients_text":null,"additives_tags":[],"allergens_tags":[],"labels_tags":[],"categories_tags":[],"nutriments":${nutFields}}`;
+    ? `Look up Open Food Facts product barcode "${query.trim()}". Return ONLY a JSON object (no markdown): ${shape}`
+    : `Search Open Food Facts for "${query}". Best match only. Return ONLY a JSON object (no markdown): ${shape}`;
   try {
     const txt = await callAI(prompt, 2000, true);
     const m = txt.match(/\{[\s\S]*\}/);
@@ -467,16 +485,8 @@ async function fetchOFFviaAI(query) {
     const p = JSON.parse(m[0]);
     if (!p.product_name) return null;
     const parsed = parseOFF(p);
-    parsed._src = "off-ai";
+    parsed._src = "off-assisted";
     return parsed;
-  } catch { return null; }
-}
-
-async function fetchImageB64(url) {
-  if (!url) return null;
-  try {
-    const txt = await callAI(`Fetch the image at this URL and return it as a base64 data URL string starting with "data:image/" — nothing else: ${url}`, 2000, true);
-    return txt.trim().startsWith("data:image/") ? txt.trim() : null;
   } catch { return null; }
 }
 
@@ -1179,7 +1189,8 @@ export default function App() {
   const [panelAltLoading,setPanelAltLoading] = useState(false);
   const [searchQ,setSearchQ]         = useState("");
   const [searchOpen,setSearchOpen]   = useState(false);
-  const [productPicker,setProductPicker] = useState(null); // {query, matches: [{name, brand, code, ...}]}
+  const [picker,setPicker]           = useState(null); // { query, candidates: raw OFF products }
+  const warnedReadOnly               = useRef(false);
   const searchRef = useRef(null);
 
   // Close the search dropdown on outside click or Escape (works app-wide,
@@ -1232,168 +1243,132 @@ export default function App() {
   const nk        = (s) => normKey(s);
 
   // ── SCAN ────────────────────────────────────────────────────────────────────
+  // Show a tracked entry and kick off its detail panels
+  function showEntry(entry, key) {
+    setTracked(p => [entry, ...p]);
+    setSelected(entry);
+    setScanning(false);
+    loadInsight(entry.name, entry.substances, entry.offData?.nut, entry.offData, key);
+    const cb = fromCache("brand", key);
+    if (cb) setBrandCred(cb); else if (entry.offData?.brand) loadBrand(entry.offData.brand, entry.name, key);
+    const ca = fromCache("alts", key);
+    if (ca) setAlternatives(ca); else loadAlts(entry, key);
+  }
+
+  function entryFrom(rec, label, extra = {}) {
+    return {
+      id: Date.now(),
+      name: rec.offData?.name || label,
+      searchTerm: label,
+      substances: rec.allSubs || [],
+      offData: rec.offData,
+      aiSugarData: rec.aiSugarData,
+      risk: rec.risk,
+      diet: rec.diet || "unknown",
+      undeclaredCount: rec.undeclaredCount ?? undeclaredOf(rec),
+      date: new Date().toLocaleDateString(),
+      ...extra,
+    };
+  }
+
+  // Persist an analysis and announce what was found. Results with no product
+  // data and no findings are deliberately NOT persisted — caching an empty
+  // lookup would serve that same nothing back for 30 days.
+  function commitScan(a, label) {
+    const name = a.offData?.name || label;
+    const key = nk(name);
+    const payload = { offData:a.offData, aiSugarData:a.aiSugarData, allSubs:a.allSubs, risk:a.risk, diet:a.diet, undeclaredCount:a.undeclaredCount, hitCount:1, savedAt:Date.now() };
+    const history = a.offData?.brand ? brandHistory(a.offData.brand) : null;
+
+    if (a.offData || a.allSubs.length > 0) {
+      toCache("scan", key, payload);
+      ghSet(key, payload, setDbCount).then(st => {
+        if (st === "saved") toast("database", `"${name}" committed to the shared database.`);
+        else if (st === "no-token" && !warnedReadOnly.current) {
+          warnedReadOnly.current = true;
+          toast("database", "Read-only mode: results are stored for this session only. Set VITE_GH_TOKEN and redeploy to enable shared database writes.");
+        } else if (st === "error") toast("database", "Shared database write failed — the result is kept for this session. See the browser console for details.");
+      });
+    }
+
+    const entry = entryFrom({ ...a, offData:a.offData }, label);
+    showEntry(entry, key);
+
+    if (a.offData) toast("off", `Found "${name}" on Open Food Facts.`);
+    else toast("scan", _offStatus === "network"
+      ? "Open Food Facts is unreachable from this browser. The analysis is name-based only — press ↻ to retry."
+      : `No Open Food Facts match for "${label}". The analysis is name-based only; nothing was cached, so ↻ retries fresh.`);
+
+    if (a.risk === "high") toast("high", `High risk: ${a.allSubs.filter(s=>s.risk==="high").map(s=>s.name).slice(0,2).join(", ")}.`);
+    else if (a.risk === "medium") toast("medium", "Medium risk substances detected.");
+
+    if (a.undeclared.length > 0) toast("undeclared", `${a.offData?.brand ? a.offData.brand + " — " : ""}"${name}" may contain ${a.undeclared.length} substance${a.undeclared.length!==1?"s":""} not listed on the label: ${a.undeclared.map(s=>s.name).slice(0,3).join(", ")}.`);
+    if (history && (history.undeclared > 0 || history.high >= 2)) toast("brand", `${a.offData.brand}: ${history.undeclared > 0 ? `${history.undeclared} undeclared-substance report${history.undeclared!==1?"s":""}` : `${history.high} high-risk products`} across ${history.count} product${history.count!==1?"s":""} in the shared database.`);
+
+    const sugar = a.offData?.nut?.sugars ?? a.aiSugarData?.total_sugars ?? null;
+    if (sugar != null && sugar > 22.5) toast("sugar", `High sugar: ${sugar}g per 100g.`);
+  }
+
   async function scan(rawName) {
     const label = (rawName || input).trim();
     if (!label) return;
     setInput(""); setScanning(true); setBrandCred(null); setAlternatives([]);
-
     const key = nk(label);
 
     // 1. Session cache
     const sc = fromCache("scan", key);
     if (sc) {
-      const entry = { id:Date.now(), name:sc.offData?.name||label, searchTerm:label, substances:sc.allSubs, offData:sc.offData, aiSugarData:sc.aiSugarData, risk:sc.risk, diet:sc.diet||"unknown", date:new Date().toLocaleDateString(), fromCache:"session" };
-      setTracked(p => [entry, ...p]); setSelected(entry); setScanning(false);
-      toast("cache","Session cache — instant result.");
-      loadInsight(entry.name, sc.allSubs, sc.offData?.nut, sc.offData, key);
-      const cb = fromCache("brand",key); if(cb) setBrandCred(cb); else if(sc.offData?.brand) loadBrand(sc.offData.brand, entry.name, key);
-      const ca = fromCache("alts",key); if(ca) setAlternatives(ca); else loadAlts(entry, key);
+      showEntry(entryFrom(sc, label, { fromCache:"session" }), key);
+      toast("cache", "Session cache — instant result.");
       return;
     }
 
-    // 2. GitHub shared DB
+    // 2. Shared database
     const ghRec = ghGet(key);
     if (ghRec) {
+      const hitCount = (ghRec.hitCount || 0) + 1;
       toCache("scan", key, ghRec);
-      const entry = { id:Date.now(), name:ghRec.offData?.name||label, searchTerm:label, substances:ghRec.allSubs||[], offData:ghRec.offData, aiSugarData:ghRec.aiSugarData, risk:ghRec.risk, diet:ghRec.diet||"unknown", date:new Date().toLocaleDateString(), fromCache:"shared", hitCount:(ghRec.hitCount||0)+1 };
-      ghSet(key, { ...ghRec, hitCount:(ghRec.hitCount||0)+1 }, setDbCount);
-      setTracked(p => [entry, ...p]); setSelected(entry); setScanning(false);
-      toast("shared",`From shared database · searched ${entry.hitCount} time${entry.hitCount!==1?"s":""}`);
-      const undGh = undeclaredOf(ghRec);
-      if (undGh > 0) toast("undeclared",`"${entry.name}" may contain ${undGh} substance${undGh!==1?"s":""} not listed on its label.`);
-      loadInsight(entry.name, ghRec.allSubs, ghRec.offData?.nut, ghRec.offData, key);
-      if(ghRec.offData?.brand) loadBrand(ghRec.offData.brand, entry.name, key);
-      if(ghRec.alts) setAlternatives(ghRec.alts); else loadAlts(entry, key);
+      ghSet(key, { ...ghRec, hitCount }, setDbCount);
+      const entry = entryFrom(ghRec, label, { fromCache:"shared", hitCount });
+      showEntry(entry, key);
+      if (ghRec.alts) setAlternatives(ghRec.alts);
+      toast("shared", `From the shared database · searched ${hitCount} time${hitCount!==1?"s":""}`);
+      const und = undeclaredOf(ghRec);
+      if (und > 0) toast("undeclared", `"${entry.name}" may contain ${und} substance${und!==1?"s":""} not listed on its label.`);
       return;
     }
 
-    // 3. Full scan — check for multiple matches first
-    let offData = null;
-    let aiSugarData = null;
-    let allSubs = [];
-    let undeclared = [];
-    let dietType = "unknown";
-    
-    // Try direct lookups (barcode, modern search, legacy search)
-    const direct = await fetchOFFDirect(label).catch(() => null);
-    if (direct) {
-      offData = direct;
-    } else {
-      // If no direct match but legacy search found multiple candidates,
-      // show a picker instead of auto-guessing wrong
-      try {
-        const legacyMatches = await offLegacySearch(label, 5).catch(() => []);
-        if (legacyMatches.length > 1) {
-          // Multiple matches — let the user pick instead of guessing
-          setScanning(false);
-          setProductPicker({
-            query: label,
-            matches: legacyMatches.map(p => ({
-              name: p.product_name || "Unknown",
-              brand: p.brands || "Unknown brand",
-              code: p.code || null,
-              nutriScore: p.nutriscore_grade || null,
-              image: p.image_url || null,
-              _raw: p,
-            })),
-          });
-          return; // Pause scan — user will pick one
-        } else if (legacyMatches.length === 1) {
-          offData = parseOFF(legacyMatches[0]);
-          offData._src = "off-direct";
-        }
-      } catch {}
-    }
-
-    if (!AI_MODE) {
-      // FREE PATH: Open Food Facts + local rules engine. Zero cost per scan.
-      const fa = await freeAnalyze(label);
-      offData = offData || fa.offData; 
-      aiSugarData = fa.aiSugarData; 
-      allSubs = fa.allSubs;
-      undeclared = fa.undeclared; 
-      dietType = fa.diet;
-    } else {
-      // AI PATH: web-researched hazards, sugar data, base64 images
-      const [off, aiSubs, sug] = await Promise.all([
-        fetchOFF(label).catch(() => null),
-        aiHazards(label, null).catch(() => []),
-        aiSugar(label).catch(() => null),
-      ]);
-      offData = offData || off; 
-      aiSugarData = sug;
-
-      // Image: direct OFF URLs render as-is (free); only AI-sourced lookups need base64 conversion
-      if (offData?.image && !offData.image.startsWith("data:") && offData._src !== "off-direct") {
-        const b64 = await fetchImageB64(offData.image).catch(() => null);
-        if (b64 && offData) offData.image = b64;
+    // 3. Fresh lookup
+    try {
+      const { candidates, analysis } = await lookupAndAnalyze(label);
+      if (candidates) {
+        // Ambiguous query — let the user choose rather than guessing wrong
+        setScanning(false);
+        setPicker({ query: label, candidates });
+        return;
       }
-
-      let finalSubs = aiSubs;
-      if (offData?.ingredients && aiSubs.length === 0) {
-        finalSubs = await aiHazards(offData.name, offData.ingredients).catch(() => []);
-      }
-      allSubs = finalSubs.filter(s => s.key && s.name).map(s => ({...s, id:s.key, source:"ai"}));
-
-      // Safety net: union AI results with the free local engine, so a failed or
-      // empty AI response never blanks the hazard analysis
-      const localSubs = localHazards(offData?.name||label, offData?.ingredients||null, offData?.additives||[], offData?.categories||[]);
-      const have = new Set(allSubs.map(s => (s.key||s.id||"").toLowerCase()));
-      localSubs.forEach(s => { if (!have.has(s.key)) allSubs.push(s); });
-      if (!aiSugarData) aiSugarData = localSugar(offData, offData?.name||label);
-
-      // Undeclared: documented for this product but NOT on its ingredient label
-      undeclared = offData?.ingredients ? allSubs.filter(s => s.ingredientConfirmed === false) : [];
-      dietType = await aiDietClassify(offData?.name||label, offData?.ingredients||null, offData?.labels||[], offData?.allergens||[]).catch(() => "unknown");
+      commitScan(analysis, label);
+    } catch (e) {
+      console.warn("scan:", e);
+      setScanning(false);
+      toast("scan", "The scan could not be completed. Please try again.");
     }
-
-    // Merge new substances into local hazard DB
-    setHazardDb(prev => {
-      const next = {...prev}; let added = 0;
-      allSubs.forEach(s => { const k=s.key||s.id; if(k&&!next[k]){next[k]={...s,source:s.source||"ai"};added++;} });
-      if(added) toast("scan",`${added} substance${added!==1?"s":""} added to local database.`);
-      return next;
-    });
-
-    const risk = getRisk(allSubs);
-    const payload = { offData, aiSugarData, allSubs, risk, diet:dietType, undeclaredCount:undeclared.length, hitCount:1, savedAt:Date.now() };
-
-    // Brand history from the shared DB — before this scan is saved
-    const bHist = offData?.brand ? brandHistory(offData.brand) : null;
-
-    // Only cache & persist scans that actually found something — a failed lookup
-    // must NOT poison the session cache or the shared DB for 30 days
-    const worthSaving = !!offData || allSubs.length > 0;
-    if (worthSaving) {
-      toCache("scan", key, payload);
-      ghSet(key, payload, setDbCount).then(st => { // Save to GitHub for all future users
-        if (st === "saved") toast("database", `"${offData?.name||label}" committed to the shared database.`);
-        else if (st === "no-token" && !window.__hstReadOnlyWarned) {
-          window.__hstReadOnlyWarned = true;
-          toast("database", "Read-only mode: results are stored locally only. Configure VITE_GH_TOKEN and redeploy to enable shared database writes.");
-        }
-        else if (st === "error") toast("database", "Shared database write failed — result kept for this session. Check the browser console for details.");
-      });
-    }
-
-    const entry = { id:Date.now(), name:offData?.name||label, searchTerm:label, substances:allSubs, offData, aiSugarData, risk, diet:dietType, undeclaredCount:undeclared.length, date:new Date().toLocaleDateString() };
-    setTracked(p => [entry, ...p]); setSelected(entry); setScanning(false);
-
-    if (offData) toast("off",`Found "${offData.name}"${offData._src==="off-direct"?" via free Open Food Facts API":" on Open Food Facts"}.`);
-    else toast("scan", _offStatus === "network"
-      ? "Couldn't reach Open Food Facts (network/CORS blocked all attempts). Analysis is name-based only — press ↻ to retry."
-      : `No Open Food Facts match for "${label}". Analysis is based on the product name only — nothing was cached, so ↻ rescan will retry fresh.`);
-    if (risk==="high") toast("high",`High risk: ${allSubs.filter(s=>s.risk==="high").map(s=>s.name).slice(0,2).join(", ")}.`);
-    else if (risk==="medium") toast("medium",`Medium risk substances detected.`);
-    if (undeclared.length > 0) toast("undeclared",`${offData?.brand ? offData.brand + " — " : ""}"${offData?.name||label}" may contain ${undeclared.length} substance${undeclared.length!==1?"s":""} NOT listed on the label: ${undeclared.map(s=>s.name).slice(0,3).join(", ")}.`);
-    if (bHist && (bHist.undeclared > 0 || bHist.high >= 2)) toast("brand",`${offData.brand}: ${bHist.undeclared > 0 ? `${bHist.undeclared} undeclared-substance report${bHist.undeclared!==1?"s":""}` : `${bHist.high} high-risk products`} across ${bHist.count} product${bHist.count!==1?"s":""} in the shared database.`);
-    const sugar = offData?.nut?.sugars ?? aiSugarData?.total_sugars ?? null;
-    if (sugar != null && sugar > 22.5) toast("sugar",`High sugar: ${sugar}g per 100g.`);
-
-    loadInsight(entry.name, allSubs, offData?.nut, offData, key);
-    if (offData?.brand) loadBrand(offData.brand, entry.name, key);
-    loadAlts(entry, key);
   }
+
+  // Continue after the user picks one of the ambiguous candidates
+  async function scanCandidate(rawProduct) {
+    const label = picker?.query || rawProduct.product_name || "";
+    setPicker(null); setScanning(true);
+    try {
+      const offData = parseOFF(rawProduct);
+      commitScan(await analyzeProduct(offData, label), label);
+    } catch (e) {
+      console.warn("scanCandidate:", e);
+      setScanning(false);
+      toast("scan", "The scan could not be completed. Please try again.");
+    }
+  }
+
 
   async function loadInsight(name, subs, nut, offData, key) {
     const k = key || nk(name);
@@ -1417,6 +1392,31 @@ export default function App() {
     setBrandCred(cred); setBrandCredLoading(false);
   }
 
+  // Alternatives are resolved by the same two-source strategy everywhere:
+  // the preferred source for the current mode, then the other as a fallback.
+  // Written once here rather than repeated in each of the three call sites.
+  async function resolveAlts(entry) {
+    const viaOff = () => fetchOFFAlternatives(entry.offData?.categories, entry.name).catch(() => []);
+    const viaAssisted = () => aiAlternatives(entry.name, entry.offData?.brand, entry.offData?.nutriScore, entry.risk, entry.offData?.ingredients).catch(() => []);
+    const [primary, fallback] = AI_MODE ? [viaAssisted, viaOff] : [viaOff, viaAssisted];
+    const first = await primary();
+    if (first && first.length) return first;
+    // Only reach for the fallback when it can actually work
+    if (!AI_MODE && _offStatus !== "network") return [];
+    return (await fallback()) || [];
+  }
+
+  async function resolveCalorieAlts(entry) {
+    const nut = entry.offData?.nut || {};
+    const viaOff = () => fetchOFFCalorieAlts(nut.energy_kcal).catch(() => []);
+    const viaAssisted = () => aiCalorieAlts(entry.name, nut.energy_kcal, entry.offData?.categories?.[0], entry.risk, { fat:nut.fat, sugars:nut.sugars, protein:nut.protein, fiber:nut.fiber }).catch(() => []);
+    const [primary, fallback] = AI_MODE ? [viaAssisted, viaOff] : [viaOff, viaAssisted];
+    const first = await primary();
+    if (first && first.length) return first;
+    if (!AI_MODE && _offStatus !== "network") return [];
+    return (await fallback()) || [];
+  }
+
   async function loadAlts(entry, key) {
     const k = key || nk(entry.name);
     const needsAlt = entry.risk==="high" || entry.risk==="medium" || ["c","d","e"].includes(entry.offData?.nutriScore||"");
@@ -1424,84 +1424,12 @@ export default function App() {
     const cached = fromCache("alts", k);
     if (cached) { setAlternatives(cached); return; }
     setAltLoading(true);
-    let alts = AI_MODE
-      ? await aiAlternatives(entry.name, entry.offData?.brand, entry.offData?.nutriScore, entry.risk, entry.offData?.ingredients).catch(() => [])
-      : await fetchOFFAlternatives(entry.offData?.categories, entry.name).catch(() => []);
-    if (AI_MODE && (!alts || !alts.length)) alts = await fetchOFFAlternatives(entry.offData?.categories, entry.name).catch(() => []); // fallback
-    if (!AI_MODE && (!alts || !alts.length) && _offStatus === "network") // sandboxed env: bridge through assisted lookup
-      alts = await aiAlternatives(entry.name, entry.offData?.brand, entry.offData?.nutriScore, entry.risk, entry.offData?.ingredients).catch(() => []);
+    const alts = await resolveAlts(entry);
     toCache("alts", k, alts);
     setAlternatives(alts); setAltLoading(false);
     // Also persist alts to GitHub DB
     const rec = ghGet(k);
     if (rec) ghSet(k, {...rec, alts}, setDbCount);
-  }
-
-  // Resume the scan after user picks a product from the picker modal
-  async function continueScanWithProduct(rawProduct) {
-    setProductPicker(null);
-    setScanning(true);
-    const label = productPicker?.query || "Unknown";
-    
-    // Parse the picked product
-    const offData = parseOFF(rawProduct);
-    offData._src = "off-direct";
-    
-    // Continue with the full analysis pipeline
-    let aiSugarData, allSubs, undeclared, dietType;
-    if (!AI_MODE) {
-      const localSubs = localHazards(offData.name, offData.ingredients || null, offData.additives || [], offData.categories || []);
-      aiSugarData = localSugar(offData, offData.name);
-      allSubs = localSubs;
-      undeclared = offData.ingredients ? allSubs.filter(s => s.ingredientConfirmed === false) : [];
-      dietType = await aiDietClassify(offData.name, offData.ingredients || null, offData.labels || [], offData.allergens || []).catch(() => "unknown");
-    } else {
-      // AI path with safety net
-      const aiSubs = await aiHazards(offData.name, null).catch(() => []);
-      aiSugarData = await aiSugar(offData.name).catch(() => null);
-      allSubs = aiSubs.filter(s => s.key && s.name).map(s => ({...s, id:s.key, source:"ai"}));
-      const localSubs = localHazards(offData.name, offData.ingredients || null, offData.additives || [], offData.categories || []);
-      const have = new Set(allSubs.map(s => (s.key||s.id||"").toLowerCase()));
-      localSubs.forEach(s => { if (!have.has(s.key)) allSubs.push(s); });
-      if (!aiSugarData) aiSugarData = localSugar(offData, offData.name);
-      undeclared = offData.ingredients ? allSubs.filter(s => s.ingredientConfirmed === false) : [];
-      dietType = await aiDietClassify(offData.name, offData.ingredients || null, offData.labels || [], offData.allergens || []).catch(() => "unknown");
-    }
-
-    setHazardDb(prev => {
-      const next = {...prev};
-      allSubs.forEach(s => { const k=s.key||s.id; if(k&&!next[k]){next[k]={...s,source:s.source||"ai"};} });
-      return next;
-    });
-
-    const risk = getRisk(allSubs);
-    const key = nk(offData.name);
-    const payload = { offData, aiSugarData, allSubs, risk, diet:dietType, undeclaredCount:undeclared.length, hitCount:1, savedAt:Date.now() };
-    const bHist = offData.brand ? brandHistory(offData.brand) : null;
-
-    const worthSaving = !!offData || allSubs.length > 0;
-    if (worthSaving) {
-      toCache("scan", key, payload);
-      ghSet(key, payload, setDbCount).then(st => {
-        if (st === "saved") toast("database", `"${offData.name}" committed to the shared database.`);
-        else if (st === "no-token" && !window.__hstReadOnlyWarned) {
-          window.__hstReadOnlyWarned = true;
-          toast("database", "Read-only mode: results are stored locally only. Configure VITE_GH_TOKEN and redeploy to enable shared database writes.");
-        }
-        else if (st === "error") toast("database", "Shared database write failed — result kept for this session. Check the browser console for details.");
-      });
-    }
-
-    const entry = { id:Date.now(), name:offData.name, searchTerm:label, substances:allSubs, offData, aiSugarData, risk, diet:dietType, undeclaredCount:undeclared.length, date:new Date().toLocaleDateString() };
-    setTracked(p => [entry, ...p]); setSelected(entry); setScanning(false);
-
-    if (offData) toast("off", `Selected "${offData.name}"${offData._src==="off-direct"?" via Open Food Facts API":"."}`);
-    if (risk==="high") toast("high", `High risk: ${allSubs.filter(s=>s.risk==="high").map(s=>s.name).slice(0,2).join(", ")}.`);
-    else if (risk==="medium") toast("medium", `Medium risk substances detected.`);
-    if (undeclared.length > 0) toast("undeclared", `${offData?.brand ? offData.brand + " — " : ""}"${offData?.name}" may contain ${undeclared.length} substance${undeclared.length!==1?"s":""} NOT listed on the label: ${undeclared.map(s=>s.name).slice(0,3).join(", ")}.`);
-    if (bHist && (bHist.undeclared > 0 || bHist.high >= 2)) toast("brand", `${offData.brand}: ${bHist.undeclared > 0 ? `${bHist.undeclared} undeclared-substance report${bHist.undeclared!==1?"s":""}` : `${bHist.high} high-risk products`} across ${bHist.count} product${bHist.count!==1?"s":""} in the shared database.`);
-    const sugar = offData?.nut?.sugars ?? aiSugarData?.total_sugars ?? null;
-    if (sugar != null && sugar > 22.5) toast("sugar", `High sugar: ${sugar}g per 100g.`);
   }
 
   function selectEntry(entry) {
@@ -1538,126 +1466,119 @@ export default function App() {
     "low Nutri-Score items","ultra-processed foods","brands with controversies",
   ];
 
+  // Populate the shared database in the background when a search names a
+  // product we have never analysed. One code path for both modes.
+  async function bgScanFromSearch(query) {
+    try {
+      const { candidates, analysis } = await lookupAndAnalyze(query);
+      // Ambiguous names are skipped rather than guessed — the user can scan
+      // properly from the Hazard Tracker tab and choose the right variant.
+      if (candidates) {
+        setSearchRes(prev => prev ? { ...prev, savingToDb:false, answer:`Several products match "${query}". Scan it from the Hazard Tracker tab to pick the right one.` } : prev);
+        return;
+      }
+      const a = analysis;
+      if (!a.offData && a.allSubs.length === 0) {
+        setSearchRes(prev => prev ? { ...prev, savingToDb:false, answer:`No product data found for "${query}" — nothing was saved.` } : prev);
+        return;
+      }
+      const k = nk(query);
+      const payload = { offData:a.offData, aiSugarData:a.aiSugarData, allSubs:a.allSubs, risk:a.risk, diet:a.diet, undeclaredCount:a.undeclaredCount, hitCount:1, savedAt:Date.now() };
+      toCache("scan", k, payload);
+      const st = await ghSet(k, payload, setDbCount);
+      setSearchRes(prev => prev ? { ...prev, savingToDb:false, savedToDb:st === "saved",
+        answer: a.offData
+          ? `Found ${st === "saved" ? "and saved " : ""}"${a.offData.name}"${a.offData.brand ? ` by ${a.offData.brand}` : ""} — ${a.risk || "no"} risk, ${a.allSubs.length} flagged substance${a.allSubs.length !== 1 ? "s" : ""}.`
+          : prev.answer } : prev);
+      if (st === "saved") toast("database", `"${a.offData?.name || query}" committed to the shared database.`);
+    } catch (e) {
+      console.warn("bgScanFromSearch:", e);
+      setSearchRes(prev => prev ? { ...prev, savingToDb:false } : prev);
+    }
+  }
+
   async function runSearch(q) {
     const query = (q || searchQ).trim();
     if (!query) return;
     setSearchLoading(true); setSearchRes(null); setSearchOpen(true);
     const qLow = query.toLowerCase();
 
-    // Check GitHub DB for instant match
     const dbMatches = Object.entries(_ghDb.products || {})
       .filter(([k,v]) => k.includes(qLow) || (v.offData?.name||"").toLowerCase().includes(qLow) || (v.offData?.brand||"").toLowerCase().includes(qLow))
-      .slice(0,6).map(([k,v]) => ({ name:v.offData?.name||k, brand:v.offData?.brand||null, risk:v.risk, diet:v.diet||"unknown", nutriScore:v.offData?.nutriScore||null, hitCount:v.hitCount||1 }));
+      .slice(0,6)
+      .map(([k,v]) => ({ name:v.offData?.name||k, brand:v.offData?.brand||null, risk:v.risk, diet:v.diet||"unknown", nutriScore:v.offData?.nutriScore||null, hitCount:v.hitCount||1 }));
 
     const summary = tracked.map(f => ({ name:f.name, brand:f.offData?.brand||null, risk:f.risk, nutriScore:f.offData?.nutriScore||null, substances:f.substances.map(s=>s.name).slice(0,4), sugars:f.offData?.nut?.sugars??f.aiSugarData?.total_sugars??null, diet:f.diet||"unknown" }));
 
-    // If DB matches found and no personal scans — instant result
-    if (dbMatches.length > 0 && summary.length === 0) {
-      setSearchRes({ answer:`Found ${dbMatches.length} product${dbMatches.length!==1?"s":""} in the shared database matching "${query}".`, matches:dbMatches.map(m=>({name:m.name+(m.brand?` (${m.brand})`:""),reason:`${m.risk||"unknown"} risk · searched ${m.hitCount}× · ${m.diet}`,diet:m.diet})), tip:`Database has ${dbCount} products total.`, category:"database", fromDb:true });
-      setSearchLoading(false); ghLogSearch(query,"database"); return;
-    }
-
-    // Local matcher — always available, used directly in standard mode and as
-    // the fallback whenever the enhanced search is unavailable
-    const buildLocalResult = () => {
-      const trackedMatches = summary.filter(f =>
+    // Local matcher over this session's scans plus the shared database. Always
+    // available: it answers directly in Standard mode and backs up Enhanced.
+    const localResult = () => {
+      const mine = summary.filter(f =>
         f.name.toLowerCase().includes(qLow) || (f.brand||"").toLowerCase().includes(qLow) ||
-        (qLow.includes("high risk") && f.risk==="high") || (qLow.includes("vegan") && f.diet==="vegan") ||
-        (qLow.includes("vegetarian") && f.diet==="vegetarian") || (qLow.includes("sugar") && (f.sugars??0) > 11.25) ||
-        (qLow.includes("e-number") && f.substances.some(s=>/^E\d/i.test(s))) ||
-        ((qLow.includes("processed")||qLow.includes("nutri")) && ["c","d","e"].includes(f.nutriScore||""))
+        (qLow.includes("high risk") && f.risk === "high") ||
+        (qLow.includes("vegan") && f.diet === "vegan") ||
+        (qLow.includes("vegetarian") && f.diet === "vegetarian") ||
+        (qLow.includes("sugar") && (f.sugars ?? 0) > 11.25) ||
+        (qLow.includes("e-number") && f.substances.some(s => /^E\d/i.test(s))) ||
+        ((qLow.includes("processed") || qLow.includes("nutri")) && ["c","d","e"].includes(f.nutriScore || ""))
       );
       const all = [
-        ...trackedMatches.map(m=>({ name:m.name+(m.brand?` (${m.brand})`:""), reason:`${m.risk||"unknown"} risk${m.sugars!=null?` · ${m.sugars}g sugar`:""} · your scan`, diet:m.diet })),
-        ...dbMatches.map(m=>({ name:m.name+(m.brand?` (${m.brand})`:""), reason:`${m.risk||"unknown"} risk · searched ${m.hitCount}× · shared DB`, diet:m.diet })),
+        ...mine.map(m => ({ name:m.name + (m.brand ? ` (${m.brand})` : ""), reason:`${m.risk||"unknown"} risk${m.sugars!=null?` · ${m.sugars}g sugar`:""} · your scan`, diet:m.diet })),
+        ...dbMatches.map(m => ({ name:m.name + (m.brand ? ` (${m.brand})` : ""), reason:`${m.risk||"unknown"} risk · searched ${m.hitCount}× · shared database`, diet:m.diet })),
       ];
-      return all.length > 0
-        ? { answer:`Found ${all.length} matching item${all.length!==1?"s":""} across your scans and the shared database.`, matches:all.slice(0,6), tip:null, category:"database" }
-        : null;
+      return all.length ? { answer:`Found ${all.length} matching item${all.length!==1?"s":""} across your scans and the shared database.`, matches:all.slice(0,6), tip:null, category:"database" } : null;
     };
 
-    // STANDARD MODE: answer from your scans + shared DB
-    if (!AI_MODE) {
-      try {
-        const local = buildLocalResult();
-        const isProductQ = /^[a-z0-9 '&\-]{2,50}$/i.test(query) && !query.includes("?") && !["who","what","why","how","which","are","is","do","does","show","find","list","tell"].some(w => qLow.startsWith(w));
-        if (local) {
-          setSearchRes(local);
-          setSearchLoading(false); ghLogSearch(query,"database"); return;
-        }
-        if (isProductQ && !ghGet(nk(query))) {
-          setSearchRes({ answer:`"${query}" isn't in the database yet — scanning it now…`, matches:[], tip:null, category:"database", savingToDb:true });
-          setSearchLoading(false); ghLogSearch(query,"database");
-          (async () => {
-            try {
-              const fa = await freeAnalyze(query);
-              if (fa.offData || fa.allSubs.length > 0) {
-                const k = nk(query);
-                const payload = { offData:fa.offData, aiSugarData:fa.aiSugarData, allSubs:fa.allSubs, risk:fa.risk, diet:fa.diet, undeclaredCount:fa.undeclaredCount, hitCount:1, savedAt:Date.now() };
-                toCache("scan", k, payload);
-                const st = await ghSet(k, payload, setDbCount);
-                setSearchRes(prev => prev ? {...prev, savingToDb:false, savedToDb:st==="saved", answer:fa.offData?`Found ${st==="saved"?"and saved ":""}"${fa.offData.name}"${fa.offData.brand?` by ${fa.offData.brand}`:""} — ${fa.risk||"no"} risk, ${fa.allSubs.length} flagged substance${fa.allSubs.length!==1?"s":""}.`:prev.answer} : prev);
-                if (st === "saved") toast("database",`"${fa.offData?.name||query}" committed to the shared database.`);
-              } else {
-                setSearchRes(prev => prev ? {...prev, savingToDb:false, answer:`No product data found for "${query}" — nothing was saved.`} : prev);
-              }
-            } catch (e) { console.warn("bgScan:", e); setSearchRes(prev => prev ? {...prev, savingToDb:false} : prev); }
-          })();
-          return;
-        }
-        setSearchRes({ answer:`No matches found for "${query}" in your scans or the shared database. Try scanning the product first.`, matches:[], tip:`Database has ${dbCount} products total.`, category:"general" });
-      } catch (e) {
-        console.warn("localSearch:", e);
-        setSearchRes({ answer:"Search encountered a problem. Please try again.", matches:[], tip:null, category:"general" });
-      }
-      setSearchLoading(false); ghLogSearch(query,"general"); return;
+    // A bare product-like phrase (not a question) is a candidate for background analysis
+    const looksLikeProduct = /^[a-z0-9 '&\-]{2,50}$/i.test(query) && !query.includes("?")
+      && !["who","what","why","how","which","are","is","do","does","show","find","list","tell"].some(w => qLow.startsWith(w));
+
+    const startBgScan = (base) => {
+      setSearchRes({ ...base, savingToDb:true });
+      setSearchLoading(false);
+      ghLogSearch(query, base.category || "database");
+      bgScanFromSearch(query);
+    };
+
+    // Shared-database hits with nothing scanned locally — answer immediately
+    if (dbMatches.length > 0 && summary.length === 0) {
+      setSearchRes({ answer:`Found ${dbMatches.length} product${dbMatches.length!==1?"s":""} in the shared database matching "${query}".`, matches:dbMatches.map(m => ({ name:m.name + (m.brand ? ` (${m.brand})` : ""), reason:`${m.risk||"unknown"} risk · searched ${m.hitCount}× · ${m.diet}`, diet:m.diet })), tip:`The database holds ${dbCount} products.`, category:"database", fromDb:true });
+      setSearchLoading(false); ghLogSearch(query, "database");
+      return;
     }
 
-    try {
-      const dbCtx = dbMatches.length > 0 ? `DB matches: ${JSON.stringify(dbMatches.slice(0,3))}.` : "";
-      const txt = await callAI(`HST food safety app. User scanned: ${JSON.stringify(summary)}. ${dbCtx} DB has ${dbCount} total products. Query: "${query}". Return ONLY JSON: {"answer":"2-4 sentences","matches":[{"name":"item","reason":"why","diet":"vegan|vegetarian|pescatarian|meat|unknown"}],"tip":"one tip","category":"credibility|risk|sugar|additives|nutrition|diet|database|general"}. No markdown.`, 1000, true);
-      const m = txt.match(/\{[\s\S]*\}/);
-      const result = m ? JSON.parse(m[0]) : { answer:"No results found.", matches:[], tip:null, category:"general" };
-
-      // If query looks like a product name and not in DB — background scan to populate DB
-      const isProductQuery = /^[a-z0-9 '&\-]{2,50}$/i.test(query) && !query.includes("?") && !["who","what","why","how","which","are","is","do","does","show","find","list","tell"].some(w => query.toLowerCase().startsWith(w));
-      const alreadyInDb = !!ghGet(nk(query));
-
-      if (isProductQuery && !alreadyInDb) {
-        setSearchRes({...result, savingToDb:true});
-        setSearchLoading(false); ghLogSearch(query, result.category||"general");
-        // Background scan + save to DB
-        const bgScan = async () => {
-          try {
-            const [offData, aiSubs, aiSugarData] = await Promise.all([fetchOFF(query).catch(()=>null), aiHazards(query,null).catch(()=>[]), aiSugar(query).catch(()=>null)]);
-            let finalSubs = aiSubs;
-            if (offData?.ingredients && aiSubs.length===0) finalSubs = await aiHazards(offData.name||query, offData.ingredients).catch(()=>[]);
-            const allSubs = finalSubs.filter(s=>s.key&&s.name).map(s=>({...s,id:s.key,source:"ai"}));
-            const dietType = await aiDietClassify(offData?.name||query, offData?.ingredients||null, offData?.labels||[], offData?.allergens||[]).catch(()=>"unknown");
-            const risk = getRisk(allSubs);
-            const k = nk(query);
-            const payload = { offData, aiSugarData, allSubs, risk, diet:dietType, hitCount:1, savedAt:Date.now() };
-            if (offData || allSubs.length > 0) {
-              toCache("scan", k, payload);
-              const st = await ghSet(k, payload, setDbCount);
-              setSearchRes(prev => prev ? {...prev, savingToDb:false, savedToDb:st==="saved"} : prev);
-              if (st === "saved") toast("database",`"${offData?.name||query}" committed to the shared database.`);
-            } else {
-              setSearchRes(prev => prev ? {...prev, savingToDb:false} : prev);
-            }
-          } catch (e) { console.warn("bgScan:", e); }
-        };
-        bgScan();
-        return;
+    if (!AI_MODE) {
+      try {
+        const local = localResult();
+        if (local) { setSearchRes(local); setSearchLoading(false); ghLogSearch(query, "database"); return; }
+        if (looksLikeProduct && !ghGet(nk(query))) {
+          startBgScan({ answer:`"${query}" is not in the database yet — analysing it now…`, matches:[], tip:null, category:"database" });
+          return;
+        }
+        setSearchRes({ answer:`No matches for "${query}" in your scans or the shared database. Try scanning the product first.`, matches:[], tip:`The database holds ${dbCount} products.`, category:"general" });
+      } catch (e) {
+        console.warn("runSearch:", e);
+        setSearchRes({ answer:"Search encountered a problem. Please try again.", matches:[], tip:null, category:"general" });
       }
+      setSearchLoading(false); ghLogSearch(query, "general");
+      return;
+    }
 
-      setSearchRes(result); ghLogSearch(query, result.category||"general");
+    // Enhanced mode: generated answer, with the local matcher as the fallback
+    try {
+      const dbCtx = dbMatches.length ? `Shared database matches: ${JSON.stringify(dbMatches.slice(0,3))}.` : "";
+      const txt = await callAI(`HST food safety app. User scanned: ${JSON.stringify(summary)}. ${dbCtx} The database holds ${dbCount} products. Query: "${query}". Return ONLY JSON: {"answer":"2-4 sentences","matches":[{"name":"item","reason":"why","diet":"vegan|vegetarian|pescatarian|meat|unknown"}],"tip":"one tip","category":"credibility|risk|sugar|additives|nutrition|diet|database|general"}. No markdown.`, 1000, true);
+      const m = txt.match(/\{[\s\S]*\}/);
+      const result = m ? JSON.parse(m[0]) : (localResult() || { answer:"No results found.", matches:[], tip:null, category:"general" });
+
+      if (looksLikeProduct && !ghGet(nk(query))) { startBgScan(result); return; }
+      setSearchRes(result); ghLogSearch(query, result.category || "general");
     } catch {
-      const local = buildLocalResult();
-      setSearchRes(local || { answer:"Search encountered a problem. Please try again.", matches:[], tip:null, category:"general" });
+      setSearchRes(localResult() || { answer:"Search encountered a problem. Please try again.", matches:[], tip:null, category:"general" });
     }
     setSearchLoading(false);
   }
+
 
   // ── OTHER OPTIONS PANEL ──────────────────────────────────────────────────────
   function openAltPanel(e, entry) {
@@ -1668,12 +1589,8 @@ export default function App() {
     const cached = fromCache("panelAlts",k) || fromCache("alts",k);
     if (cached) { setPanelAlts(cached); setPanelAltLoading(false); return; }
     setPanelAlts([]); setPanelAltLoading(true);
-    const req = AI_MODE
-      ? aiAlternatives(entry.name, entry.offData?.brand, entry.offData?.nutriScore, entry.risk, entry.offData?.ingredients)
-          .then(a => (a && a.length) ? a : fetchOFFAlternatives(entry.offData?.categories, entry.name)) // fallback
-      : fetchOFFAlternatives(entry.offData?.categories, entry.name);
-    req
-      .then(a => { const r=a||[]; setPanelAlts(r); toCache("panelAlts",k,r); setPanelAltLoading(false); })
+    resolveAlts(entry)
+      .then(a => { const r = a || []; setPanelAlts(r); toCache("panelAlts", k, r); setPanelAltLoading(false); })
       .catch(() => setPanelAltLoading(false));
   }
 
@@ -1684,13 +1601,7 @@ export default function App() {
     const cached = fromCache("calAlts", k);
     if (cached) { setAltTabResults(cached); setAltTabLoading(false); toast("cache","Loaded from cache."); return; }
     setAltTabResults([]); setAltTabLoading(true);
-    const nut = entry.offData?.nut || {};
-    let alts = AI_MODE
-      ? await aiCalorieAlts(entry.name, nut.energy_kcal, entry.offData?.categories?.[0], entry.risk, { fat:nut.fat, sugars:nut.sugars, protein:nut.protein, fiber:nut.fiber }).catch(() => [])
-      : await fetchOFFCalorieAlts(nut.energy_kcal).catch(() => []);
-    if (AI_MODE && (!alts || !alts.length)) alts = await fetchOFFCalorieAlts(nut.energy_kcal).catch(() => []); // fallback
-    if (!AI_MODE && (!alts || !alts.length) && _offStatus === "network") // sandboxed env: bridge through assisted lookup
-      alts = await aiCalorieAlts(entry.name, nut.energy_kcal, entry.offData?.categories?.[0], entry.risk, { fat:nut.fat, sugars:nut.sugars, protein:nut.protein, fiber:nut.fiber }).catch(() => []);
+    const alts = await resolveCalorieAlts(entry);
     toCache("calAlts", k, alts);
     setAltTabResults(alts); setAltTabLoading(false);
   }
@@ -1778,32 +1689,41 @@ export default function App() {
   return (
     <div style={{minHeight:"100vh",background:t.bg,color:t.text,fontFamily:"Inter,'Segoe UI',system-ui,sans-serif",overflow:"hidden"}}>
       {/* ════ PRODUCT PICKER MODAL ════ */}
-      {productPicker && (
-        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999}}>
-          <div style={{background:t.bg,border:`1px solid ${t.border}`,borderRadius:16,padding:"24px 28px",maxWidth:500,maxHeight:"80vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,0.3)"}}>
-            <div style={{fontSize:12,fontWeight:600,color:t.textMuted,letterSpacing:"0.08em",textTransform:"uppercase",marginBottom:8}}>Multiple matches found</div>
-            <h2 style={{margin:"0 0 8px",fontSize:18,fontWeight:700,color:t.text}}>Pick the right "{productPicker.query}"</h2>
-            <div style={{fontSize:11,color:t.textSub,marginBottom:16,lineHeight:1.6}}>Open Food Facts found {productPicker.matches.length} product{productPicker.matches.length!==1?"s":""}. Select the one you want to scan:</div>
-            
-            <div style={{display:"flex",flexDirection:"column",gap:10}}>
-              {productPicker.matches.map((m,i) => (
-                <button key={i} onClick={() => continueScanWithProduct(m._raw)} style={{textAlign:"left",background:t.surface,border:`1.5px solid ${t.border}`,borderRadius:10,padding:"12px 14px",cursor:"pointer",transition:"all 0.2s",display:"flex",gap:12,alignItems:"center"}}>
-                  {m.image && <img src={m.image} alt={m.name} style={{width:48,height:48,borderRadius:6,objectFit:"contain",background:t.bgSub}}/>}
-                  <div style={{flex:1,minWidth:0}}>
-                    <div style={{fontSize:13,fontWeight:600,color:t.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.name}</div>
-                    <div style={{fontSize:10,color:t.textSub,marginTop:2}}>{m.brand}</div>
-                    {m.nutriScore && <div style={{display:"inline-block",fontSize:9,fontWeight:700,color:"#fff",background:NS_COLOR[m.nutriScore]||"#999",padding:"1px 6px",borderRadius:4,marginTop:4}}>{m.nutriScore.toUpperCase()}</div>}
-                  </div>
-                  <span style={{fontSize:16,color:t.textMuted}}>→</span>
-                </button>
-              ))}
+      {/* ── AMBIGUOUS MATCH PICKER ── */}
+      {picker && (
+        <div onClick={() => setPicker(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
+          <div onClick={e => e.stopPropagation()} style={{background:t.bg,border:`1px solid ${t.border}`,borderRadius:16,padding:"22px 24px",width:"min(520px,100%)",maxHeight:"80vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,0.35)"}}>
+            <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.08em",textTransform:"uppercase",marginBottom:6}}>{picker.candidates.length} matches</div>
+            <h2 style={{margin:"0 0 6px",fontSize:17,fontWeight:700,color:t.text}}>Which "{picker.query}"?</h2>
+            <div style={{fontSize:11,color:t.textSub,marginBottom:16,lineHeight:1.6}}>Open Food Facts returned several products for this name. Pick the exact one to analyse.</div>
+
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              {picker.candidates.map((p, i) => {
+                const ns = p.nutriscore_grade;
+                const brand = (p.brands || "").split(",")[0].trim();
+                return (
+                  <button key={i} onClick={() => scanCandidate(p)} style={{textAlign:"left",background:t.surface,border:`1.5px solid ${t.border}`,borderRadius:10,padding:"11px 13px",cursor:"pointer",display:"flex",gap:12,alignItems:"center",width:"100%"}}>
+                    {p.image_url
+                      ? <img src={p.image_url} alt="" style={{width:44,height:44,borderRadius:6,objectFit:"contain",background:t.bgSub,flexShrink:0}}/>
+                      : <div style={{width:44,height:44,borderRadius:6,background:t.bgSub,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>🍽️</div>}
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:13,fontWeight:600,color:t.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.product_name}</div>
+                      <div style={{fontSize:10,color:t.textSub,marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                        {brand || "Unknown brand"}{p.quantity ? ` · ${p.quantity}` : ""}
+                      </div>
+                    </div>
+                    {ns && <span style={{fontSize:9,fontWeight:700,color:"#fff",background:NS_COLOR[ns]||"#999",padding:"2px 7px",borderRadius:4,flexShrink:0}}>{ns.toUpperCase()}</span>}
+                    <span style={{fontSize:14,color:t.textMuted,flexShrink:0}}>→</span>
+                  </button>
+                );
+              })}
             </div>
-            
-            <button onClick={() => setProductPicker(null)} style={{marginTop:16,width:"100%",background:t.pill,border:`1px solid ${t.border}`,borderRadius:8,padding:"9px 14px",cursor:"pointer",fontSize:12,fontWeight:600,color:t.textSub}}>Cancel</button>
+
+            <button onClick={() => setPicker(null)} style={{marginTop:14,width:"100%",background:t.pill,border:`1px solid ${t.border}`,borderRadius:8,padding:"9px 14px",cursor:"pointer",fontSize:12,fontWeight:600,color:t.textSub}}>Cancel</button>
           </div>
         </div>
       )}
-      
+
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
         *{font-family:'Inter','Segoe UI',system-ui,sans-serif;-webkit-font-smoothing:antialiased;box-sizing:border-box}

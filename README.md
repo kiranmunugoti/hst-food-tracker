@@ -1,8 +1,38 @@
-# HST — Hazard Substance Tracker (v3.2)
+# HST — Hazard Substance Tracker (v5.0)
 
-Free-mode food safety tracker: Open Food Facts API + local rules engine + GitHub shared DB.
-Zero AI cost per scan. Flip `AI_MODE = true` in `src/App.jsx` to enable Anthropic-powered enrichment
-(requires routing calls through a backend with an API key — see notes below).
+Scans food products for hazardous additives, contaminants, and substances that are
+**not declared on the label**. Rates brands from aggregated scan data.
+
+Built to stay affordable at scale: the default analysis path makes no AI calls at
+all, so the marginal cost of a scan is effectively zero.
+
+## Architecture
+
+Three layers, each with one entry point:
+
+| Layer | Function | Responsibility |
+|---|---|---|
+| Lookup | `resolveProduct(query)` | Query → one product, or a candidate list. **1 request** typically, 3 worst case. |
+| Analysis | `analyzeProduct(offData, label)` | Product → hazards, sugar, diet, undeclared list. Issues no lookups of its own. |
+| Persist | `commitScan(analysis, label)` | Cache, shared-database write, user notifications. |
+
+Every entry point (manual scan, picker choice, background scan from the search
+bar) funnels through these same three functions — there is no second pipeline.
+
+### Analysis modes
+- **Standard** (default): deterministic. 50-additive E-number database, category
+  contaminant rules, glycemic-index table, template insights, community brand
+  ratings, Open Food Facts category search for alternatives. No AI calls.
+- **Enhanced**: layers extended research on top. It can only ever *add* to the
+  Standard baseline, so a failed or unavailable enhanced response degrades
+  silently instead of blanking the analysis. Toggle in the header; it probes
+  connectivity and tells you whether the service is actually reachable.
+
+### Request budget
+Open Food Facts rate-limits search to roughly 10 requests per minute. Lookups are
+therefore capped at 3 requests and cached at three levels (session → shared
+database → 24h edge cache in `/api/off`). Empty results are never cached, so a
+failed lookup does not serve that same nothing back for 30 days.
 
 ## Run locally
     npm install
@@ -10,36 +40,36 @@ Zero AI cost per scan. Flip `AI_MODE = true` in `src/App.jsx` to enable Anthropi
 
 ## Deploy to Vercel
 1. Push this folder to a GitHub repo.
-2. In Vercel: Add New Project → import the repo.
-   Framework preset: **Vite** (auto-detected). Build command `npm run build`, output `dist`.
-3. Optional (enables writes to the shared GitHub db.json):
-   Project → Settings → Environment Variables → add `VITE_GH_TOKEN` = a GitHub
-   fine-grained token with **Contents: Read and write** on `kiranmunugoti/hst-food-tracker`.
-   Redeploy after adding it. Without the token the app still runs — reads are public,
-   writes are silently skipped.
+2. Vercel → Add New Project → import the repo. Framework preset **Vite** is
+   auto-detected (build `npm run build`, output `dist`).
+3. Environment variables (Settings → Environment Variables, then **redeploy** —
+   `VITE_` values are injected at build time):
 
-## Troubleshooting
-- Blank page → open browser DevTools (F12) → Console, and check Vercel → Deployments → Build Logs.
-- `VITE_GH_TOKEN` must be set at build time (Vite inlines it). Re-deploy after changing it.
-- Note: a `VITE_` env var is embedded in the public JS bundle — anyone can extract the token.
-  Fine for a demo repo; for production, move GitHub writes behind a Vercel serverless function.
+   | Variable | Required | Purpose |
+   |---|---|---|
+   | `VITE_GH_TOKEN` | for shared writes | Fine-grained GitHub token, scoped to the database repo, **Contents: Read and write**. Without it the app runs read-only and says so. |
+   | `ANTHROPIC_API_KEY` | for Enhanced mode | Server-side only — **no** `VITE_` prefix. Used by `/api/claude`. |
 
-## AI mode caveat
-`AI_MODE = true` calls `api.anthropic.com` directly from the browser. That only works inside
-Claude.ai artifacts (which inject auth). On Vercel you must create an `/api/claude` serverless
-function that holds your `ANTHROPIC_API_KEY` and proxies requests, then point `callAI` at it.
-Free mode (default) needs none of this.
+### Serverless functions (`/api`)
+- **`/api/off`** — proxies Open Food Facts. Removes CORS restrictions and edge-caches
+  for 24h, which is what keeps the app inside OFF's rate limits at scale.
+- **`/api/claude`** — proxies Anthropic for Enhanced mode, keeping the key server-side.
 
-## Serverless proxies (v3.6)
-Two functions in `/api` deploy automatically with the app on Vercel:
+> A `VITE_`-prefixed variable is embedded in the public JS bundle and can be
+> extracted by anyone. Keep `VITE_GH_TOKEN` scoped to a single non-critical repo.
+> To remove that exposure, move the database write behind a serverless function
+> alongside the two above.
 
-- **`/api/off`** — proxies Open Food Facts. The app tries OFF directly first and
-  falls back to this proxy, so CORS blocks and rate limits can no longer break
-  Standard mode. Responses are edge-cached for 24h.
-- **`/api/claude`** — proxies the Anthropic API for Enhanced mode. Set
-  `ANTHROPIC_API_KEY` in Vercel → Settings → Environment Variables (server-side
-  name, NO `VITE_` prefix — a VITE_ key would be exposed in the public bundle).
-  Without it, Enhanced mode simply falls back to the built-in engine.
+## Shared database
+Scans are committed to `db.json` in the configured GitHub repo, so a product
+analysed once loads instantly for everyone afterwards. Writes report their real
+outcome (`saved` / `no-token` / `error`) — the UI never claims a commit that did
+not happen. Stale-`sha` conflicts are retried once, and the first write creates
+the file if it is missing.
 
-If you previously added an API key directly in client code, remove it — it is
-publicly extractable from the deployed bundle. Use `ANTHROPIC_API_KEY` instead.
+## Known limits
+- Standard mode only knows the 50 additives and 7 contaminant patterns it ships
+  with. Enhanced mode can research beyond that.
+- GitHub is fine as a database for early scale; beyond roughly 5,000 writes/hour
+  it will rate-limit and concurrent commits will collide. Cloudflare Workers KV
+  or Supabase are the natural free-tier successors — swap `ghGet`/`ghSet`.
