@@ -403,6 +403,17 @@ async function offByCode(code) {
   const parsed = parseOFF(p); parsed._src = "off-direct"; return parsed;
 }
 
+async function offModernSearch(terms) {
+  // Modern search endpoint — route through /api/off due to CORS restrictions
+  try {
+    const d = await offJson(`/api/off?url=${encodeURIComponent(`https://search.openfoodfacts.org/search?q=${encodeURIComponent(terms)}&page_size=3`)}`);
+    const code = (d.hits || []).find(h => h.code)?.code;
+    return code ? offByCode(code) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function offLegacySearch(terms, limit = 5) {
   const d = await offJson(`https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(terms)}&search_simple=1&action=process&json=1&page_size=${limit}&fields=${OFF_FIELDS}`);
   return d.products || [];
@@ -417,14 +428,9 @@ async function fetchOFFDirect(query) {
   if (/^\d{8,14}$/.test(q)) {
     result = await tryStep(() => offByCode(q));
   } else {
-    // 1) Modern OFF search (search-a-licious — far better fuzzy matching) → barcode → full product
-    result = await tryStep(async () => {
-      const s = await offJson(`https://search.openfoodfacts.org/search?q=${encodeURIComponent(q)}&page_size=3`);
-      const code = (s.hits || []).find(h => h.code)?.code;
-      return code ? offByCode(code) : null;
-    });
-    // 2) Legacy search: full phrase, then one shortened retry (kept minimal —
-    //    OFF rate-limits search requests, so fewer calls per scan matters)
+    // 1) Modern OFF search (via proxy for CORS)
+    result = await tryStep(() => offModernSearch(q));
+    // 2) Legacy search: full phrase, then one shortened retry
     if (!result) result = await tryStep(() => offLegacySearch(q));
     if (!result) {
       const words = q.split(/\s+/).filter(Boolean);
@@ -1263,6 +1269,10 @@ export default function App() {
 
     // 3. Full scan — check for multiple matches first
     let offData = null;
+    let aiSugarData = null;
+    let allSubs = [];
+    let undeclared = [];
+    let dietType = "unknown";
     
     // Try direct lookups (barcode, modern search, legacy search)
     const direct = await fetchOFFDirect(label).catch(() => null);
