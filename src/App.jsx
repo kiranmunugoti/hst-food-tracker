@@ -1,26 +1,28 @@
 import { useState, useRef, useEffect } from "react";
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────────
+// The shared scan database lives in its OWN repository, separate from this
+// source code. The app commits to it on every scan, so keeping it out of the
+// code repo means your `git push` is never rejected by commits the app made.
+// Create the repo (public, empty) and put its name here.
 const GH_OWNER  = "kiranmunugoti";
-const GH_REPO   = "hst-food-tracker";
+const GH_REPO   = "hst-database";   // data only — NOT the source repo
 const GH_BRANCH = "main";
 const GH_FILE   = "db.json";
 const GH_RAW    = `https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${GH_BRANCH}/${GH_FILE}`;
-// Set VITE_GH_TOKEN in Vercel env vars for write access. Reads are always public.
-// __GH_TOKEN__ is injected at build time by Vite (see vite.config.js). Inside
-// Claude artifacts the global doesn't exist — the typeof guard keeps the app
-// running with reads public and writes silently disabled.
+// Write access needs VITE_GH_TOKEN (Vercel env var, scoped to the database repo
+// only). Reads are public and always work. __GH_TOKEN__ is injected at build
+// time by Vite; the typeof guard keeps the app running where it is absent, with
+// reads working and writes cleanly disabled.
 const GH_TOKEN  = (typeof __GH_TOKEN__ !== "undefined" && __GH_TOKEN__) || "";
 
-// ─── ENGINE MODE ───────────────────────────────────────────────────────────────
-// false = FREE MODE (default): local rules engine + Open Food Facts API + GitHub
-//         cache. Zero AI calls, zero cost per scan — scales to millions of users.
-// true  = AI MODE: Anthropic API enrichment (web-researched hazards, brand
-//         research, generated insights). Costs per call — use as a premium tier.
-//         NOTE: works out-of-the-box only inside Claude artifacts; on Vercel it
-//         needs a serverless proxy for the API key. Every AI call falls back to
-//         the free engine automatically if it fails.
-// Toggleable at runtime from the ⚡ switch in the header.
+// ─── ANALYSIS MODE ─────────────────────────────────────────────────────────────
+// false = STANDARD (default): deterministic engine + Open Food Facts + shared
+//         database. No AI calls, so the marginal cost per scan is zero.
+// true  = ENHANCED: layers extended research on top. Can only ADD to the
+//         Standard baseline, so an unavailable response degrades silently.
+//         Needs ANTHROPIC_API_KEY server-side on Vercel (see /api/claude).
+// Toggleable at runtime from the header switch.
 let AI_MODE = false;
 
 // ─── SEED HAZARD DB ────────────────────────────────────────────────────────────
@@ -621,22 +623,34 @@ async function aiCalorieAlts(name, calories, category, risk, nutrients) {
 // ghDb is module-level so it persists across re-renders without React state
 let _ghDb = { products:{}, searchLog:[] };
 let _ghSha = "";
+let _ghLastError = "";  // human-readable reason the last write failed
 
+// Load the shared database. Returns "ok" | "empty" | "error" so the caller can
+// tell an empty database apart from an unreachable one.
 async function ghLoad(setDbCount) {
   try {
     const r = await fetch(`${GH_RAW}?t=${Date.now()}`);
-    if (!r.ok) return;
+    if (!r.ok) {
+      // 404 = the database file does not exist yet. That is a normal first-run
+      // state: the first write creates it.
+      console.info(`Shared database not found at ${GH_OWNER}/${GH_REPO}/${GH_FILE} (HTTP ${r.status}). It will be created on the first successful write.`);
+      return "empty";
+    }
     const data = await r.json();
-    _ghDb = data;
-    setDbCount(Object.keys(data.products || {}).length);
-    // Also get SHA for writes
+    if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("malformed database file");
+    _ghDb = { products: data.products || {}, searchLog: data.searchLog || [], _meta: data._meta || {} };
+    setDbCount(Object.keys(_ghDb.products).length);
     if (GH_TOKEN) {
       const r2 = await fetch(`https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_FILE}`, {
         headers:{ Authorization:`Bearer ${GH_TOKEN}`, Accept:"application/vnd.github.v3+json" },
       });
       if (r2.ok) { const meta = await r2.json(); _ghSha = meta.sha; }
     }
-  } catch (e) { console.warn("ghLoad:", e); }
+    return "ok";
+  } catch (e) {
+    console.warn("ghLoad:", e);
+    return "error";
+  }
 }
 
 function ghGet(ck) {
@@ -664,7 +678,19 @@ async function ghWrite(message) {
       else if (m.status === 404) _ghSha = ""; // file doesn't exist yet — create it
       r = await doPut();
     }
-    if (!r.ok) { console.warn("ghWrite failed:", r.status, await r.text().catch(()=> "")); return "error"; }
+    if (!r.ok) {
+      const detail = await r.text().catch(() => "");
+      // Name the likely cause instead of a bare failure — these are the three
+      // setup mistakes that actually happen.
+      const hint = r.status === 404
+        ? `Repository ${GH_OWNER}/${GH_REPO} not found. Create it (public, with a main branch) or correct GH_REPO.`
+        : r.status === 401 ? "The token is invalid or expired."
+        : r.status === 403 ? `The token lacks 'Contents: Read and write' on ${GH_OWNER}/${GH_REPO}.`
+        : `HTTP ${r.status}.`;
+      console.warn("ghWrite failed:", r.status, hint, detail);
+      _ghLastError = hint;
+      return "error";
+    }
     const resp = await r.json();
     _ghSha = resp.content?.sha || _ghSha;
     return "saved";
@@ -735,15 +761,35 @@ function brandHistory(brand) {
 }
 
 let _searchFlushTimer = null;
+let _searchDirty = false;
+
+// Commit pending search records. Product writes already serialise the whole
+// database (search log included), so this only needs to cover searches that
+// are not followed by a scan.
+function flushSearchLog() {
+  clearTimeout(_searchFlushTimer);
+  _searchFlushTimer = null;
+  if (!_searchDirty || !GH_TOKEN) return;
+  _searchDirty = false;
+  ghWrite("log: searches");
+}
+
 function ghLogSearch(query, category) {
   if (!_ghDb.searchLog) _ghDb.searchLog = [];
   _ghDb.searchLog.unshift({ query, category, at: Date.now() });
   if (_ghDb.searchLog.length > 500) _ghDb.searchLog = _ghDb.searchLog.slice(0, 500);
-  // Persist search records too — debounced to one commit per 20s of activity
-  if (GH_TOKEN) {
-    clearTimeout(_searchFlushTimer);
-    _searchFlushTimer = setTimeout(() => ghWrite("log: searches"), 20000);
-  }
+  if (!GH_TOKEN) return;
+  _searchDirty = true;
+  // Debounced so a burst of typing produces one commit, but short enough that
+  // records are not lost when the user leaves shortly after searching.
+  clearTimeout(_searchFlushTimer);
+  _searchFlushTimer = setTimeout(flushSearchLog, 8000);
+}
+
+// Last chance to persist when the tab is hidden or closed
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flushSearchLog(); });
+  window.addEventListener("pagehide", flushSearchLog);
 }
 
 // ─── FOOD ILLUSTRATION ─────────────────────────────────────────────────────────
@@ -1287,7 +1333,7 @@ export default function App() {
         else if (st === "no-token" && !warnedReadOnly.current) {
           warnedReadOnly.current = true;
           toast("database", "Read-only mode: results are stored for this session only. Set VITE_GH_TOKEN and redeploy to enable shared database writes.");
-        } else if (st === "error") toast("database", "Shared database write failed — the result is kept for this session. See the browser console for details.");
+        } else if (st === "error") toast("database", `Shared database write failed — ${_ghLastError || "see the browser console"}. The result is kept for this session.`);
       });
     }
 

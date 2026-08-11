@@ -60,12 +60,33 @@ failed lookup does not serve that same nothing back for 30 days.
 > To remove that exposure, move the database write behind a serverless function
 > alongside the two above.
 
-## Shared database
-Scans are committed to `db.json` in the configured GitHub repo, so a product
-analysed once loads instantly for everyone afterwards. Writes report their real
-outcome (`saved` / `no-token` / `error`) — the UI never claims a commit that did
-not happen. Stale-`sha` conflicts are retried once, and the first write creates
-the file if it is missing.
+## Shared database — separate repository
+
+The scan database lives in its **own repository**, not this one:
+
+    GH_OWNER / GH_REPO  →  kiranmunugoti / hst-database   (src/App.jsx, line ~8)
+
+This separation is deliberate. The app commits to the database on every scan, so
+if the database lived in the source repo, the remote would constantly gain commits
+your local clone lacks and every `git push` would be rejected with
+`! [rejected] main -> main (fetch first)`. Keeping data out of the code repo means
+pushes stay clean forever.
+
+### One-time setup
+1. Create a new **public** repository named `hst-database` (add a README so it has
+   a `main` branch). Nothing else needed — the app creates `db.json` on the first
+   successful write.
+2. Create a fine-grained GitHub token scoped to **`hst-database` only**, with
+   **Contents: Read and write**.
+3. Add it in Vercel as `VITE_GH_TOKEN`, then **redeploy**.
+
+To use a different name, change `GH_REPO` in `src/App.jsx`.
+
+### Behaviour
+Writes report their real outcome (`saved` / `no-token` / `error`) — the UI never
+claims a commit that did not happen. Failures name their cause: a missing
+repository, an invalid token, or missing Contents permission. Stale-`sha`
+conflicts are retried once, and a missing `db.json` is created automatically.
 
 ## Known limits
 - Standard mode only knows the 50 additives and 7 contaminant patterns it ships
