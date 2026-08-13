@@ -91,6 +91,13 @@ function attach(server) {
 
 export default defineConfig({
   plugins: [react(), devApiPlugin()],
+  build: {
+    // Ship source maps. Without them a production crash reports only minified
+    // frames like `ty/<.children<.children<`, which name nothing and cannot be
+    // traced back to a line. The map is a separate file the browser fetches
+    // only when devtools are open, so it costs users nothing.
+    sourcemap: true,
+  },
   define: {
     __GH_TOKEN__: JSON.stringify(process.env.VITE_GH_TOKEN || ""),
   },

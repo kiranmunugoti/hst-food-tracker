@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { productRatings, addReview, CSPI_TIERS, ACCOLADE_SOURCES, normalizeScore } from "./ratings.js";
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────────
 // The shared scan database lives in its OWN repository, separate from this
@@ -2551,7 +2552,137 @@ function NRow({ label, val100, valSrv, unit, ri, bold, indent, type, hasSrv, t }
 }
 
 // ─── OFF PRODUCT CARD ──────────────────────────────────────────────────────────
-function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, brandCred, brandStat, brandCredLoading, alternatives, altLoading, diet, t, dark, onOpen, cosmeticAnalysis }) {
+function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, myReport, setMyReport, onSubmit }) {
+  if (!ratings) return null;
+  const { safety, expert, community } = ratings;
+  const TIER_COLOR = { avoid:"#c0392b", caution:"#d97706", sensitive:"#b8860b", cutback:"#7a8b3a", safe:"#2e7d52" };
+  const sHdr = { fontSize:10, fontWeight:700, letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:8 };
+  const box  = { background:t.surface, border:`1px solid ${t.border}`, borderRadius:10, padding:12, marginBottom:10 };
+  const scoreColor = (v) => v >= 8 ? "#2e7d52" : v >= 6 ? "#7a8b3a" : v >= 4 ? "#d97706" : "#c0392b";
+
+  return (
+    <div style={{marginTop:14}}>
+      {/* Three scores, never merged. Combining them would let a well-reviewed
+          product mask a composition problem — the exact thing this app is for. */}
+      <div style={{display:"flex",gap:8,marginBottom:10}}>
+        {[["Safety", safety.score, "CSPI tiers"],
+          ["Expert", expert.score, expert.count ? `${expert.count} source${expert.count!==1?"s":""}` : "none yet"],
+          ["Community", community.score, community.count ? `${community.count} review${community.count!==1?"s":""}` : "none yet"]
+        ].map(([label, val, sub]) => (
+          <div key={label} style={{flex:1,textAlign:"center",background:t.surface,border:`1px solid ${t.border}`,borderRadius:10,padding:"10px 6px"}}>
+            <div style={{fontSize:19,fontWeight:700,color:val==null?t.textMuted:scoreColor(val)}}>{val == null ? "—" : val}</div>
+            <div style={{fontSize:10,fontWeight:600,color:t.text,marginTop:1}}>{label}</div>
+            <div style={{fontSize:9,color:t.textMuted,marginTop:1}}>{sub}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{fontSize:9,color:t.textMuted,lineHeight:1.6,marginBottom:12}}>
+        Scored 1–10. These are kept separate on purpose: a product can be
+        award-winning and well liked and still contain an additive CSPI rates
+        “Avoid”. Reviews never change the safety score.
+      </div>
+
+      {/* ── CSPI breakdown ── */}
+      <div style={box}>
+        <div style={{...sHdr,color:t.textSub}}>CSPI Chemical Cuisine</div>
+        {safety.rated.length === 0 && safety.unrated.length === 0 && (
+          <div style={{fontSize:11,color:t.textSub}}>No additives listed for this product.</div>
+        )}
+        {(safety.rated || []).map(r => (
+          <div key={r.additive} style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:6}}>
+            <span style={{flexShrink:0,fontSize:8,fontWeight:700,color:"#fff",background:TIER_COLOR[r.tier]||"#777",padding:"3px 6px",borderRadius:4,marginTop:1}}>
+              {CSPI_TIERS[r.tier]?.short || "Unrated"}
+            </span>
+            <div style={{minWidth:0}}>
+              <div style={{fontSize:11,fontWeight:600,color:t.text}}>{r.name}</div>
+              <div style={{fontSize:10,color:t.textSub,lineHeight:1.5}}>{r.why}</div>
+            </div>
+          </div>
+        ))}
+        {(safety.unrated || []).length > 0 && (
+          <div style={{fontSize:10,color:t.textMuted,marginTop:8,lineHeight:1.6,borderTop:`1px solid ${t.border}`,paddingTop:8}}>
+            Not in the curated CSPI subset, so not scored either way: {safety.unrated.join(", ")}.
+            Coverage {Math.round(safety.coverage * 100)}% — an unrated additive is unknown, not cleared.
+          </div>
+        )}
+      </div>
+
+      {/* ── Expert accolades ── */}
+      <div style={box}>
+        <div style={{...sHdr,color:t.textSub}}>Expert scores &amp; awards</div>
+        {expert.count === 0 ? (
+          <div style={{fontSize:10,color:t.textSub,lineHeight:1.6}}>
+            None recorded. Competition medals, critic scores and lab results have no
+            open API — they are curated entries in the shared database, added by hand
+            with a source. Nothing here is generated.
+          </div>
+        ) : (
+          <>
+            {expert.items.map((a, i) => (
+              <div key={i} style={{display:"flex",gap:8,alignItems:"baseline",marginBottom:5}}>
+                <span style={{fontSize:12,fontWeight:700,color:scoreColor(a.normalized.value),minWidth:26}}>{a.normalized.value}</span>
+                <div style={{minWidth:0}}>
+                  <div style={{fontSize:11,color:t.text}}>{a.name || a.sourceLabel} {a.year ? `(${a.year})` : ""}</div>
+                  <div style={{fontSize:9,color:t.textMuted}}>{a.sourceLabel} · original “{a.normalized.raw}” · {a.normalized.note}</div>
+                </div>
+              </div>
+            ))}
+            {expert.thin && (
+              <div style={{fontSize:9,color:t.textMuted,marginTop:6,lineHeight:1.6}}>
+                Fewer than three sources — treat as indicative, not a verdict.
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* ── Community ── */}
+      <div style={box}>
+        <div style={{...sHdr,color:t.textSub}}>Customer reviews</div>
+        {community.count > 0 && (
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,color:t.text,marginBottom:4}}>
+              {community.average}/5 from {community.count} review{community.count!==1?"s":""}
+              {community.thin && <span style={{color:t.textMuted}}> · too few to be representative</span>}
+            </div>
+            {community.reports.length > 0 && (
+              <div style={{fontSize:10,color:"#d97706",lineHeight:1.6,marginTop:5}}>
+                Unverified substance reports: {community.reports.map(r => `${r.substance} (${r.count})`).join(", ")}.
+                These are reader claims awaiting confirmation and do not affect the safety score.
+              </div>
+            )}
+          </div>
+        )}
+        <div style={{display:"flex",gap:5,marginBottom:8}}>
+          {[1,2,3,4,5].map(n => (
+            <button key={n} onClick={() => setMyStars(n)}
+              style={{flex:1,padding:"7px 0",fontSize:13,borderRadius:7,cursor:"pointer",
+                background:n<=myStars?"#d97706":t.pill,color:n<=myStars?"#fff":t.textSub,
+                border:`1px solid ${n<=myStars?"#d97706":t.border}`,fontWeight:600}}>★</button>
+          ))}
+        </div>
+        <textarea value={myReview} onChange={e => setMyReview(e.target.value)} rows={2} maxLength={500}
+          placeholder="What did you think? (optional)"
+          style={{width:"100%",boxSizing:"border-box",fontSize:11,padding:"7px 9px",borderRadius:7,border:`1px solid ${t.border}`,background:t.bgSub,color:t.text,resize:"vertical",fontFamily:"inherit",marginBottom:6}}/>
+        <input value={myReport} onChange={e => setMyReport(e.target.value)}
+          placeholder="Ingredient on the label but missing from the data? (comma separated)"
+          style={{width:"100%",boxSizing:"border-box",fontSize:11,padding:"7px 9px",borderRadius:7,border:`1px solid ${t.border}`,background:t.bgSub,color:t.text,marginBottom:8}}/>
+        <button onClick={onSubmit} disabled={!myStars}
+          style={{width:"100%",padding:"9px 0",fontSize:12,fontWeight:600,borderRadius:8,cursor:myStars?"pointer":"default",
+            background:myStars?t.accent:t.pill,color:myStars?t.accentFg:t.textMuted,border:"none"}}>
+          {myStars ? "Save review to shared database" : "Pick a rating first"}
+        </button>
+        <div style={{fontSize:9,color:t.textMuted,marginTop:7,lineHeight:1.6}}>
+          One review per device; saving again replaces your previous one. Reviews are
+          public. Substance reports are counted and shown as unverified — they are a
+          prompt to check the label, not a change to the rating.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, brandCred, brandStat, brandCredLoading, alternatives, altLoading, diet, t, dark, onOpen, cosmeticAnalysis, ratingsPanel }) {
   const [showIngr, setShowIngr] = useState(false);
   const n = offData.nut;
   const hasSrv = !!offData.servingSize;
@@ -2797,6 +2928,8 @@ function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, br
       })()}
 
       {/* HEALTHIER ALTERNATIVES */}
+      {ratingsPanel}
+
       {(altLoading || (alternatives && alternatives.length > 0)) && (
         <div style={{...card}}>
           <div style={{...sHdr,color:"#2e7d52"}}>Healthier Alternatives</div>
@@ -2850,6 +2983,10 @@ export default function App() {
   const [toasts,setToasts]       = useState([]);
   const [insight,setInsight]     = useState("");
   const [insightLoading,setInsightLoading] = useState(false);
+  const [ratings,setRatings]     = useState(null);   // safety / expert / community
+  const [myStars,setMyStars]     = useState(0);
+  const [myReview,setMyReview]   = useState("");
+  const [myReport,setMyReport]   = useState("");
   const [brandCred,setBrandCred] = useState(null);
   const [brandCredLoading,setBrandCredLoading] = useState(false);
   const [alternatives,setAlternatives] = useState([]);
@@ -2964,6 +3101,7 @@ export default function App() {
     setTracked(p => [entry, ...p]);
     setSelected(entry);
     setScanning(false);
+    loadRatings(entry, key);
     loadInsight(entry.name, entry.substances, entry.offData?.nut, entry.offData, key);
     const cb = fromCache("brand", key);
     if (cb) setBrandCred(cb); else if (entry.offData?.brand) loadBrand(entry.offData.brand, entry.name, key);
@@ -3151,7 +3289,7 @@ export default function App() {
   async function selectPickerTab(d) {
     setPicker(p => p && { ...p, tab: d });
     setPicker(p => {
-      if (p && p.results[d] === null && pickerLoading !== d) {
+      if (p && !Array.isArray(p.results?.[d]) && pickerLoading !== d) {
         setPickerLoading(d);
         (d === "cosmetics" ? offSearch(p.query, 6, d) : foodSearchMerged(p.query, 6))
           .then(hits => setPicker(cur => cur && { ...cur, results: { ...cur.results, [d]: hits.map(h => ({ ...h, _domain: d })) } }))
@@ -3253,6 +3391,53 @@ export default function App() {
     const first = await primary();
     if (first && first.length) return first;
     return (await fallback()) || [];   // same reasoning as resolveAlts
+  }
+
+  // Ratings live in the shared database alongside the scan record, so expert
+  // accolades curated by one person and reviews left by another are visible to
+  // everyone. Safety is recomputed locally from the additive list every time
+  // rather than read from the record — a stored score could drift from the
+  // CSPI table, and the table is the authority.
+  function loadRatings(entry, key) {
+    const k = key || nk(entry.name);
+    const rec = ghGet(k) || {};
+    setRatings(productRatings({
+      additives: entry.offData?.additives || [],
+      accolades: rec.accolades || [],
+      reviews:   rec.reviews || [],
+    }));
+    const mine = (rec.reviews || []).find(r => r.by === reviewerId());
+    setMyStars(mine?.stars || 0);
+    setMyReview(mine?.text || "");
+    setMyReport("");
+  }
+
+  // A stable per-device id, so a person can amend their own review instead of
+  // adding a second one. Not an identity claim — it only prevents one device
+  // from voting repeatedly.
+  function reviewerId() {
+    try {
+      let id = window.localStorage.getItem("hst_reviewer");
+      if (!id) { id = "r" + Math.random().toString(36).slice(2, 10); window.localStorage.setItem("hst_reviewer", id); }
+      return id;
+    } catch { return null; }
+  }
+
+  async function submitReview() {
+    if (!selected || !myStars) return;
+    const k = nk(selected.name);
+    const rec = ghGet(k) || {};
+    const reported = myReport.split(",").map(x => x.trim()).filter(Boolean);
+    const updated = addReview(rec, { by: reviewerId(), stars: myStars, text: myReview, reportedSubstances: reported });
+    await ghSet(k, { ...rec, ...updated }, setDbCount);
+    setRatings(productRatings({
+      additives: selected.offData?.additives || [],
+      accolades: rec.accolades || [],
+      reviews:   updated.reviews,
+    }));
+    toast("review", reported.length
+      ? `Review saved. ${reported.length} substance report${reported.length !== 1 ? "s" : ""} queued for confirmation — reports are shown as unverified counts and do not change the safety score.`
+      : "Review saved to the shared database.");
   }
 
   async function loadAlts(entry, key) {
@@ -3731,7 +3916,9 @@ export default function App() {
         <div onClick={() => setPicker(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
           <div onClick={e => e.stopPropagation()} style={{background:t.bg,border:`1px solid ${t.border}`,borderRadius:16,padding:"22px 24px",width:"min(520px,100%)",maxHeight:"80vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,0.35)"}}>
             {(() => {
-            const list = picker.results[picker.tab];
+            const results = picker.results || {};
+            const rawList = results[picker.tab];
+            const list = Array.isArray(rawList) ? rawList : rawList === null ? null : [];
             const loading = pickerLoading === picker.tab;
             const TABS = [{ id:"food", label:"Food", icon:"🍽️" }, { id:"cosmetics", label:"Cosmetics", icon:"🧴" }];
             return (<>
@@ -3747,12 +3934,15 @@ export default function App() {
             <div style={{display:"flex",gap:6,marginBottom:14}}>
               {TABS.map(tab => {
                 const active = picker.tab === tab.id;
-                const n = picker.results[tab.id];
+                const n = results[tab.id];
                 return (
                   <button key={tab.id} onClick={() => selectPickerTab(tab.id)}
                     style={{flex:1,background:active?t.accent:t.pill,color:active?t.accentFg:t.textSub,border:`1px solid ${active?t.accent:t.border}`,borderRadius:8,padding:"7px 10px",cursor:"pointer",fontSize:11,fontWeight:600,display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
                     <span>{tab.icon}</span>{tab.label}
-                    {n !== null
+                    {/* Array check, not `!== null`: an undefined slot also means
+                        "not loaded", and `undefined !== null` is true — which
+                        made this throw on `.length`. */}
+                    {Array.isArray(n)
                       ? <span style={{opacity:0.7,fontWeight:500}}>({n.length})</span>
                       : <span style={{opacity:0.6,fontWeight:500,fontSize:10}}>· tap to search</span>}
                   </button>
@@ -4175,7 +4365,10 @@ export default function App() {
                 </div>
               </div>
             ) : selected.offData ? (
-              <OFFCard cosmeticAnalysis={selected?.cosmetic} brandStat={brandStat} onOpen={openResult} offData={selected.offData} aiSugarData={selected.aiSugarData} substances={selected.substances} insight={insight} insightLoading={insightLoading} brandCred={brandCred} brandCredLoading={brandCredLoading} alternatives={alternatives} altLoading={altLoading} diet={selected.diet||"unknown"} t={t} dark={dark}/>
+              <OFFCard cosmeticAnalysis={selected?.cosmetic} brandStat={brandStat} onOpen={openResult} offData={selected.offData} aiSugarData={selected.aiSugarData} substances={selected.substances} insight={insight} insightLoading={insightLoading} brandCred={brandCred} brandCredLoading={brandCredLoading} alternatives={alternatives} altLoading={altLoading} diet={selected.diet||"unknown"} t={t} dark={dark}
+                ratingsPanel={<RatingsPanel ratings={ratings} t={t} myStars={myStars} setMyStars={setMyStars}
+                  myReview={myReview} setMyReview={setMyReview} myReport={myReport} setMyReport={setMyReport}
+                  onSubmit={submitReview}/>}/>
             ) : (
               <div style={{display:"flex",flexDirection:"column",gap:12}}>
                 <div style={{background:t.surface,borderRadius:12,padding:"16px 18px",border:`1px solid ${t.border}`}}>

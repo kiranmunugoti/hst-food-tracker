@@ -113,3 +113,69 @@ locally and fails on deploy.
 - Nutri-Score, NOVA and Eco-Score are absent on USDA records by design.
 - Undeclared-substance detection reads ingredient text. A product with no
   ingredient list yields category-level inference only, which is weaker.
+
+---
+
+## Ratings (v8.1)
+
+Three scores, computed and shown separately. They are never averaged together.
+
+| Score | Basis | Can it be changed by users? |
+|---|---|---|
+| **Safety** | CSPI Chemical Cuisine additive tiers | No |
+| **Expert** | Curated awards, critic scores, lab results | Only by adding a sourced accolade |
+| **Community** | Customer star reviews | Yes — this is the opinion score |
+
+### Why they are not combined
+
+A product can win a gold medal, be loved by customers, and still contain an
+additive CSPI rates "Avoid". A single blended number would let popularity mask
+composition, which is the failure this app exists to prevent. Safety stays the
+headline; the others sit beside it.
+
+### CSPI tiers
+
+Safe · Cut back · Certain people should avoid · Caution · Avoid.
+
+`src/ratings.js` holds a **curated subset** of CSPI's published ratings covering
+common label additives — not the full database. Anything not in the table is
+reported as *unrated*, never as safe, and the panel shows coverage as a
+percentage so a partial assessment is visible as partial.
+
+### Adding expert accolades
+
+There is no public API for competition medals, critic scores or lab panels —
+that data is proprietary. Accolades are curated entries on the product's record
+in the shared database:
+
+```json
+"accolades": [
+  { "name": "Great Taste Awards", "sourceType": "competition", "score": "2 stars", "year": 2025 },
+  { "name": "Which? taste test",  "sourceType": "lab",         "score": "82/100",  "year": 2024 }
+]
+```
+
+`sourceType` sets the weight: `lab` 1.0, `critic` 0.8, `panel` 0.7,
+`competition` 0.6, `certifier` 0.5. Low-precision inputs (medals are ordinal)
+are down-weighted again so an award cannot outvote a numeric lab result.
+
+### Score conversion
+
+`normalizeScore` accepts `4.5 stars`, `★★★★`, `92/100`, `B+`, `85%`, `17/20`,
+`Gold`, `Grand Gold`, bare numbers, and returns a 1–10 value plus a precision
+flag. Unrecognised input returns `null` rather than a guess.
+
+100-point critic scales are **not** mapped linearly. In practice almost nothing
+scores below 50, so a linear map would rate a poor 55 as 5.5/10 — "average".
+The conversion rescales from a 50 floor: 55/100 becomes 2.8, 95/100 becomes 9.2.
+
+### Community reviews
+
+One review per device (a local id, replaced on resubmission, so one device
+cannot vote repeatedly). Reviews below five are labelled as too few to be
+representative rather than suppressed.
+
+Reviewers can report an ingredient that appears on the physical label but is
+missing from the database. These are tallied per substance and shown as
+**unverified counts** — a prompt to check the label, not a change to the score.
+A vote cannot make a nitrite disappear.

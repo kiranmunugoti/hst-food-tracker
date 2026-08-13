@@ -21,10 +21,25 @@ class ErrorBoundary extends React.Component {
         <p style={{ fontSize: 13, color: "#555", margin: "0 0 10px" }}>
           Copy everything below — it identifies the exact cause.
         </p>
-        <div style={box}>{String(this.state.error?.stack || this.state.error)}</div>
+        {/* Message first and on its own: the stack is long and the actual
+            cause was getting lost in it. */}
+        <div style={{ ...box, fontSize: 13, fontWeight: 600 }}>
+          {String(this.state.error?.message || this.state.error)}
+        </div>
+        <div style={box}>{String(this.state.error?.stack || "")}</div>
         {this.state.info?.componentStack && (
           <div style={box}>{this.state.info.componentStack}</div>
         )}
+        <button onClick={() => {
+            const text = [String(this.state.error?.message || this.state.error),
+                          String(this.state.error?.stack || ""),
+                          String(this.state.info?.componentStack || "")].join("\n\n");
+            navigator.clipboard?.writeText(text);
+          }}
+          style={{ padding: "8px 14px", fontSize: 13, borderRadius: 7, border: "1px solid #ccc",
+                   background: "#fff", cursor: "pointer", marginRight: 8 }}>
+          Copy error
+        </button>
         <button onClick={() => window.location.reload()}
           style={{ padding: "8px 14px", fontSize: 13, borderRadius: 7, border: "1px solid #ccc",
                    background: "#fff", cursor: "pointer" }}>
