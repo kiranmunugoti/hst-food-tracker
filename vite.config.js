@@ -20,7 +20,7 @@ const OFF_ALLOWED_HOSTS = [
   "world.openfoodfacts.org", "search.openfoodfacts.org",
   "world.openbeautyfacts.org",
 ];
-const UA = "HST-Tracker/7.10 (hst-food-tracker; dev)";
+const UA = "HST-Tracker/8.0 (hst-food-tracker; dev)";
 
 function devApiPlugin() {
   return {

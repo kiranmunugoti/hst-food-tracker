@@ -1364,10 +1364,9 @@ async function foodSearchMerged(terms, limit) {
 }
 
 // ─── SOURCE DIAGNOSTICS ────────────────────────────────────────────────────────
-// Every source failure so far has been invisible: a dead endpoint, a rate
-// limit and an empty catalogue all produced the same "no results". This probes
-// each endpoint independently and reports exactly what came back, so a failure
-// can be identified instead of guessed at.
+// A dead endpoint, a rate limit and an empty catalogue otherwise all produce
+// the same "no results". This probes each endpoint independently and reports
+// what came back, so a failure can be identified rather than guessed at.
 //
 // Deliberately sequential with a small gap: firing six search requests at once
 // is itself enough to trip OFF's 10/min limit and would produce a false report.
@@ -1411,14 +1410,12 @@ async function diagnoseSources(term = "greek yogurt") {
 }
 
 // ─── FILTERED (ATTRIBUTE) SEARCH ───────────────────────────────────────────────
-// Attribute queries — "vegan", "no additives", "Nutri-Score A" — used to go
-// straight to /api/v2/search. That runs on the same deprecated Perl backend as
-// search.pl, so it fails in the same way and for the same reason.
+// Attribute queries — "vegan", "no additives", "Nutri-Score A".
 //
-// Search-a-licious takes filters as a Lucene-style q, so the same intent can be
-// expressed against the supported index. The legacy endpoint stays as fallback:
-// if a field name here is wrong, the query degrades to the old behaviour rather
-// than returning nothing.
+// Search-a-licious takes filters as a Lucene-style q, so these run against the
+// supported index. The legacy /api/v2/search stays as fallback: it shares the
+// deprecated Perl backend with search.pl, but if a field name here is wrong the
+// query degrades to the old path rather than silently returning nothing.
 const SAL_FIELD_MAP = {
   nutrition_grades_tags: "nutrition_grades",
   nova_groups_tags: "nova_groups",
@@ -2113,7 +2110,17 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
       let stream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+          video: {
+            facingMode: { ideal: "environment" },
+            // 720p is not enough resolution for the thin bars of an EAN-13 at
+            // normal holding distance — the decoder sees blur and keeps
+            // retrying, which is why a clearly visible barcode can take ages.
+            width:  { ideal: 1920 },
+            height: { ideal: 1080 },
+            // Without continuous autofocus the camera locks focus once, on
+            // whatever was in frame at start, and never refocuses on the label.
+            advanced: [{ focusMode: "continuous" }],
+          },
           audio: false,
         });
       } catch (err) {
@@ -2139,24 +2146,45 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
       setCanTorch(!!track?.getCapabilities?.().torch);
       setStatus("scanning");
 
+      // Some real barcodes never pass a checksum — ITF-14 cases, worn or
+      // curved labels. Rather than discard them silently (which makes the
+      // scanner look frozen), two identical consecutive reads are accepted as
+      // confirmation: agreement between independent frames is its own check.
+      const recent = { value: null, count: 0 };
       const handle = (code) => {
         const clean = String(code).replace(/\D/g, "");
-        if (!clean || !validBarcodeChecksum(clean)) return false;
-        stopAll();
-        onDetect(clean);
-        return true;
+        if (!clean || clean.length < 8) return false;
+
+        if (validBarcodeChecksum(clean)) { stopAll(); onDetect(clean); return true; }
+
+        if (recent.value === clean) {
+          recent.count++;
+          if (recent.count >= 2) { stopAll(); onDetect(clean); return true; }
+        } else { recent.value = clean; recent.count = 1; }
+
+        // Tell the user something is happening rather than leaving a dead view.
+        setMessage("Reading the barcode — hold steady for a moment.");
+        return false;
       };
 
       if ("BarcodeDetector" in window) {
         try {
           const supported = await window.BarcodeDetector.getSupportedFormats?.() || BARCODE_FORMATS;
           const detector = new window.BarcodeDetector({ formats: BARCODE_FORMATS.filter(f => supported.includes(f)) });
-          const tick = async () => {
+          // detect() is expensive. Running it every animation frame (60/s) means
+          // each call queues behind the last and the preview stutters, which
+          // makes it HARDER to hold the code steady. ~12/s decodes just as well
+          // and leaves the camera responsive.
+          let lastRun = 0;
+          const tick = async (ts) => {
             if (stopRef.current || !videoRef.current) return;
-            try {
-              const found = await detector.detect(videoRef.current);
-              if (found?.length && handle(found[0].rawValue)) return;
-            } catch {}
+            if (ts - lastRun >= 80) {
+              lastRun = ts;
+              try {
+                const found = await detector.detect(videoRef.current);
+                if (found?.length && handle(found[0].rawValue)) return;
+              } catch {}
+            }
             requestAnimationFrame(tick);
           };
           requestAnimationFrame(tick);
@@ -3211,8 +3239,9 @@ export default function App() {
     const [primary, fallback] = AI_MODE ? [viaAssisted, viaOff] : [viaOff, viaAssisted];
     const first = await primary();
     if (first && first.length) return first;
-    // Only reach for the fallback when it can actually work
-    if (!AI_MODE && _offStatus !== "network") return [];
+    // Always try the fallback when the primary returns nothing. A failed
+    // category query is indistinguishable from a genuine no-match, and an empty
+    // alternatives list helps nobody either way.
     return (await fallback()) || [];
   }
 
@@ -3223,8 +3252,7 @@ export default function App() {
     const [primary, fallback] = AI_MODE ? [viaAssisted, viaOff] : [viaOff, viaAssisted];
     const first = await primary();
     if (first && first.length) return first;
-    if (!AI_MODE && _offStatus !== "network") return [];
-    return (await fallback()) || [];
+    return (await fallback()) || [];   // same reasoning as resolveAlts
   }
 
   async function loadAlts(entry, key) {
@@ -3235,7 +3263,9 @@ export default function App() {
     if (cached) { setAlternatives(cached); return; }
     setAltLoading(true);
     const alts = await resolveAlts(entry);
-    toCache("alts", k, alts);
+    // An empty result is not worth caching — caching it meant a transient
+    // failure permanently suppressed alternatives for that product.
+    if (alts.length) toCache("alts", k, alts);
     setAlternatives(alts); setAltLoading(false);
     // Also persist alts to GitHub DB
     const rec = ghGet(k);
@@ -3903,9 +3933,8 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Data source check. Every source failure used to look identical
-                  to "no results", which made them impossible to tell apart from
-                  the outside. This reports each endpoint separately. */}
+              {/* Data source check — reports each endpoint separately, so a
+                  failure can be told apart from an empty result. */}
               <div style={{marginTop:11,borderTop:`1px solid ${t.border}`,paddingTop:10}}>
                 <button onClick={runDiagnostics} disabled={diagRunning}
                   style={{fontSize:10,fontWeight:600,color:t.textSub,background:t.pill,border:`1px solid ${t.border}`,padding:"5px 11px",borderRadius:7,cursor:diagRunning?"default":"pointer",opacity:diagRunning?0.6:1}}>

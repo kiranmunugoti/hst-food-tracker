@@ -31,7 +31,7 @@ export default async function handler(req, res) {
     params.set("api_key", key);
 
     const r = await fetch(`${FDC_BASE}${path}?${params.toString()}`, {
-      headers: { "User-Agent": "HST-Tracker/7.7 (hst-food-tracker)" },
+      headers: { "User-Agent": "HST-Tracker/8.0 (hst-food-tracker; contact via GitHub)" },
     });
 
     const text = await r.text();

@@ -16,7 +16,7 @@ export default async function handler(req, res) {
       return res.status(403).json({ error: "Host not allowed" });
     }
     const r = await fetch(u.toString(), {
-      headers: { "User-Agent": "HST-Tracker/7.0 (hst-food-tracker; contact via GitHub)" },
+      headers: { "User-Agent": "HST-Tracker/8.0 (hst-food-tracker; contact via GitHub)" },
     });
     const data = await r.json();
     res.setHeader("Cache-Control", "s-maxage=86400, stale-while-revalidate=604800");
