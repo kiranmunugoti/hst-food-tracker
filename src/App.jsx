@@ -872,10 +872,12 @@ async function fetchOFFAlternatives(categories, excludeName) {
   const catTag = cat.includes(":") ? cat : "en:" + cat;
   const grab = async (grades) => {
     try {
-      const r = await fetch(`https://world.openfoodfacts.org/api/v2/search?categories_tags=${encodeURIComponent(catTag)}&nutrition_grades_tags=${grades}&fields=product_name,brands,nutriscore_grade,nutriments&page_size=8&sort_by=unique_scans_n`);
-      if (!r.ok) return [];
-      const d = await r.json();
-      return d.products || [];
+      // Goes through filterSearch so it gets the Search-a-licious path, the
+      // proxy fallback and the 404/rate-limit handling — a raw fetch here had
+      // none of them and failed silently to an empty alternatives list.
+      const { products } = await filterSearch(
+        { categories_tags: catTag, nutrition_grades_tags: grades }, "food", 8);
+      return products;
     } catch { return []; }
   };
   let prods = await grab("a");
@@ -902,10 +904,9 @@ async function fetchOFFCalorieAlts(kcal) {
   const out = []; const seen = new Set();
   for (const c of cats) {
     try {
-      const r = await fetch(`https://world.openfoodfacts.org/api/v2/search?categories_tags=${c}&nutrition_grades_tags=a&fields=product_name,brands,nutriscore_grade,nutriments&page_size=12&sort_by=unique_scans_n`);
-      if (!r.ok) continue;
-      const d = await r.json();
-      (d.products || []).forEach(p => {
+      const { products } = await filterSearch(
+        { categories_tags: c, nutrition_grades_tags: "a" }, "food", 12);
+      products.forEach(p => {
         const n = p.nutriments || {}; const e = n["energy-kcal_100g"];
         if (e == null || Math.abs(e - kcal) > 50) return;
         const nm = (p.product_name || "").trim();
@@ -968,7 +969,9 @@ async function analyzeProduct(offData, label) {
 // blocked OFF outright. Returns null when the caller should show a picker.
 async function lookupAndAnalyze(label) {
   const { product, candidates, domain } = await resolveProduct(label).catch(() => ({ product: null, candidates: [], domain: "food" }));
-  if (candidates.length > 1) return { candidates, domain };
+  // Any candidate at all goes to the picker. A name search is a browse, so even
+  // one result is shown as a choice rather than analysed on the user's behalf.
+  if (candidates.length > 0) return { candidates, domain };
   let offData = product;
   if (!offData && (AI_MODE || _offStatus === "network")) offData = await offViaAssisted(label);
   if (offData && !offData._domain) offData._domain = domain;
@@ -1094,26 +1097,377 @@ const hostFor     = (d) => (d === "cosmetics" ? OBF_HOST : OFF_HOST);
 const domainHost  = () => hostFor(DOMAIN);
 const domainLabel = () => (DOMAIN === "cosmetics" ? "Open Beauty Facts" : "Open Food Facts");
 
+// A 404 from OFF is a real answer — "no such product" — not a failure to
+// reach OFF. Conflating the two is what made an unknown barcode report as
+// "unreachable", so the two cases are separate types from here down.
+class OffNotFound extends Error {
+  constructor(url) { super("Not in database"); this.name = "OffNotFound"; this.url = url; }
+}
+
+// 429 (per-IP limit) and 503 (OFF's global crawl limit) mean "come back later",
+// which is neither an absence nor a dead connection. Kept separate so the app
+// can say which one it is instead of guessing.
+class OffRateLimited extends Error {
+  constructor(status) { super("Rate limited (HTTP " + status + ")"); this.name = "OffRateLimited"; this.status = status; }
+}
+
+// Reads the body once and only accepts it as JSON. When /api/off does not
+// exist (vite dev, artifact preview, a static host with no functions) the
+// request resolves 200 with index.html, which must not be mistaken for data.
+async function readJson(r) {
+  const text = await r.text();
+  const ct = r.headers.get("content-type") || "";
+  if (!ct.includes("json") && /^\s*</.test(text)) throw new Error("Non-JSON response (no /api/off on this host)");
+  try { return JSON.parse(text); } catch { throw new Error("Malformed JSON response"); }
+}
+
 async function offJson(url) {
   let directErr = null;
   try {
     const r = await fetch(url);
+    if (r.status === 404) throw new OffNotFound(url);
+    if (r.status === 429 || r.status === 503) throw new OffRateLimited(r.status);
     if (!r.ok) throw new Error("HTTP " + r.status);
-    return await r.json();
-  } catch (e) { directErr = e; }
-  const r = await fetch(`/api/off?url=${encodeURIComponent(url)}`);
-  if (!r.ok) throw directErr || new Error("proxy HTTP " + r.status);
-  return r.json();
+    return await readJson(r);
+  } catch (e) {
+    // A 404 is authoritative — the proxy would only fetch the same 404 again,
+    // and retrying it would burn a request against the rate limit for nothing.
+    if (e instanceof OffNotFound) throw e;
+    directErr = e;
+  }
+  try {
+    const r = await fetch(`/api/off?url=${encodeURIComponent(url)}`);
+    if (r.status === 404) throw new OffNotFound(url);
+    // 403 here is the proxy's own host allow-list, or OFF blocking the request.
+    // Either way it is a refusal, not an absence — it must not read as "no match".
+    if (r.status === 429 || r.status === 503) throw new OffRateLimited(r.status);
+    if (!r.ok) throw new Error("proxy HTTP " + r.status);
+    return await readJson(r);
+  } catch (e) {
+    if (e instanceof OffNotFound) throw e;
+    if (e instanceof OffRateLimited || directErr instanceof OffRateLimited) {
+      throw e instanceof OffRateLimited ? e : directErr;
+    }
+    // Both routes failed at the transport layer — this is the genuine
+    // "unreachable" case, and the only one that should be reported as such.
+    throw directErr || e;
+  }
 }
 
 async function offGetByCode(code, domain = DOMAIN) {
-  const d = await offJson(`${hostFor(domain)}/api/v2/product/${code}.json?fields=${OFF_FIELDS}`);
+  let d;
+  try {
+    d = await offJson(`${hostFor(domain)}/api/v2/product/${code}.json?fields=${OFF_FIELDS}`);
+  } catch (e) {
+    if (e instanceof OffNotFound) return null;   // barcode simply isn't in this database
+    throw e;                                     // real network/CORS failure — let it count as blocked
+  }
+  // v2 also signals an unknown code as status 0 with HTTP 200.
+  if (d && d.status === 0) return null;
   return d.product?.product_name ? d.product : null;
 }
 
-async function offSearch(terms, limit, domain = DOMAIN) {
-  const d = await offJson(`${hostFor(domain)}/cgi/search.pl?search_terms=${encodeURIComponent(terms)}&search_simple=1&action=process&json=1&page_size=${limit}&fields=${OFF_FIELDS}`);
+// Legacy keyword search. Open Food Facts has deprecated this endpoint and it
+// now returns HTTP 503 for long stretches, so it is no longer the primary path
+// for food — only the fallback, and the only option for Open Beauty Facts.
+async function offSearchLegacy(terms, limit, domain = DOMAIN) {
+  let d;
+  try {
+    d = await offJson(`${hostFor(domain)}/cgi/search.pl?search_terms=${encodeURIComponent(terms)}&search_simple=1&action=process&json=1&page_size=${limit}&fields=${OFF_FIELDS}`);
+  } catch (e) {
+    if (e instanceof OffNotFound) return [];   // searched fine, matched nothing
+    throw e;
+  }
   return (d.products || []).filter(p => p.product_name);
+}
+
+// Search-a-licious — OFF's Elasticsearch-backed replacement for search.pl.
+// It accepts the same `fields` list, so candidates come back fully populated
+// in ONE request; no per-result product lookup, which keeps the request budget
+// intact. Food only: there is no Open Beauty Facts index.
+async function offSearchSAL(terms, limit) {
+  let d;
+  try {
+    d = await offJson(`${OFF_SEARCH_HOST}/search?q=${encodeURIComponent(terms)}&page_size=${limit}&fields=code,${OFF_FIELDS}`);
+  } catch (e) {
+    if (e instanceof OffNotFound) return [];
+    throw e;
+  }
+  return (d.hits || []).filter(p => p.product_name);
+}
+
+async function offSearch(terms, limit, domain = DOMAIN) {
+  if (domain === "cosmetics") return offSearchLegacy(terms, limit, domain);
+  // Try the supported index first. Fall back to the legacy endpoint only if
+  // Search-a-licious itself fails — a genuine empty result is not a failure
+  // and must not trigger a second request for the same query.
+  try {
+    const hits = await offSearchSAL(terms, limit);
+    if (hits.length) return hits;
+  } catch { /* fall through to legacy */ }
+  return offSearchLegacy(terms, limit, domain);
+}
+
+// ─── USDA FOODDATA CENTRAL ─────────────────────────────────────────────────────
+// Second food source. Open Food Facts is strongest on European products; FDC's
+// Branded Foods dataset covers US packaged goods with full ingredient
+// statements, which is exactly what undeclared-substance detection needs.
+//
+// It is a SUPPLEMENT, not a replacement: FDC has no Nutri-Score, no NOVA group
+// and no Eco-Score, so an OFF record is always preferred when both have the
+// same product. Its own budget is separate (1,000 req/hour with a real key),
+// and it is only queried when OFF has not already answered — never in parallel.
+const USDA_PROXY = "/api/usda";
+
+// FDC nutrient IDs → the OFF nutriment keys parseOFF already reads, so a
+// converted record needs no special handling anywhere downstream.
+const FDC_NUTRIENTS = {
+  1008: "energy-kcal_100g",
+  1004: "fat_100g",
+  1258: "saturated-fat_100g",
+  1005: "carbohydrates_100g",
+  2000: "sugars_100g",
+  1235: "added-sugars_100g",
+  1079: "fiber_100g",
+  1003: "proteins_100g",
+};
+
+async function usdaJson(path, params) {
+  const qs = new URLSearchParams({ path, ...params }).toString();
+  const r = await fetch(`${USDA_PROXY}?${qs}`);
+  if (r.status === 404) throw new OffNotFound(path);
+  if (r.status === 429) throw new OffRateLimited(429);
+  if (!r.ok) {
+    // 403 means the key is missing or its quota is gone. That is a
+    // configuration problem, not an empty result, and must not read as one.
+    let detail = "";
+    try { detail = (await r.json())?.error || ""; } catch { /* ignore */ }
+    throw new Error(detail || "FoodData Central HTTP " + r.status);
+  }
+  return readJson(r);
+}
+
+// Convert an FDC Branded Foods record into the raw OFF product shape. Doing the
+// conversion at the edge of the source means the picker, parseOFF, the hazard
+// engine and the cache all stay unchanged.
+function fdcToOFF(food) {
+  const nutriments = {};
+  (food.foodNutrients || []).forEach(n => {
+    const id = n.nutrientId ?? n.nutrient?.id;
+    const key = FDC_NUTRIENTS[id];
+    const val = n.value ?? n.amount;
+    if (key && val != null) nutriments[key] = val;
+    // Sodium arrives in mg. OFF stores sodium and salt in grams, and salt is
+    // derived from sodium by the standard 2.5 factor.
+    if (id === 1093 && val != null) {
+      nutriments["sodium_100g"] = +(val / 1000).toFixed(4);
+      nutriments["salt_100g"] = +((val / 1000) * 2.5).toFixed(4);
+    }
+  });
+
+  // FDC splits the owner company from the marketing brand; keep both in OFF's
+  // comma-separated order so brand grouping still rolls sub-brands up.
+  const brands = [food.brandName, food.brandOwner].map(b => (b || "").trim()).filter(Boolean);
+  const uniqBrands = [...new Set(brands)];
+
+  return {
+    code: food.gtinUpc || null,
+    product_name: food.description || food.lowercaseDescription || "Unknown",
+    brands: uniqBrands.join(","),
+    image_url: null,                       // FDC hosts no product photography
+    ingredients_text: food.ingredients || null,
+    quantity: food.packageWeight || null,
+    serving_size: food.servingSize ? `${food.servingSize}${food.servingSizeUnit || ""}` : null,
+    // Deliberately absent: FDC computes none of these. Leaving them null is
+    // truthful; inventing them would put a fabricated grade on the card.
+    nutriscore_grade: null,
+    nova_group: null,
+    ecoscore_grade: null,
+    additives_tags: [],                    // no additive taxonomy — hazards come from ingredients text
+    allergens_tags: [],
+    labels_tags: [],
+    categories_tags: food.foodCategory ? [food.foodCategory] : [],
+    nutriments,
+    _source: "usda",
+    _fdcId: food.fdcId || null,
+  };
+}
+
+async function usdaSearch(terms, limit) {
+  let d;
+  try {
+    d = await usdaJson("/foods/search", {
+      query: terms,
+      pageSize: String(Math.min(limit, 25)),
+      dataType: "Branded",                 // packaged products only; raw commodity rows have no label
+    });
+  } catch (e) {
+    if (e instanceof OffNotFound) return [];
+    throw e;
+  }
+  return (d.foods || []).map(fdcToOFF).filter(p => p.product_name && p.product_name !== "Unknown");
+}
+
+// FDC has no barcode endpoint, but gtinUpc is indexed, so searching the digits
+// and confirming an exact match is the supported way to resolve a barcode.
+async function usdaGetByCode(code) {
+  const hits = await usdaSearch(code, 5).catch(e => {
+    if (e instanceof OffNotFound) return [];
+    throw e;
+  });
+  const norm = (s) => String(s || "").replace(/^0+/, "");
+  return hits.find(p => norm(p.code) === norm(code)) || null;
+}
+
+// Merged food search: Open Food Facts, topped up from USDA FoodData Central.
+//
+// OFF is queried first and its records win on conflict — they carry Nutri-Score,
+// NOVA and additive tags that FDC has no equivalent for. USDA is only called
+// when OFF has not already filled the list, so a well-covered query costs the
+// same one request it always did.
+async function foodSearchMerged(terms, limit) {
+  let offHits = [], offFailed = null;
+  try { offHits = await offSearch(terms, limit, "food"); }
+  catch (e) { offFailed = e; }
+
+  // Enough from OFF already — spend nothing on a second source.
+  if (offHits.length >= limit) return offHits;
+
+  let usdaHits = [];
+  try { usdaHits = await usdaSearch(terms, limit - offHits.length + 4); }
+  catch (e) {
+    // If OFF also failed, surface the OFF error — it is the primary source and
+    // its failure mode (rate limit vs unreachable) is what the user needs told.
+    if (offFailed) throw offFailed;
+  }
+  if (offFailed && !usdaHits.length) throw offFailed;
+
+  // Dedupe. Barcode is authoritative when both sides have one; otherwise fall
+  // back to a normalised name+brand key, which catches the common case of the
+  // same product present in both databases without a shared GTIN.
+  const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const seen = new Set();
+  const keysOf = (p) => {
+    const k = [];
+    if (p.code) k.push("c:" + String(p.code).replace(/^0+/, ""));
+    k.push("n:" + norm(p.product_name) + "|" + norm((p.brands || "").split(",")[0]));
+    return k;
+  };
+  const out = [];
+  for (const p of [...offHits, ...usdaHits]) {
+    const keys = keysOf(p);
+    if (keys.some(k => seen.has(k))) continue;
+    keys.forEach(k => seen.add(k));
+    out.push(p);
+  }
+  return out.slice(0, Math.max(limit, offHits.length));
+}
+
+// ─── SOURCE DIAGNOSTICS ────────────────────────────────────────────────────────
+// Every source failure so far has been invisible: a dead endpoint, a rate
+// limit and an empty catalogue all produced the same "no results". This probes
+// each endpoint independently and reports exactly what came back, so a failure
+// can be identified instead of guessed at.
+//
+// Deliberately sequential with a small gap: firing six search requests at once
+// is itself enough to trip OFF's 10/min limit and would produce a false report.
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function probeEndpoint(label, fn) {
+  const t0 = Date.now();
+  try {
+    const n = await fn();
+    return { label, ok: true, detail: `${n} result${n === 1 ? "" : "s"}`, ms: Date.now() - t0 };
+  } catch (e) {
+    const kind = e instanceof OffRateLimited ? "rate limited"
+      : e instanceof OffNotFound ? "not found"
+      : "failed";
+    return { label, ok: false, detail: `${kind} — ${String(e?.message || e)}`, ms: Date.now() - t0 };
+  }
+}
+
+async function diagnoseSources(term = "greek yogurt") {
+  const probes = [
+    ["Open Food Facts — barcode API", async () => {
+      // Nutella: a barcode that certainly exists, so a failure here is transport.
+      const d = await offJson(`${OFF_HOST}/api/v2/product/3017620422003.json?fields=product_name`);
+      return d?.product?.product_name ? 1 : 0;
+    }],
+    ["Search-a-licious — full-text", async () => (await offSearchSAL(term, 3)).length],
+    ["Open Food Facts — legacy search.pl", async () => (await offSearchLegacy(term, 3, "food")).length],
+    ["Search-a-licious — filters (organic)", async () => {
+      const { products } = await filterSearch({ labels_tags: "en:organic" }, "food", 3);
+      return products.length;
+    }],
+    ["USDA FoodData Central", async () => (await usdaSearch(term, 3)).length],
+    ["Open Beauty Facts — cosmetics search", async () => (await offSearchLegacy("yogurt", 3, "cosmetics")).length],
+  ];
+  const out = [];
+  for (const [label, fn] of probes) {
+    out.push(await probeEndpoint(label, fn));
+    await sleep(600);
+  }
+  return out;
+}
+
+// ─── FILTERED (ATTRIBUTE) SEARCH ───────────────────────────────────────────────
+// Attribute queries — "vegan", "no additives", "Nutri-Score A" — used to go
+// straight to /api/v2/search. That runs on the same deprecated Perl backend as
+// search.pl, so it fails in the same way and for the same reason.
+//
+// Search-a-licious takes filters as a Lucene-style q, so the same intent can be
+// expressed against the supported index. The legacy endpoint stays as fallback:
+// if a field name here is wrong, the query degrades to the old behaviour rather
+// than returning nothing.
+const SAL_FIELD_MAP = {
+  nutrition_grades_tags: "nutrition_grades",
+  nova_groups_tags: "nova_groups",
+  labels_tags: "labels_tags",
+  ingredients_analysis_tags: "ingredients_analysis_tags",
+  categories_tags: "categories_tags",
+  additives_n: "additives_n",
+};
+
+function salQueryFrom(params) {
+  const clauses = [];
+  let free = "";
+  for (const [k, v] of Object.entries(params)) {
+    if (v == null || v === "") continue;
+    if (k === "search_terms") { free = String(v); continue; }
+    const field = SAL_FIELD_MAP[k];
+    if (!field) continue;
+    // A comma-separated value is a set of alternatives ("d,e" → D or E).
+    const vals = String(v).split(",").map(s => s.trim()).filter(Boolean);
+    if (!vals.length) continue;
+    clauses.push(vals.length === 1
+      ? `${field}:"${vals[0]}"`
+      : `(${vals.map(x => `${field}:"${x}"`).join(" OR ")})`);
+  }
+  return [free, ...clauses].filter(Boolean).join(" ");
+}
+
+// Returns raw product records (OFF shape) for a set of filter params.
+async function filterSearch(params, domain, limit = 12) {
+  // Search-a-licious indexes food only — Open Beauty Facts has no equivalent.
+  if (domain !== "cosmetics") {
+    const q = salQueryFrom(params);
+    if (q) {
+      try {
+        const d = await offJson(`${OFF_SEARCH_HOST}/search?q=${encodeURIComponent(q)}&page_size=${limit}&fields=code,${OFF_FIELDS}`);
+        const hits = (d.hits || []).filter(p => p.product_name);
+        if (hits.length) return { products: hits, count: d.count ?? hits.length };
+      } catch { /* fall through to the legacy endpoint */ }
+    }
+  }
+  const qs = new URLSearchParams({
+    ...params,
+    fields: OFF_FIELDS,
+    page_size: String(limit),
+    sort_by: "unique_scans_n",
+  }).toString();
+  const d = await offJson(`${hostFor(domain)}/api/v2/search?${qs}`);
+  const products = (d.products || []).filter(p => p.product_name);
+  return { products, count: d.count ?? products.length };
 }
 
 // ─── CLOUD DISCOVERY ───────────────────────────────────────────────────────────
@@ -1168,16 +1522,10 @@ function discoveryIntent(query) {
 
 // Run the discovery query against the live database.
 async function cloudDiscover(intent, limit = 8) {
-  const qs = new URLSearchParams({
-    ...intent.params,
-    page_size: String(limit),
-    sort_by: "unique_scans_n",
-    fields: OFF_FIELDS,
-  });
-  if (intent.term) qs.set("search_terms", intent.term);
-  const url = `${hostFor(intent.domain)}/api/v2/search?${qs.toString()}`;
-  const d = await offJson(url);
-  return (d.products || []).filter(p => p.product_name).map(p => {
+  const params = { ...intent.params };
+  if (intent.term) params.search_terms = intent.term;
+  const { products } = await filterSearch(params, intent.domain, limit);
+  return products.map(p => {
     const parsed = parseOFF(p);
     parsed._domain = intent.domain;
     return parsed;
@@ -1272,19 +1620,12 @@ async function cloudSearch(query) {
   residual = residual.replace(FILTER_STOPWORDS, " ").replace(/\s+/g, " ").trim();
   if (residual.length > 2) params.search_terms = residual;
 
-  const qs = new URLSearchParams({
-    ...params,
-    fields: OFF_FIELDS,
-    page_size: "12",
-    sort_by: "unique_scans_n",
-  }).toString();
 
   try {
-    const d = await offJson(`${hostFor(domain)}/api/v2/search?${qs}`);
-    const products = (d.products || []).filter(p => p.product_name);
+    const { products, count } = await filterSearch(params, domain, 12);
     return {
       applied, domain,
-      count: d.count ?? products.length,
+      count,
       products: products.slice(0, 8).map(p => ({
         name: p.product_name.trim(),
         brand: (p.brands || "").split(",")[0].trim() || null,
@@ -1296,7 +1637,10 @@ async function cloudSearch(query) {
     };
   } catch (e) {
     console.warn("cloudSearch:", e);
-    return { applied, domain, count: 0, products: [], failed: true };
+    // Carry the reason forward. Swallowing it into a bare failed flag is what
+    // made a dead endpoint indistinguishable from an empty catalogue.
+    return { applied, domain, count: 0, products: [], failed: true,
+             error: String(e?.message || e) };
   }
 }
 
@@ -1305,11 +1649,18 @@ async function cloudSearch(query) {
 // resolving to "Amul Milk Chocolate".
 async function resolveProduct(query, limit = 6) {
   const q = query.trim();
-  let blocked = 0, tried = 0;
-  const step = async (fn) => { tried++; try { return await fn(); } catch { blocked++; return null; } };
+  let blocked = 0, tried = 0, limited = 0;
+  const step = async (fn) => {
+    tried++;
+    try { return await fn(); }
+    catch (e) { blocked++; if (e instanceof OffRateLimited) limited++; return null; }
+  };
   const finish = (product, candidates, domain) => {
     const found = !!product || (candidates && candidates.length > 0);
-    _offStatus = found ? "ok" : (tried > 0 && blocked >= tried ? "network" : "nomatch");
+    _offStatus = found ? "ok"
+      : limited > 0 ? "ratelimited"
+      : (tried > 0 && blocked >= tried) ? "network"
+      : "nomatch";
     const parsed = product ? parseOFF(product) : null;
     if (parsed) parsed._domain = domain;
     return { product: parsed, candidates: (candidates || []).map(c => ({ ...c, _domain: domain })), domain };
@@ -1326,29 +1677,32 @@ async function resolveProduct(query, limit = 6) {
       const hit = await step(() => offGetByCode(q, d));
       if (hit) return finish(hit, [], d);
     }
-    return finish(null, [], guess || "food");
+    // Neither Open Food Facts nor Open Beauty Facts has it — try FoodData
+    // Central before giving up. This is where US products usually turn up.
+    const usda = await step(() => usdaGetByCode(q));
+    if (usda) return finish(usda, [], "food");
+
+    const out = finish(null, [], guess || "food");
+    // Every request succeeded and every database said "no such code". That is
+    // a gap in the databases, not a connectivity problem, and the advice the
+    // user needs is different — so it gets its own status.
+    if (_offStatus === "nomatch") _offStatus = "unknown-code";
+    return out;
   }
 
-  // ── Name search: first database that returns anything wins. ──
+  // ── Name search: always return the candidate list. ──
+  // Even a single match is returned as a candidate rather than resolved
+  // silently, because a name search is a browse: the point is to show what
+  // exists, not to guess which one was meant.
+  const searcher = (d) => (d === "cosmetics" ? offSearch(q, limit, d) : foodSearchMerged(q, limit));
   for (const d of order) {
-    const hits = (await step(() => offSearch(q, limit, d))) || [];
-    if (hits.length === 1) return finish(hits[0], [], d);
-    if (hits.length > 1)   return finish(null, hits, d);
+    const hits = (await step(() => searcher(d))) || [];
+    if (hits.length > 0) return finish(null, hits, d);
   }
 
-  // ── Last resort: the modern search host handles fuzzy multi-word queries
-  //    better than the legacy endpoint. Food only — there is no cosmetics
-  //    equivalent — so it is skipped when the query clearly reads cosmetic.
-  if (guess !== "cosmetics") {
-    const code = await step(async () => {
-      const d = await offJson(`${OFF_SEARCH_HOST}/search?q=${encodeURIComponent(q)}&page_size=3`);
-      return (d.hits || []).find(h => h.code)?.code || null;
-    });
-    if (code) {
-      const hit = await step(() => offGetByCode(code, "food"));
-      if (hit) return finish(hit, [], "food");
-    }
-  }
+  // The Search-a-licious index is now queried inside offSearch as the primary
+  // path, so the old "last resort" block that hit it separately is gone — it
+  // would have re-run the same query and spent a second request for nothing.
   return finish(null, [], guess || "food");
 }
 
@@ -1378,6 +1732,9 @@ function parseOFF(p) {
   const g = (...keys) => { for (const k of keys) { if (n[k] != null && n[k] !== "") return Number(n[k]); } return null; };
   return {
     name: p.product_name || "Unknown",
+    // Which database this record came from, carried through so the result card
+    // and the cache both stay honest about provenance.
+    source: p._source || "off",
     brand: (p.brands || "").split(",")[0].trim() || null,
     // OFF often lists several, e.g. "Maggi,Nestlé" — keep them all rather than
     // discarding the owning company after the first comma
@@ -1643,11 +2000,17 @@ function brandHistory(brand) {
   const recs = Object.values(_ghDb.products || {}).filter(p =>
     brandChain(p.offData).some(b => b.toLowerCase().trim() === bl || (ratingIdentity(b) || "").toLowerCase().trim() === bl));
   if (!recs.length) return null;
-  return {
+  // Same aggregate shape brandScoreOf expects, so the scan-time rating is
+  // identical to the one shown on the brand page — one scoring rule, not two.
+  const agg = {
     count: recs.length,
-    undeclared: recs.reduce((a, p) => a + undeclaredOf(p), 0),
     high: recs.filter(p => p.risk === "high").length,
+    medium: recs.filter(p => p.risk === "medium").length,
+    undeclared: recs.reduce((a, p) => a + undeclaredOf(p), 0),
+    ns: { a:0, b:0, c:0, d:0, e:0 },
   };
+  recs.forEach(p => { const g = p.offData?.nutriScore; if (g && agg.ns[g] != null) agg.ns[g]++; });
+  return { ...agg, ...brandScoreOf(agg) };
 }
 
 let _searchFlushTimer = null;
@@ -2476,10 +2839,13 @@ export default function App() {
   const [panelAltLoading,setPanelAltLoading] = useState(false);
   const [searchQ,setSearchQ]         = useState("");
   const [searchOpen,setSearchOpen]   = useState(false);
-  const [picker,setPicker]           = useState(null); // { query, candidates: raw OFF products }
+  const [picker,setPicker]           = useState(null); // { query, results:{food,cosmetics}, tab }
+  const [pickerLoading,setPickerLoading] = useState(null); // domain currently being fetched
   const [showPlan,setShowPlan]       = useState(false);
   const [cameraOpen,setCameraOpen]   = useState(false);
   const [inputFocus,setInputFocus]   = useState(false);
+  const [diag,setDiag]               = useState(null);   // source diagnostics result
+  const [diagRunning,setDiagRunning] = useState(false);
   const [discover,setDiscover]       = useState(null);
   const [discoverLoading,setDiscoverLoading] = useState(false);
   const [brandStat,setBrandStat]     = useState(null);
@@ -2623,16 +2989,29 @@ export default function App() {
     const entry = entryFrom({ ...a, offData:a.offData }, label);
     showEntry(entry, key);
 
-    if (a.offData) toast("off", `Found "${name}" on Open Food Facts.`);
-    else toast("scan", _offStatus === "network"
-      ? "Open Food Facts is unreachable from this browser. The analysis is name-based only — press ↻ to retry."
-      : `No Open Food Facts match for "${label}". The analysis is name-based only; nothing was cached, so ↻ retries fresh.`);
+    if (a.offData) toast("off", `Found "${name}" on ${a.offData.source === "usda" ? "USDA FoodData Central" : domainLabel()}.`);
+    else if (_offStatus === "ratelimited") toast("scan",
+      `${domainLabel()} is rate-limiting requests right now (10 searches per minute). Wait about a minute, then press ↻ — the analysis below is name-based only.`);
+    else if (_offStatus === "network") toast("scan",
+      `${domainLabel()} is unreachable from this browser. The analysis is name-based only — press ↻ to retry.`);
+    else if (_offStatus === "unknown-code") toast("scan",
+      `Barcode ${label} reached ${domainLabel()} but is not in the database yet — a lot of regional products are missing. Search the product by name instead, or add the barcode at openfoodfacts.org to cover it for everyone.`);
+    else toast("scan",
+      `No ${domainLabel()} match for "${label}". The analysis is name-based only; nothing was cached, so ↻ retries fresh.`);
 
     if (a.risk === "high") toast("high", `High risk: ${a.allSubs.filter(s=>s.risk==="high").map(s=>s.name).slice(0,2).join(", ")}.`);
     else if (a.risk === "medium") toast("medium", "Medium risk substances detected.");
 
     if (a.undeclared.length > 0) toast("undeclared", `${a.offData?.brand ? a.offData.brand + " — " : ""}"${name}" may contain ${a.undeclared.length} substance${a.undeclared.length!==1?"s":""} not listed on the label: ${a.undeclared.map(s=>s.name).slice(0,3).join(", ")}.`);
-    if (history && (history.undeclared > 0 || history.high >= 2)) toast("brand", `${a.offData.brand}: ${history.undeclared > 0 ? `${history.undeclared} undeclared-substance report${history.undeclared!==1?"s":""}` : `${history.high} high-risk products`} across ${history.count} product${history.count!==1?"s":""} in the shared database.`);
+    if (history) {
+      // The rating is shown for every brand with any prior record, not only
+      // bad ones — a brand with a clean record is information too. The record
+      // it is based on is stated so the number is never taken on faith.
+      const parts = [];
+      if (history.undeclared > 0) parts.push(`${history.undeclared} undeclared-substance report${history.undeclared!==1?"s":""}`);
+      if (history.high > 0) parts.push(`${history.high} high-risk product${history.high!==1?"s":""}`);
+      toast("brand", `${a.offData.brand} — brand rating ${history.score}/10 (${history.verdict}), based on ${history.count} product${history.count!==1?"s":""} in the shared database${parts.length ? `: ${parts.join(", ")}` : " with nothing flagged"}.`);
+    }
 
     const sugar = a.offData?.nut?.sugars ?? a.aiSugarData?.total_sugars ?? null;
     if (sugar != null && sugar > 22.5) toast("sugar", `High sugar: ${sugar}g per 100g.`);
@@ -2674,14 +3053,27 @@ export default function App() {
       if (candidates) {
         // Ambiguous query — let the user choose rather than guessing wrong
         setScanning(false);
-        setPicker({ query: label, candidates });
+        setPicker({
+          query: label,
+          tab: domain === "cosmetics" ? "cosmetics" : "food",
+          // null means "not fetched yet" — distinct from [] meaning "fetched,
+          // nothing found". The other database is only queried if the user
+          // actually opens that tab, so an unused tab costs no requests.
+          results: { food: domain === "cosmetics" ? null : candidates,
+                     cosmetics: domain === "cosmetics" ? candidates : null },
+        });
         return;
       }
+      if (!analysis) throw new Error("Lookup returned no analysis");
       commitScan(analysis, label);
     } catch (e) {
       console.warn("scan:", e);
+      toast("scan", `The scan could not be completed: ${String(e?.message || e)}`);
+    } finally {
+      // Unconditional. The Search button is disabled while `scanning` is true,
+      // so any path that left it set would make the button permanently dead —
+      // a finally block removes that entire class of failure.
       setScanning(false);
-      toast("scan", "The scan could not be completed. Please try again.");
     }
   }
 
@@ -2699,16 +3091,47 @@ export default function App() {
     // the few products already scanned, which is not what was asked.
     if (CLOUD_FILTERS.some(f => f.m.test(q))) {
       setDiscoverLoading(true); setDiscover(null); setSelected(null);
-      const res = await cloudSearch(q);
-      setDiscover(res || { applied: [], products: [], count: 0 });
-      setDiscoverLoading(false);
-      if (res?.domain) noteDomain(res.domain);
+      try {
+        const res = await cloudSearch(q);
+        setDiscover(res || { applied: [], products: [], count: 0 });
+        if (res?.domain) noteDomain(res.domain);
+      } catch (e) {
+        console.warn("submitQuery/discover:", e);
+        setDiscover({ applied: [], products: [], count: 0, failed: true, error: String(e?.message || e) });
+      } finally {
+        // Same reasoning: an unhandled rejection here left the panel stuck on
+        // its loading skeleton with no way out.
+        setDiscoverLoading(false);
+      }
       return;
     }
 
     setDiscover(null);
     if (QUESTION_RE.test(q)) { setSearchQ(q); runSearch(q); return; }
     scan(q);   // checks session cache → shared database → fresh lookup
+  }
+
+  async function runDiagnostics() {
+    setDiagRunning(true); setDiag(null);
+    try { setDiag(await diagnoseSources()); }
+    catch (e) { setDiag([{ label: "Diagnostics", ok: false, detail: String(e?.message || e), ms: 0 }]); }
+    setDiagRunning(false);
+  }
+
+  // Switch picker tabs. The other database is queried on first open only, then
+  // cached in picker state — reopening a tab never re-requests.
+  async function selectPickerTab(d) {
+    setPicker(p => p && { ...p, tab: d });
+    setPicker(p => {
+      if (p && p.results[d] === null && pickerLoading !== d) {
+        setPickerLoading(d);
+        (d === "cosmetics" ? offSearch(p.query, 6, d) : foodSearchMerged(p.query, 6))
+          .then(hits => setPicker(cur => cur && { ...cur, results: { ...cur.results, [d]: hits.map(h => ({ ...h, _domain: d })) } }))
+          .catch(() => setPicker(cur => cur && { ...cur, results: { ...cur.results, [d]: [] } }))
+          .finally(() => setPickerLoading(null));
+      }
+      return p;
+    });
   }
 
   // A scanned barcode is an exact key — go straight to a scan, no picker needed
@@ -3277,23 +3700,60 @@ export default function App() {
       {picker && (
         <div onClick={() => setPicker(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
           <div onClick={e => e.stopPropagation()} style={{background:t.bg,border:`1px solid ${t.border}`,borderRadius:16,padding:"22px 24px",width:"min(520px,100%)",maxHeight:"80vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,0.35)"}}>
-            <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.08em",textTransform:"uppercase",marginBottom:6}}>{picker.candidates.length} matches</div>
-            <h2 style={{margin:"0 0 6px",fontSize:17,fontWeight:700,color:t.text}}>Which "{picker.query}"?</h2>
-            <div style={{fontSize:11,color:t.textSub,marginBottom:16,lineHeight:1.6}}>Open Food Facts returned several products for this name. Pick the exact one to analyse.</div>
+            {(() => {
+            const list = picker.results[picker.tab];
+            const loading = pickerLoading === picker.tab;
+            const TABS = [{ id:"food", label:"Food", icon:"🍽️" }, { id:"cosmetics", label:"Cosmetics", icon:"🧴" }];
+            return (<>
+            <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.08em",textTransform:"uppercase",marginBottom:6}}>
+              {loading ? "Searching…" : `${(list || []).length} match${(list || []).length !== 1 ? "es" : ""}`}
+            </div>
+            <h2 style={{margin:"0 0 6px",fontSize:17,fontWeight:700,color:t.text}}>"{picker.query}"</h2>
+            <div style={{fontSize:11,color:t.textSub,marginBottom:12,lineHeight:1.6}}>Browse what exists, then pick one to analyse. Food covers Open Food Facts and USDA FoodData Central; cosmetics is a separate database, so it is searched on its own tab.</div>
+
+            {/* Food and cosmetics are different databases with different hazard
+                engines, so they are tabs rather than one merged list. The
+                inactive tab is only queried when opened. */}
+            <div style={{display:"flex",gap:6,marginBottom:14}}>
+              {TABS.map(tab => {
+                const active = picker.tab === tab.id;
+                const n = picker.results[tab.id];
+                return (
+                  <button key={tab.id} onClick={() => selectPickerTab(tab.id)}
+                    style={{flex:1,background:active?t.accent:t.pill,color:active?t.accentFg:t.textSub,border:`1px solid ${active?t.accent:t.border}`,borderRadius:8,padding:"7px 10px",cursor:"pointer",fontSize:11,fontWeight:600,display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
+                    <span>{tab.icon}</span>{tab.label}
+                    {n !== null
+                      ? <span style={{opacity:0.7,fontWeight:500}}>({n.length})</span>
+                      : <span style={{opacity:0.6,fontWeight:500,fontSize:10}}>· tap to search</span>}
+                  </button>
+                );
+              })}
+            </div>
 
             <div style={{display:"flex",flexDirection:"column",gap:8}}>
-              {picker.candidates.map((p, i) => {
+              {loading && <div style={{fontSize:11,color:t.textSub,padding:"14px 0",textAlign:"center"}}>Searching {picker.tab === "cosmetics" ? "Open Beauty Facts" : "Open Food Facts"}…</div>}
+              {!loading && list !== null && list.length === 0 &&
+                <div style={{fontSize:11,color:t.textSub,padding:"14px 0",textAlign:"center",lineHeight:1.6}}>
+                  No {picker.tab} match for "{picker.query}". Try the other tab, or a more specific name.
+                </div>}
+              {!loading && (list || []).map((p, i) => {
                 const ns = p.nutriscore_grade;
                 const brand = (p.brands || "").split(",")[0].trim();
                 return (
                   <button key={i} onClick={() => scanCandidate(p)} style={{textAlign:"left",background:t.surface,border:`1.5px solid ${t.border}`,borderRadius:10,padding:"11px 13px",cursor:"pointer",display:"flex",gap:12,alignItems:"center",width:"100%"}}>
                     {p.image_url
                       ? <img src={p.image_url} alt="" style={{width:44,height:44,borderRadius:6,objectFit:"contain",background:t.bgSub,flexShrink:0}}/>
-                      : <div style={{width:44,height:44,borderRadius:6,background:t.bgSub,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>🍽️</div>}
+                      : <div style={{width:44,height:44,borderRadius:6,background:t.bgSub,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>{picker.tab === "cosmetics" ? "🧴" : "🍽️"}</div>}
                     <div style={{flex:1,minWidth:0}}>
                       <div style={{fontSize:13,fontWeight:600,color:t.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.product_name}</div>
                       <div style={{fontSize:10,color:t.textSub,marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
                         {brand || "Unknown brand"}{p.quantity ? ` · ${p.quantity}` : ""}
+                      </div>
+                      {/* Named explicitly: a USDA record has no Nutri-Score by
+                          design, and without this the missing grade looks like
+                          a bug rather than a property of the source. */}
+                      <div style={{fontSize:9,color:t.textMuted,marginTop:2}}>
+                        {p._source === "usda" ? "USDA FoodData Central" : picker.tab === "cosmetics" ? "Open Beauty Facts" : "Open Food Facts"}
                       </div>
                     </div>
                     {ns && <span style={{fontSize:9,fontWeight:700,color:"#fff",background:NS_COLOR[ns]||"#999",padding:"2px 7px",borderRadius:4,flexShrink:0}}>{ns.toUpperCase()}</span>}
@@ -3302,6 +3762,8 @@ export default function App() {
                 );
               })}
             </div>
+            </>);
+            })()}
 
             <button onClick={() => setPicker(null)} style={{marginTop:14,width:"100%",background:t.pill,border:`1px solid ${t.border}`,borderRadius:8,padding:"9px 14px",cursor:"pointer",fontSize:12,fontWeight:600,color:t.textSub}}>Cancel</button>
           </div>
@@ -3389,7 +3851,7 @@ export default function App() {
           {/* LEFT PANEL */}
           <div style={{background:t.leftBg,borderRight:`1px solid ${t.border}`,display:"flex",flexDirection:"column",overflow:"hidden",position:"relative"}}>
             <div style={{padding:"16px 16px 10px"}}>
-              <div style={{fontSize:12,fontWeight:600,color:t.text,marginBottom:3}}>Scan or search a product</div>
+              <div style={{fontSize:12,fontWeight:600,color:t.text,marginBottom:3}}>Search for a product</div>
               <div style={{fontSize:11,color:t.textMuted,marginBottom:10}}>Food and cosmetics — the type is detected automatically.</div>
               <div style={{display:"flex",gap:7,position:"relative"}}>
                 <input value={input}
@@ -3425,7 +3887,7 @@ export default function App() {
               )}
 
               <button onClick={()=>submitQuery()} disabled={scanning||!input.trim()} style={{marginTop:8,width:"100%",background:scanning?t.pill:t.accent,border:"none",color:scanning?t.textMuted:t.accentFg,padding:"11px",borderRadius:9,cursor:scanning||!input.trim()?"default":"pointer",fontSize:13,fontWeight:600,display:"flex",alignItems:"center",justifyContent:"center",gap:8,opacity:!input.trim()&&!scanning?0.45:1,transition:"all 0.2s"}}>
-                {scanning?<><span style={{display:"inline-block",width:13,height:13,border:`2px solid ${t.textMuted}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite"}}/>Working…</>:"Scan or search"}
+                {scanning?<><span style={{display:"inline-block",width:13,height:13,border:`2px solid ${t.textMuted}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite"}}/>Working…</>:"Search"}
               </button>
               {/* Discovery shortcuts — these query the live product database,
                   not just what has already been scanned */}
@@ -3439,6 +3901,32 @@ export default function App() {
                     </button>
                   ))}
                 </div>
+              </div>
+
+              {/* Data source check. Every source failure used to look identical
+                  to "no results", which made them impossible to tell apart from
+                  the outside. This reports each endpoint separately. */}
+              <div style={{marginTop:11,borderTop:`1px solid ${t.border}`,paddingTop:10}}>
+                <button onClick={runDiagnostics} disabled={diagRunning}
+                  style={{fontSize:10,fontWeight:600,color:t.textSub,background:t.pill,border:`1px solid ${t.border}`,padding:"5px 11px",borderRadius:7,cursor:diagRunning?"default":"pointer",opacity:diagRunning?0.6:1}}>
+                  {diagRunning ? "Checking data sources…" : "Check data sources"}
+                </button>
+                {diag && (
+                  <div style={{marginTop:8,display:"flex",flexDirection:"column",gap:4}}>
+                    {diag.map(d => (
+                      <div key={d.label} style={{display:"flex",gap:7,alignItems:"flex-start",fontSize:10,lineHeight:1.5}}>
+                        <span style={{flexShrink:0,color:d.ok?"#2e7d52":"#c0392b",fontWeight:700}}>{d.ok?"✓":"✕"}</span>
+                        <div style={{minWidth:0}}>
+                          <div style={{color:t.text,fontWeight:600}}>{d.label}</div>
+                          <div style={{color:d.ok?t.textMuted:"#c0392b",wordBreak:"break-word"}}>{d.detail} · {d.ms}ms</div>
+                        </div>
+                      </div>
+                    ))}
+                    <div style={{fontSize:9,color:t.textMuted,marginTop:3,lineHeight:1.6}}>
+                      Probes run one at a time to stay under the 10 requests/minute limit, so this takes a few seconds.
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -3581,7 +4069,7 @@ export default function App() {
                       From {discover?.domain === "cosmetics" ? "Open Beauty Facts" : "Open Food Facts"} — live catalogue
                     </div>
                     <div style={{fontSize:17,fontWeight:700,color:t.text,letterSpacing:"-0.3px"}}>
-                      {discoverLoading ? "Searching the catalogue…" : `${discover.count?.toLocaleString?.() || discover.products.length} products match`}
+                      {discoverLoading ? "Searching the catalogue…" : `${discover?.count?.toLocaleString?.() || discover?.products?.length || 0} products match`}
                     </div>
                     {discover?.applied?.length > 0 && (
                       <div style={{display:"flex",gap:5,flexWrap:"wrap",marginTop:7}}>
@@ -3598,13 +4086,18 @@ export default function App() {
                   <div style={{display:"flex",flexDirection:"column",gap:8}}>
                     {[0,1,2,3].map(i => <div key={i} style={{height:58,background:t.surface,border:`1px solid ${t.border}`,borderRadius:10,animation:"shimmer 1.4s ease infinite"}}/>)}
                   </div>
-                ) : discover.products.length === 0 ? (
+                ) : (discover?.products?.length || 0) === 0 ? (
                   <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:12,padding:"36px 22px",textAlign:"center"}}>
                     <div style={{fontSize:13,fontWeight:600,color:t.text,marginBottom:5}}>
-                      {discover.failed ? "The catalogue could not be reached" : "No products matched those filters"}
+                      {discover?.failed ? "The catalogue could not be reached" : "No products matched those filters"}
                     </div>
                     <div style={{fontSize:11,color:t.textMuted,lineHeight:1.7}}>
-                      {discover.failed ? "Check the connection and try again." : "Try a broader query, or scan a specific product by name or barcode."}
+                      {/* The real error is shown, not a generic line. "Check the
+                          connection" was actively misleading when the cause was
+                          a deprecated endpoint or an exhausted rate limit. */}
+                      {discover?.failed
+                        ? (discover.error || "The filter query failed and no fallback returned data.")
+                        : "Try a broader query, or scan a specific product by name or barcode."}
                     </div>
                   </div>
                 ) : (
