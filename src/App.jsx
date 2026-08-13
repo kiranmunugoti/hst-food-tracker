@@ -25,6 +25,15 @@ const GH_TOKEN  = (typeof __GH_TOKEN__ !== "undefined" && __GH_TOKEN__) || "";
 // Toggleable at runtime from the header switch.
 let AI_MODE = false;
 
+// ─── DOMAIN ────────────────────────────────────────────────────────────────────
+// "food"      → Open Food Facts + additive/contaminant engine, referenced to
+//               EFSA and JECFA, the bodies that actually govern food additives.
+// "cosmetics" → Open Beauty Facts + INCI formulation engine, referenced to CIR
+//               and SCCS, the bodies that govern cosmetic ingredients.
+// The two are kept strictly apart: a CIR conclusion is about skin contact and
+// says nothing about ingestion, so limits must never be carried across.
+let DOMAIN = "food";
+
 // ─── SEED HAZARD DB ────────────────────────────────────────────────────────────
 const SEED = {
   glyphosate:{ name:"Glyphosate",       category:"Pesticide",           risk:"high",   eNumber:null,   foods:["wheat","oats","corn","soybeans"],      effects:"Potential carcinogen (IARC Group 2A), gut microbiome disruption", limit:"0.1 mg/kg (EU)" },
@@ -117,11 +126,16 @@ const CONTAMINANT_RULES = [
 function localHazards(name, ingredients, additives = [], categories = []) {
   const found = {};
   const ingr = (ingredients || "").toLowerCase();
+  // Food additive limits come from EFSA (which sets the EU ADI) and JECFA (the
+  // joint FAO/WHO committee) — the bodies that actually govern food additives.
+  // Cosmetic authorities such as CIR and SCCS assess topical exposure and are
+  // deliberately not used here.
   const mk = (eKey, rec, confirmed, via) => ({
     key: eKey.toLowerCase(), id: eKey.toLowerCase(), name: rec.name, eNumber: eKey,
     category: rec.cat, risk: rec.risk, effects: rec.fx, limit: rec.lim,
     foundInIngredient: via, ingredientConfirmed: confirmed,
-    sourceUrl: `https://world.openfoodfacts.org/additive/${eKey.toLowerCase()}`, sourceName: "Open Food Facts",
+    body: "EFSA", sourceName: "EFSA / JECFA (via Open Food Facts)",
+    sourceUrl: `https://world.openfoodfacts.org/additive/${eKey.toLowerCase()}`,
     source: "local",
   });
   // 1. E-numbers declared in OFF additives_tags → confirmed
@@ -190,18 +204,665 @@ function localInsight(name, subs, nut, offData) {
   return parts.join(" ");
 }
 
-function localBrandCred(brand, tracked) {
-  const stats = computeBrandStats(tracked || []).find(b => b.brand.toLowerCase() === brand.toLowerCase());
-  if (!stats) return null;
+// ═══════════════════════════════════════════════════════════════════════════════
+// COSMETICS ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+// Assessments here follow the two bodies that actually govern cosmetic
+// ingredients:
+//   • CIR  — Cosmetic Ingredient Review (US expert panel, cir-safety.org).
+//            Conclusions: safe as used / safe with qualifications / unsafe /
+//            insufficient data.
+//   • SCCS — EU Scientific Committee on Consumer Safety. Opinions feed the
+//            restrictions in EU Cosmetics Regulation 1223/2009 Annexes II–VI.
+//
+// Concentration limits quoted below are the EU regulatory limits arising from
+// SCCS opinions. They apply to TOPICAL use only and say nothing about
+// ingestion — a distinction the app must never blur.
+const COSMETIC_DB = {
+  // ── Preservatives ──
+  methylisothiazolinone: { inci:"Methylisothiazolinone", fn:"Preservative", risk:"high",
+    effects:"Potent contact sensitiser; a major cause of allergic contact dermatitis",
+    limit:"Banned in leave-on products (EU); 0.0015% in rinse-off", body:"SCCS",
+    note:"SCCS concluded no safe concentration could be established for leave-on use.",
+    m:/methylisothiazolinone|\bMI\b/i },
+  methylchloroisothiazolinone: { inci:"Methylchloroisothiazolinone", fn:"Preservative", risk:"high",
+    effects:"Strong sensitiser, used in a 3:1 blend with MI",
+    limit:"0.0015% of a 3:1 MCI/MI mixture, rinse-off only (EU)", body:"SCCS",
+    m:/methylchloroisothiazolinone|\bMCI\b/i },
+  formaldehyde: { inci:"Formaldehyde", fn:"Preservative", risk:"high",
+    effects:"Carcinogen by inhalation (IARC Group 1); sensitiser",
+    limit:"Banned as an added ingredient in EU cosmetics", body:"SCCS",
+    m:/\bformaldehyde\b|formalin/i },
+  dmdm_hydantoin: { inci:"DMDM Hydantoin", fn:"Preservative (formaldehyde releaser)", risk:"medium",
+    effects:"Releases formaldehyde slowly; sensitisation risk",
+    limit:"0.6% (EU); products must be labelled 'releases formaldehyde' above 0.001%", body:"SCCS",
+    m:/dmdm hydantoin/i },
+  imidazolidinyl_urea: { inci:"Imidazolidinyl Urea", fn:"Preservative (formaldehyde releaser)", risk:"medium",
+    effects:"Formaldehyde releaser; contact allergen",
+    limit:"0.6% (EU)", body:"CIR", m:/imidazolidinyl urea/i },
+  diazolidinyl_urea: { inci:"Diazolidinyl Urea", fn:"Preservative (formaldehyde releaser)", risk:"medium",
+    effects:"Formaldehyde releaser; contact allergen",
+    limit:"0.5% (EU)", body:"CIR", m:/diazolidinyl urea/i },
+  quaternium_15: { inci:"Quaternium-15", fn:"Preservative (formaldehyde releaser)", risk:"medium",
+    effects:"The most sensitising of the formaldehyde releasers",
+    limit:"0.2% (EU)", body:"CIR", m:/quaternium-?15/i },
+  methylparaben: { inci:"Methylparaben", fn:"Preservative", risk:"low",
+    effects:"Weak oestrogenic activity in vitro; well tolerated in use",
+    limit:"0.4% single ester, 0.8% total parabens (EU)", body:"SCCS",
+    note:"SCCS considers methyl- and ethylparaben safe at permitted levels.",
+    m:/methylparaben/i },
+  propylparaben: { inci:"Propylparaben", fn:"Preservative", risk:"medium",
+    effects:"Endocrine-activity concerns prompted a lowered limit",
+    limit:"0.14% (EU, reduced from 0.4% after SCCS review)", body:"SCCS",
+    m:/propylparaben|butylparaben/i },
+  isobutylparaben: { inci:"Isobutylparaben", fn:"Preservative", risk:"high",
+    effects:"Endocrine-disruption concerns; insufficient safety data",
+    limit:"Banned in EU cosmetics", body:"SCCS", m:/isopropylparaben|isobutylparaben|pentylparaben|phenylparaben|benzylparaben/i },
+  phenoxyethanol: { inci:"Phenoxyethanol", fn:"Preservative", risk:"low",
+    effects:"Generally well tolerated; occasional irritation",
+    limit:"1.0% (EU)", body:"SCCS",
+    note:"SCCS re-confirmed 1% as safe for all age groups.",
+    m:/phenoxyethanol/i },
+  triclosan: { inci:"Triclosan", fn:"Preservative / antimicrobial", risk:"medium",
+    effects:"Endocrine effects in animals; antimicrobial resistance concerns",
+    limit:"0.3% in specified products only (EU)", body:"SCCS", m:/triclosan/i },
+
+  // ── UV filters ──
+  oxybenzone: { inci:"Benzophenone-3 (Oxybenzone)", fn:"UV filter", risk:"medium",
+    effects:"Systemic absorption; endocrine-activity concerns; contact allergen",
+    limit:"6% in sunscreens, 0.5% when used to protect formulation (EU)", body:"SCCS",
+    note:"SCCS lowered the permitted level following absorption data.",
+    m:/benzophenone-?3|oxybenzone/i },
+  octinoxate: { inci:"Ethylhexyl Methoxycinnamate (Octinoxate)", fn:"UV filter", risk:"medium",
+    effects:"Endocrine-activity concerns in animal studies",
+    limit:"10% (EU)", body:"SCCS", m:/ethylhexyl methoxycinnamate|octinoxate|octyl methoxycinnamate/i },
+  homosalate: { inci:"Homosalate", fn:"UV filter", risk:"medium",
+    effects:"Endocrine-activity concerns prompted a substantial limit reduction",
+    limit:"7.34% in face products (EU, reduced from 10%)", body:"SCCS", m:/homosalate/i },
+  octocrylene: { inci:"Octocrylene", fn:"UV filter", risk:"low",
+    effects:"Contact allergen; degrades to benzophenone over time",
+    limit:"10% (EU)", body:"SCCS", m:/octocrylene/i },
+  titanium_dioxide_nano: { inci:"Titanium Dioxide (nano)", fn:"UV filter", risk:"medium",
+    effects:"Safe on intact skin; inhalation of loose powder or spray is the concern",
+    limit:"25% (EU); not permitted in sprayable products", body:"SCCS",
+    note:"SCCS nanomaterial guidance applies — form and route of exposure govern the risk.",
+    m:/titanium dioxide.*nano|\bnano.*titanium dioxide/i },
+  zinc_oxide_nano: { inci:"Zinc Oxide (nano)", fn:"UV filter", risk:"low",
+    effects:"Not absorbed through intact skin; inhalation is the concern",
+    limit:"25% (EU); not permitted in sprayable products", body:"SCCS",
+    m:/zinc oxide.*nano|\bnano.*zinc oxide/i },
+
+  // ── Surfactants ──
+  sls: { inci:"Sodium Lauryl Sulfate", fn:"Surfactant (anionic)", risk:"medium",
+    effects:"Irritant and barrier-disrupting at higher concentrations, especially leave-on",
+    limit:"No numeric limit; CIR: safe in rinse-off, concentration-limited in leave-on", body:"CIR",
+    note:"CIR concluded safe when formulated to be non-irritating — brief skin contact.",
+    m:/sodium lauryl sulfate|sodium laurilsulfate|\bSLS\b/i },
+  sles: { inci:"Sodium Laureth Sulfate", fn:"Surfactant (anionic)", risk:"low",
+    effects:"Milder than SLS; ethoxylation can leave 1,4-dioxane traces",
+    limit:"CIR: safe as used; 1,4-dioxane must be removed", body:"CIR",
+    m:/sodium laureth sulfate|sodium lauryl ether sulfate|\bSLES\b/i },
+  cocamidopropyl_betaine: { inci:"Cocamidopropyl Betaine", fn:"Surfactant (amphoteric)", risk:"low",
+    effects:"Sensitisation usually traced to manufacturing impurities",
+    limit:"CIR: safe when impurities are controlled", body:"CIR", m:/cocamidopropyl betaine/i },
+
+  // ── Actives (pH-dependent) ──
+  glycolic_acid: { inci:"Glycolic Acid", fn:"AHA exfoliant", risk:"medium",
+    effects:"Increases UV sensitivity; irritation at low pH",
+    limit:"4% at pH ≥3.8 for consumer use (EU)", body:"SCCS",
+    ph:[3.5,4.5], phNote:"Needs an acidic pH to exfoliate; below pH 3.5 irritation rises sharply.",
+    m:/glycolic acid/i },
+  lactic_acid: { inci:"Lactic Acid", fn:"AHA exfoliant", risk:"low",
+    effects:"Milder AHA; increases UV sensitivity",
+    limit:"4% at pH ≥3.8 for consumer use (EU)", body:"SCCS",
+    ph:[3.5,4.5], m:/lactic acid/i },
+  salicylic_acid: { inci:"Salicylic Acid", fn:"BHA exfoliant", risk:"medium",
+    effects:"Not for use on children; avoid in pregnancy at high levels",
+    limit:"2% in leave-on, 3% in rinse-off (EU)", body:"SCCS",
+    ph:[3.0,4.0], phNote:"Active in its free acid form, which needs pH below about 4.",
+    m:/salicylic acid/i },
+  ascorbic_acid: { inci:"Ascorbic Acid (Vitamin C)", fn:"Antioxidant active", risk:"low",
+    effects:"Unstable; oxidises to inactive and potentially irritating products",
+    limit:"No restriction", body:"CIR",
+    ph:[2.5,3.5], phNote:"L-ascorbic acid only penetrates below about pH 3.5, which is itself irritating.",
+    m:/\bascorbic acid\b|l-ascorbic/i },
+  niacinamide: { inci:"Niacinamide", fn:"Vitamin B3 active", risk:"low",
+    effects:"Well tolerated; flushing at high concentration",
+    limit:"No restriction", body:"CIR",
+    ph:[5.0,7.0], phNote:"Converts to nicotinic acid (which causes flushing) at low pH.",
+    m:/niacinamide|nicotinamide/i },
+  retinol: { inci:"Retinol", fn:"Vitamin A active", risk:"medium",
+    effects:"Irritation, peeling, UV sensitivity; avoid in pregnancy",
+    limit:"0.3% in face products, 0.05% in body lotion (EU)", body:"SCCS",
+    ph:[5.5,6.5], phNote:"Degrades rapidly in acidic formulations.",
+    m:/\bretinol\b|retinyl palmitate|retinaldehyde|\bretinal\b/i },
+  benzoyl_peroxide: { inci:"Benzoyl Peroxide", fn:"Antibacterial active", risk:"medium",
+    effects:"Bleaches fabric; irritation; oxidises other actives",
+    limit:"Restricted to specific product types (EU)", body:"SCCS", m:/benzoyl peroxide/i },
+  hydroquinone: { inci:"Hydroquinone", fn:"Skin lightener", risk:"high",
+    effects:"Ochronosis with prolonged use; cytotoxic to melanocytes",
+    limit:"Banned in EU cosmetics (permitted only in artificial nail systems)", body:"SCCS",
+    m:/hydroquinone/i },
+
+  // ── Other substances of concern ──
+  phthalate_dep: { inci:"Diethyl Phthalate", fn:"Fragrance fixative / solvent", risk:"medium",
+    effects:"Endocrine-activity concerns for the phthalate class",
+    limit:"CIR: safe as used; several other phthalates banned in EU", body:"CIR",
+    m:/diethyl phthalate|\bDEP\b|phthalate/i },
+  bht_cos: { inci:"BHT", fn:"Antioxidant / stabiliser", risk:"low",
+    effects:"Low risk at cosmetic levels",
+    limit:"0.8% leave-on face (SCCS opinion)", body:"SCCS", m:/\bBHT\b|butylated hydroxytoluene/i },
+  edta_cos: { inci:"Disodium EDTA", fn:"Chelator / stabiliser", risk:"low",
+    effects:"Poorly biodegradable; can increase penetration of other ingredients",
+    limit:"CIR: safe as used", body:"CIR", m:/\bEDTA\b|edetate/i },
+  d5_siloxane: { inci:"Cyclopentasiloxane (D5)", fn:"Emollient / solvent", risk:"medium",
+    effects:"Persistent and bioaccumulative; environmental restriction",
+    limit:"Restricted to below 0.1% in wash-off products (EU)", body:"SCCS",
+    m:/cyclopentasiloxane|cyclotetrasiloxane|\bD5\b|\bD4\b/i },
+  talc: { inci:"Talc", fn:"Absorbent / bulking agent", risk:"medium",
+    effects:"Must be asbestos-free; inhalation risk in loose powders",
+    limit:"Prohibited in powders for children under 3 (EU)", body:"SCCS", m:/\btalc\b/i },
+  aluminium_salt: { inci:"Aluminium Salts", fn:"Antiperspirant active", risk:"low",
+    effects:"SCCS found systemic exposure acceptable at typical use levels",
+    limit:"10.60% in non-spray antiperspirants (SCCS opinion)", body:"SCCS",
+    m:/aluminum chlorohydrate|aluminium chlorohydrate|aluminum zirconium|aluminium zirconium/i },
+
+  // ── Banned or severely restricted in EU cosmetics ────────────────────────
+  lilial: { inci:"Butylphenyl Methylpropional (Lilial)", fn:"Fragrance", risk:"high",
+    effects:"Classified as a reproductive toxicant (CMR 1B)",
+    limit:"Banned in EU cosmetics since March 2022", body:"SCCS",
+    note:"Prohibited outright rather than restricted. Still appears in older stock and imports.",
+    m:/butylphenyl methylpropional|lilial/i },
+  kojic_acid: { inci:"Kojic Acid", fn:"Skin brightener", risk:"medium",
+    effects:"Skin sensitisation; thyroid effects examined at higher exposures",
+    limit:"1% in face and hand products (EU)", body:"SCCS",
+    m:/kojic acid/i },
+  arbutin: { inci:"Alpha-Arbutin", fn:"Skin brightener", risk:"medium",
+    effects:"Releases hydroquinone on breakdown",
+    limit:"2% face creams, 0.5% body lotion (EU)", body:"SCCS",
+    note:"Limits are set to keep released hydroquinone below a level of concern.",
+    m:/arbutin/i },
+  resorcinol: { inci:"Resorcinol", fn:"Hair dye intermediate", risk:"medium",
+    effects:"Skin sensitiser; thyroid effects at high exposure",
+    limit:"0.5% (oxidative hair dyes, EU)", body:"SCCS", m:/resorcinol/i },
+  ppd: { inci:"p-Phenylenediamine (PPD)", fn:"Hair dye", risk:"high",
+    effects:"Potent contact sensitiser; severe allergic reactions possible",
+    limit:"2% (oxidative hair dyes, EU); banned in products for eyelashes/eyebrows", body:"SCCS",
+    m:/phenylenediamine|\bppd\b/i },
+  toluene: { inci:"Toluene", fn:"Solvent", risk:"high",
+    effects:"Reproductive toxicity; CNS effects on inhalation",
+    limit:"25% in nail products only, with warnings (EU)", body:"SCCS", m:/\btoluene\b/i },
+  formaldehyde_nail: { inci:"Methylene Glycol / Formalin", fn:"Nail hardener", risk:"high",
+    effects:"Formaldehyde equivalent; carcinogenic by inhalation",
+    limit:"5% in nail hardeners only, with warnings (EU)", body:"SCCS",
+    m:/methylene glycol|formalin/i },
+
+  // ── Penetration enhancers: they raise the delivered dose of everything ────
+  propylene_glycol: { inci:"Propylene Glycol", fn:"Humectant / penetration enhancer", risk:"low",
+    effects:"Occasional irritation and contact allergy",
+    limit:"Safe as used in cosmetics", body:"CIR",
+    note:"Increases how much of everything else in the formula crosses the barrier.",
+    m:/propylene glycol/i },
+  ethoxydiglycol: { inci:"Ethoxydiglycol", fn:"Solvent / penetration enhancer", risk:"medium",
+    effects:"Strongly increases absorption of co-formulated actives",
+    limit:"Safe with qualifications on concentration", body:"CIR",
+    note:"The delivered dose of actives alongside it is meaningfully higher than the label concentration suggests.",
+    m:/ethoxydiglycol/i },
+  alcohol_denat: { inci:"Alcohol Denat.", fn:"Solvent / penetration enhancer", risk:"medium",
+    effects:"Barrier disruption with repeated use, especially high in the list",
+    limit:"Safe as used", body:"CIR", m:/alcohol denat|\bsd alcohol\b/i },
+
+  // ── Declarable fragrance allergens (EU list of 26) ────────────────────────
+  limonene: { inci:"Limonene", fn:"Fragrance allergen", risk:"low",
+    effects:"Oxidises in air into a more potent sensitiser",
+    limit:"Declarable above 0.001% leave-on / 0.01% rinse-off (EU)", body:"SCCS", m:/\blimonene\b/i },
+  linalool: { inci:"Linalool", fn:"Fragrance allergen", risk:"low",
+    effects:"Oxidation products are the actual allergens",
+    limit:"Declarable above 0.001% leave-on / 0.01% rinse-off (EU)", body:"SCCS", m:/\blinalool\b/i },
+  citronellol: { inci:"Citronellol", fn:"Fragrance allergen", risk:"low",
+    effects:"Contact allergy in sensitised individuals",
+    limit:"Declarable above 0.001% leave-on / 0.01% rinse-off (EU)", body:"SCCS", m:/citronellol/i },
+  geraniol: { inci:"Geraniol", fn:"Fragrance allergen", risk:"low",
+    effects:"Contact allergy in sensitised individuals",
+    limit:"Declarable above 0.001% leave-on / 0.01% rinse-off (EU)", body:"SCCS", m:/geraniol/i },
+  eugenol: { inci:"Eugenol", fn:"Fragrance allergen", risk:"low",
+    effects:"Contact allergy in sensitised individuals",
+    limit:"Declarable above 0.001% leave-on / 0.01% rinse-off (EU)", body:"SCCS", m:/\beugenol\b/i },
+  coumarin: { inci:"Coumarin", fn:"Fragrance allergen", risk:"low",
+    effects:"Contact allergy in sensitised individuals",
+    limit:"Declarable above 0.001% leave-on / 0.01% rinse-off (EU)", body:"SCCS", m:/coumarin/i },
+  cinnamal: { inci:"Cinnamal", fn:"Fragrance allergen", risk:"medium",
+    effects:"Among the more frequently sensitising fragrance materials",
+    limit:"Declarable; concentration-restricted in some uses (EU)", body:"SCCS", m:/cinnamal|cinnamyl alcohol/i },
+  isoeugenol: { inci:"Isoeugenol", fn:"Fragrance allergen", risk:"medium",
+    effects:"Potent sensitiser, restricted by concentration as well as labelling",
+    limit:"0.02% in fine fragrance, lower elsewhere (EU)", body:"SCCS", m:/isoeugenol/i },
+};
+
+// The 26 fragrance allergens the EU requires to be declared individually.
+// Presence is not a hazard as such — it is a disclosure and sensitisation signal.
+const FRAGRANCE_ALLERGENS = ["limonene","linalool","citronellol","geraniol","eugenol","coumarin","cinnamal","citral","isoeugenol","hydroxycitronellal","benzyl salicylate","benzyl alcohol","benzyl benzoate","benzyl cinnamate","cinnamyl alcohol","farnesol","hexyl cinnamal","butylphenyl methylpropional","amyl cinnamal","anise alcohol","methyl 2-octynoate","alpha-isomethyl ionone","evernia prunastri","evernia furfuracea","cinnamyl aldehyde","amylcinnamyl alcohol"];
+
+// Delivery systems change how deeply and how fast an ingredient penetrates,
+// which is why SCCS assesses them separately from the raw ingredient.
+const DELIVERY_SYSTEMS = [
+  { key:"liposome", m:/liposom/i, name:"Liposomes", note:"Phospholipid vesicles that carry actives deeper into the stratum corneum, raising both efficacy and irritation potential." },
+  { key:"niosome", m:/niosom/i, name:"Niosomes", note:"Non-ionic surfactant vesicles used to improve penetration and stability." },
+  { key:"nano", m:/\bnano|nanoparticle|nanosom|nanoemulsion/i, name:"Nanomaterials", note:"SCCS assesses nanomaterials under dedicated guidance; the route of exposure (especially inhalation) governs the risk." },
+  { key:"encapsulation", m:/encapsulat|microencapsul|microsphere|micro-?sponge/i, name:"Encapsulation", note:"Shields unstable actives and releases them gradually, which usually lowers irritation." },
+  { key:"cyclodextrin", m:/cyclodextrin/i, name:"Cyclodextrin complexes", note:"Host molecules that stabilise volatile or poorly soluble actives." },
+  { key:"ferment", m:/ferment|lysate|filtrate/i, name:"Fermented actives", note:"Fermentation-derived ingredients; composition varies by process and is harder to characterise." },
+];
+
+// Stabiliser classes. Their absence matters as much as their presence: a
+// water-containing product with no preservative system is a microbial risk.
+const STABILISER_CLASSES = [
+  { key:"chelator", m:/\bEDTA\b|edetate|phytic acid|sodium phytate|etidronic/i, name:"Chelators", note:"Bind trace metals that would otherwise catalyse oxidation." },
+  { key:"antioxidant", m:/tocopherol|\bBHT\b|\bBHA\b|ascorbyl palmitate|sodium metabisulfite|ferulic/i, name:"Antioxidants", note:"Protect oils and actives from oxidising." },
+  { key:"emulsifier", m:/polysorbate|cetearyl alcohol|glyceryl stearate|ceteareth|steareth|lecithin|sorbitan/i, name:"Emulsifiers", note:"Hold oil and water phases together; instability shows as separation." },
+  { key:"thickener", m:/carbomer|xanthan|cellulose|carrageenan|acrylates.*copolymer|sclerotium/i, name:"Thickeners", note:"Set viscosity and help suspend actives evenly." },
+  { key:"phadjust", m:/sodium hydroxide|triethanolamine|citric acid|sodium citrate|lactic acid|aminomethyl propanol/i, name:"pH adjusters", note:"Bring the formulation to its intended pH." },
+  { key:"preservative", m:/phenoxyethanol|paraben|benzoate|sorbate|isothiazolinone|hydantoin|imidazolidinyl|diazolidinyl|quaternium|benzyl alcohol|dehydroacetic|chlorphenesin|caprylyl glycol|ethylhexylglycerin/i, name:"Preservative system", note:"Prevents microbial growth in any product containing water." },
+];
+
+// ─── COSMETIC ANALYSIS ─────────────────────────────────────────────────────────
+// INCI lists are ordered by descending concentration down to 1%, after which
+// order is free. That ordering is the only concentration signal available from
+// a label, so position is used as a proxy — carefully, and never as a number.
+function splitINCI(text) {
+  if (!text) return [];
+  return String(text)
+    .replace(/\(.*?\)/g, " ")               // drop parenthetical notes
+    .split(/[,;•\n]/)
+    .map(x => x.trim().replace(/^[\-\*\d.\s]+/, ""))
+    .filter(x => x.length > 1 && x.length < 90);
+}
+
+function cosmeticHazards(ingredientsText) {
+  const found = [];
+  const raw = (ingredientsText || "").toLowerCase();
+  const list = splitINCI(ingredientsText);
+  Object.entries(COSMETIC_DB).forEach(([key, rec]) => {
+    if (!rec.m.test(raw)) return;
+    // Position in the list approximates concentration
+    const idx = list.findIndex(i => rec.m.test(i));
+    found.push({
+      key, id:key, name:rec.inci, category:rec.fn, risk:rec.risk,
+      effects:rec.effects, limit:rec.limit, body:rec.body, note:rec.note || null,
+      ph:rec.ph || null, phNote:rec.phNote || null,
+      position: idx >= 0 ? idx + 1 : null,
+      ofTotal: list.length || null,
+      ingredientConfirmed: true,      // read directly from the declared INCI list
+      sourceName: rec.body === "SCCS" ? "SCCS (EU)" : "CIR",
+      sourceUrl: rec.body === "SCCS"
+        ? "https://health.ec.europa.eu/scientific-committees/scientific-committee-consumer-safety-sccs_en"
+        : "https://www.cir-safety.org/",
+    });
+  });
+  return found;
+}
+
+function fragranceAllergensIn(ingredientsText) {
+  const raw = (ingredientsText || "").toLowerCase();
+  return FRAGRANCE_ALLERGENS.filter(a => raw.includes(a));
+}
+
+// pH is almost never printed on packaging, so it is inferred from the actives
+// present. The output is the range the formulation MUST sit in to work, plus
+// any conflicts between actives that want incompatible ranges.
+function phAnalysis(hazards, ingredientsText) {
+  const withPh = hazards.filter(h => h.ph);
+  const raw = (ingredientsText || "").toLowerCase();
+  if (!withPh.length) {
+    const isWater = /^\s*(aqua|water|eau)/i.test(String(ingredientsText || "").trim());
+    return isWater
+      ? { known:false, note:"No pH-dependent actives were identified. A water-based product would normally be formulated near skin pH (4.5–5.5)." }
+      : { known:false, note:"No pH-dependent actives were identified." };
+  }
+  const lo = Math.max(...withPh.map(h => h.ph[0]));
+  const hi = Math.min(...withPh.map(h => h.ph[1]));
+  const conflicts = [];
+  for (let i = 0; i < withPh.length; i++) {
+    for (let j = i + 1; j < withPh.length; j++) {
+      const a = withPh[i], b = withPh[j];
+      if (a.ph[1] < b.ph[0] || b.ph[1] < a.ph[0]) {
+        conflicts.push({
+          a: a.name, b: b.name,
+          detail: `${a.name} needs pH ${a.ph[0]}–${a.ph[1]} while ${b.name} needs pH ${b.ph[0]}–${b.ph[1]}. In one formulation at least one of them is working outside its effective range.`,
+        });
+      }
+    }
+  }
+  // Known chemical incompatibilities that are not purely about pH
+  const pairs = [];
+  if (/\bretinol\b|retinaldehyde/.test(raw) && /(glycolic|lactic|salicylic) acid/.test(raw))
+    pairs.push("Retinol alongside an exfoliating acid increases irritation, and the acid pH degrades the retinol.");
+  if (/\bascorbic acid\b/.test(raw) && /niacinamide/.test(raw))
+    pairs.push("L-ascorbic acid and niacinamide want opposite pH ranges; at low pH niacinamide can convert to nicotinic acid, which causes flushing.");
+  if (/benzoyl peroxide/.test(raw) && /(\bascorbic acid\b|\bretinol\b)/.test(raw))
+    pairs.push("Benzoyl peroxide oxidises vitamin C and retinol, deactivating both.");
+
   return {
-    score: Math.round(stats.score), verdict: stats.verdict, founded: null, headquarters: null,
-    certifications: [],
-    controversies: stats.undeclared > 0 ? [`${stats.undeclared} undeclared-substance report${stats.undeclared !== 1 ? "s" : ""} in community data`] : [],
-    positives: (stats.ns.a + stats.ns.b) > 0 ? [`${stats.ns.a + stats.ns.b} product${stats.ns.a + stats.ns.b !== 1 ? "s" : ""} rated Nutri-Score A/B`] : [],
-    summary: `Community rating from ${stats.count} scanned product${stats.count !== 1 ? "s" : ""}: ${stats.high} high-risk, ${stats.undeclared} undeclared substance report${stats.undeclared !== 1 ? "s" : ""}. Based on your scans and the shared database — not AI web research.`,
-    transparency: stats.undeclared === 0 ? "High" : stats.undeclared <= 2 ? "Medium" : "Low",
-    recallHistory: "Unknown",
+    known: true,
+    range: lo <= hi ? [lo, hi] : null,
+    drivers: withPh.map(h => ({ name:h.name, ph:h.ph, note:h.phNote })),
+    conflicts, incompatibilities: pairs,
+    note: lo <= hi
+      ? `To work as intended this formulation should sit between pH ${lo} and ${hi}.`
+      : "The actives present require incompatible pH ranges, so they cannot all be effective in a single formulation.",
   };
+}
+
+function deliverySystemsIn(ingredientsText) {
+  const raw = (ingredientsText || "").toLowerCase();
+  return DELIVERY_SYSTEMS.filter(d => d.m.test(raw)).map(d => ({ key:d.key, name:d.name, note:d.note }));
+}
+
+function stabiliserAnalysis(ingredientsText) {
+  const raw = (ingredientsText || "").toLowerCase();
+  const present = STABILISER_CLASSES.filter(c => c.m.test(raw)).map(c => ({ key:c.key, name:c.name, note:c.note }));
+  const hasPreservative = present.some(p => p.key === "preservative");
+  const waterBased = /\b(aqua|water|eau)\b/.test(raw);
+  const gaps = [];
+  if (waterBased && !hasPreservative)
+    gaps.push("This product contains water but no recognised preservative was identified. Water-containing cosmetics need a preservative system to prevent microbial growth.");
+  if (present.some(p => p.key === "emulsifier") && !present.some(p => p.key === "antioxidant") && /\boil\b|butter|seed oil/.test(raw))
+    gaps.push("An oil phase is present with no antioxidant identified, which makes the oils more likely to oxidise over the product's life.");
+  return { present, gaps, waterBased, hasPreservative };
+}
+
+// Overall formulation: what the product is built from, judged by INCI order.
+function formulationAnalysis(ingredientsText, hazards) {
+  const list = splitINCI(ingredientsText);
+  if (!list.length) return null;
+  const raw = (ingredientsText || "").toLowerCase();
+  const base = /^(aqua|water|eau)/i.test(list[0]) ? "Water-based"
+    : /alcohol|denat/i.test(list[0]) ? "Alcohol-based"
+    : /oil|butter|ester|caprylic|triglyceride/i.test(list[0]) ? "Oil-based (anhydrous)"
+    : /glycerin|propanediol|butylene glycol/i.test(list[0]) ? "Humectant-based"
+    : "Other";
+  // Only the first several entries are meaningfully ordered by concentration
+  const leading = list.slice(0, 5);
+  const flaggedLeading = hazards.filter(h => h.position && h.position <= 5);
+  const allergens = fragranceAllergensIn(ingredientsText);
+  const hasFragrance = /\b(parfum|fragrance|aroma)\b/.test(raw);
+  return {
+    base, total:list.length, leading, flaggedLeading,
+    allergens, hasFragrance,
+    complexity: list.length > 40 ? "Very high" : list.length > 25 ? "High" : list.length > 12 ? "Moderate" : "Low",
+    note: `${list.length} declared ingredients. INCI order is by descending concentration down to 1%, so the first few dominate the formulation.`,
+  };
+}
+
+// Credibility for a cosmetic product, mirroring the food version's logic:
+// disclosure first, then what the disclosure reveals.
+function cosmeticCredibility(rec) {
+  const off = rec?.offData || null;
+  const hazards = rec?.allSubs || [];
+  const form = rec?.formulation || null;
+  const factors = [];
+  let score = 10;
+
+  if (off?.ingredients) {
+    factors.push({ label:"Full INCI list published", detail:"Every ingredient is declared, so the formulation can be assessed.", impact:"positive" });
+  } else if (off) {
+    score -= 2.5;
+    factors.push({ label:"No INCI list", detail:"This product does not publish its ingredients, so nothing can be verified.", impact:"negative" });
+  } else {
+    score -= 3.5;
+    factors.push({ label:"No product record", detail:"Not found in Open Beauty Facts; this analysis is based on the name alone.", impact:"negative" });
+  }
+
+  const high = hazards.filter(h => h.risk === "high");
+  const med  = hazards.filter(h => h.risk === "medium");
+  if (high.length) {
+    score -= Math.min(4, high.length * 1.6);
+    factors.push({ label:`${high.length} restricted or banned ingredient${high.length!==1?"s":""}`, detail:high.slice(0,3).map(h=>h.name).join(", "), impact:"negative" });
+  }
+  if (med.length) {
+    score -= Math.min(2, med.length * 0.5);
+    factors.push({ label:`${med.length} ingredient${med.length!==1?"s":""} with concentration limits`, detail:med.slice(0,3).map(h=>h.name).join(", "), impact:"neutral" });
+  }
+  if (form?.allergens?.length) {
+    score -= Math.min(1.2, form.allergens.length * 0.2);
+    factors.push({ label:`${form.allergens.length} declared fragrance allergen${form.allergens.length!==1?"s":""}`, detail:"The EU requires these 26 substances to be named individually because of sensitisation risk.", impact:"neutral" });
+  } else if (form?.hasFragrance) {
+    score -= 0.5;
+    factors.push({ label:"Fragrance not broken down", detail:"Listed only as 'parfum', so the individual components are not disclosed.", impact:"negative" });
+  }
+  const stab = rec?.stabilisers;
+  if (stab?.gaps?.length) {
+    score -= Math.min(1.5, stab.gaps.length * 0.9);
+    factors.push({ label:"Formulation gap", detail:stab.gaps[0], impact:"negative" });
+  } else if (stab?.hasPreservative) {
+    factors.push({ label:"Preservative system present", detail:"Appropriate for a product containing water.", impact:"positive" });
+  }
+  const ph = rec?.ph;
+  if (ph?.conflicts?.length || ph?.incompatibilities?.length) {
+    score -= 0.8;
+    factors.push({ label:"Active incompatibility", detail:(ph.conflicts[0]?.detail) || ph.incompatibilities[0], impact:"negative" });
+  }
+
+  if (!off) score = Math.min(score, 2.5);
+  else if (!off.ingredients) score = Math.min(score, 4.5);
+  score = Math.max(0, Math.min(10, +score.toFixed(1)));
+  const verdict = !off ? "Unverifiable"
+    : score >= 8 ? "Well formulated" : score >= 6 ? "Reasonable" : score >= 4 ? "Some concerns" : score >= 2 ? "Significant concerns" : "Poor";
+  return {
+    score, verdict, factors, domain:"cosmetics",
+    transparency: !off?.ingredients ? "Low" : (form?.hasFragrance && !form?.allergens?.length) ? "Medium" : "High",
+    dataCompleteness: off ? Math.round((["name","brand","ingredients","image"].filter(f => off[f]).length / 4) * 100) : 0,
+  };
+}
+
+function analyzeCosmetic(offData, label) {
+  const ingredients = offData?.ingredients || null;
+  const hazards = cosmeticHazards(ingredients);
+  const ph = phAnalysis(hazards, ingredients);
+  const delivery = deliverySystemsIn(ingredients);
+  const stabilisers = stabiliserAnalysis(ingredients);
+  const formulation = formulationAnalysis(ingredients, hazards);
+  const rec = { offData, allSubs:hazards, ph, delivery, stabilisers, formulation, domain:"cosmetics" };
+  const cred = cosmeticCredibility(rec);
+  return { ...rec, risk:getRisk(hazards), credibility:cred, undeclared:[], undeclaredCount:0, aiSugarData:null, diet:"n/a" };
+}
+
+// ─── BRAND OWNERSHIP ───────────────────────────────────────────────────────────
+// Open Food Facts records the brand printed on the pack, which is often a
+// sub-brand: "Maggi" rather than Nestlé, who have owned it since 1947. Holding
+// only the sub-brand accountable hides the record of the company that actually
+// sets policy, so ratings roll up to the parent where one is known.
+//
+// This list is curated and deliberately conservative — only well-established
+// ownerships are included. It is necessarily incomplete, and ownership changes
+// (disposals, acquisitions) will make entries go stale, so a missing parent
+// simply means the brand is rated on its own.
+const PARENT_COMPANY = {};
+const _own = (parent, brands) => brands.forEach(b => { PARENT_COMPANY[b.toLowerCase()] = parent; });
+
+_own("Nestlé", ["maggi","kitkat","kit kat","nescafé","nescafe","nespresso","milo","cerelac","nesquik","coffee-mate","coffee mate","perrier","s.pellegrino","san pellegrino","aero","milkybar","milky bar","toll house","stouffer's","lean cuisine","hot pockets","gerber","carnation","nestle","nestlé","nan","lactogen","everyday","munch","polo","barone"]);
+_own("Unilever", ["knorr","hellmann's","hellmanns","ben & jerry's","ben and jerry's","magnum","cornetto","wall's","walls","marmite","colman's","colmans","pot noodle","kissan","brooke bond","bru","lakme","sunsilk"]);
+_own("PepsiCo", ["lay's","lays","doritos","cheetos","tostitos","ruffles","quaker","gatorade","mountain dew","mirinda","kurkure","pepsi","7up","aquafina","sting"]);
+_own("The Coca-Cola Company", ["coca-cola","coca cola","sprite","fanta","minute maid","powerade","dasani","costa coffee","innocent","thums up","limca","maaza","smartwater","vitaminwater","kinley"]);
+_own("Mondelez", ["cadbury","oreo","toblerone","milka","ritz","trident","halls","belvita","tang","bournvita","dairy milk","5 star","gems","perk"]);
+_own("Mars", ["snickers","m&m's","m&ms","twix","bounty","milky way","galaxy","dolmio","ben's original","uncle ben's","pedigree","whiskas","orbit","extra","skittles","celebrations"]);
+_own("Kellanova", ["pringles","kellogg's","kelloggs","special k","coco pops","rice krispies","pop-tarts","pop tarts","cheez-it","chocos"]);
+_own("General Mills", ["cheerios","betty crocker","nature valley","old el paso","fibre one","fiber one"]);
+_own("Danone", ["activia","actimel","alpro","evian","volvic","aptamil","oikos","danone","protinex"]);
+_own("Ferrero", ["nutella","kinder","tic tac","ferrero rocher","thorntons","butterfinger"]);
+_own("Kraft Heinz", ["heinz","kraft","oscar mayer","jell-o","jello","complan","glucon d","glucon-d"]);
+_own("ITC", ["aashirvaad","sunfeast","bingo","yippee","b natural"]);
+_own("Britannia", ["britannia","good day","marie gold","nutrichoice","tiger","milk bikis","treat"]);
+_own("Parle", ["parle","parle-g","parle g","monaco","hide & seek","hide and seek","krackjack","melody","mango bite"]);
+_own("Nissin", ["top ramen","cup noodles","nissin"]);
+_own("Haldiram's", ["haldiram","haldiram's","haldirams"]);
+_own("Amul (GCMMF)", ["amul"]);
+_own("Bisleri", ["bisleri"]);
+_own("Dabur", ["dabur","real","réal"]);
+_own("Marico", ["saffola","parachute"]);
+_own("Hershey", ["hershey","hershey's","reese's","jolly rancher"]);
+_own("Lotte", ["lotte","choco pie"]);
+_own("Perfetti Van Melle", ["mentos","chupa chups","alpenliebe","center fresh","big babol"]);
+
+// Resolve a brand to the company behind it. Returns null when unknown, and
+// never returns the brand itself, so callers can tell "no parent on record"
+// from "the brand is the company".
+function parentOf(brand) {
+  if (!brand) return null;
+  const key = String(brand).toLowerCase().trim().replace(/\s+/g, " ");
+  const parent = PARENT_COMPANY[key];
+  if (!parent) return null;
+  return parent.toLowerCase() === key ? null : parent;
+}
+
+// The identity a brand should be RATED under: its parent if known, else itself.
+function ratingIdentity(brand) {
+  if (!brand) return null;
+  return parentOf(brand) || String(brand).trim();
+}
+
+// Every brand OFF listed, plus the resolved parent — used so a product filed
+// under "Maggi" still matches a search or rating for Nestlé.
+function brandChain(offData) {
+  const all = (offData?.brands && offData.brands.length ? offData.brands : [offData?.brand]).filter(Boolean);
+  const parent = parentOf(all[0]);
+  const out = [...all];
+  if (parent && !out.some(b => b.toLowerCase() === parent.toLowerCase())) out.push(parent);
+  return out;
+}
+
+// ─── PRODUCT CREDIBILITY ───────────────────────────────────────────────────────
+// Judges THIS product on what it does and does not disclose. Entirely
+// deterministic and derived from the product's own record, so the same product
+// always scores the same regardless of what else has been scanned.
+//
+// Transparency is the organising idea: a product that publishes a full
+// ingredient list and carries no undisclosed substances is credible even if it
+// is not especially healthy. Nutritional quality is scored separately and
+// weighted less, because it answers a different question.
+function productCredibility(rec) {
+  if (rec?.domain === "cosmetics" || DOMAIN === "cosmetics") return rec?.credibility || cosmeticCredibility(rec);
+  const off = rec?.offData || null;
+  const subs = rec?.allSubs || rec?.substances || [];
+  const undeclared = off?.ingredients ? subs.filter(s => s.ingredientConfirmed === false).length : (rec?.undeclaredCount || 0);
+  const factors = [];
+  let score = 10;
+
+  // 1. Ingredient disclosure — the single strongest credibility signal
+  if (off?.ingredients) {
+    factors.push({ label: "Ingredients published", detail: "The full ingredient list is on record.", impact: "positive" });
+  } else if (off) {
+    score -= 2.5;
+    factors.push({ label: "No ingredient list", detail: "This product does not publish its ingredients, so nothing can be confirmed from the label.", impact: "negative" });
+  } else {
+    score -= 3.5;
+    factors.push({ label: "No product record", detail: "The product was not found in Open Food Facts, so this analysis is based on its name alone.", impact: "negative" });
+  }
+
+  // 2. Undisclosed substances — what the label leaves out
+  if (undeclared > 0) {
+    score -= Math.min(4, undeclared * 1.4);
+    factors.push({ label: `${undeclared} substance${undeclared !== 1 ? "s" : ""} not on the label`, detail: "Documented for this product or its category but absent from the declared ingredients.", impact: "negative" });
+  } else if (off?.ingredients) {
+    factors.push({ label: "Nothing undisclosed found", detail: "No substances were identified beyond those declared.", impact: "positive" });
+  }
+
+  // 3. Declared hazardous additives — disclosed, so a smaller penalty
+  const high = subs.filter(s => s.risk === "high" && s.ingredientConfirmed !== false).length;
+  const med  = subs.filter(s => s.risk === "medium" && s.ingredientConfirmed !== false).length;
+  if (high > 0) {
+    score -= Math.min(2.5, high * 1.2);
+    factors.push({ label: `${high} high-risk additive${high !== 1 ? "s" : ""} declared`, detail: "Disclosed on the label, but of significant concern.", impact: "negative" });
+  }
+  if (med > 0) {
+    score -= Math.min(1.2, med * 0.35);
+    factors.push({ label: `${med} medium-risk additive${med !== 1 ? "s" : ""} declared`, detail: "Disclosed and generally acceptable in moderation.", impact: "neutral" });
+  }
+
+  // 4. Nutritional quality — a lighter weight than disclosure
+  const ns = off?.nutriScore;
+  if (ns && "abcde".includes(ns)) {
+    if (ns === "d") score -= 0.8;
+    else if (ns === "e") score -= 1.4;
+    else if (ns === "a" || ns === "b") score += 0.4;
+    factors.push({
+      label: `Nutri-Score ${ns.toUpperCase()}`,
+      detail: "abc".includes(ns) ? "Acceptable nutritional quality." : "Poor nutritional quality.",
+      impact: "ab".includes(ns) ? "positive" : "cde".indexOf(ns) >= 1 ? "negative" : "neutral",
+    });
+  }
+  if (off?.novaGroup === 4) {
+    score -= 0.8;
+    factors.push({ label: "Ultra-processed (NOVA 4)", detail: "Made largely from industrial ingredients and additives.", impact: "negative" });
+  }
+
+  // 5. Certifications on the product itself
+  const labels = (off?.labels || []).map(l => String(l).replace(/^en:/, "").replace(/-/g, " "));
+  const certs = labels.filter(l => /organic|bio|fair.?trade|non.?gmo|rainforest|vegan|gluten.?free/i.test(l));
+  if (certs.length) {
+    score += Math.min(0.6, certs.length * 0.3);
+    factors.push({ label: `${certs.length} certification${certs.length !== 1 ? "s" : ""}`, detail: certs.slice(0, 3).join(", "), impact: "positive" });
+  }
+
+  // Unverifiable is not the same as clean. With no record — or a record with no
+  // ingredient list — most checks simply could not run, so the score is capped
+  // rather than left high by default. Missing evidence must never read as a
+  // pass, otherwise the least documented products score best.
+  if (!off) score = Math.min(score, 2.5);
+  else if (!off.ingredients) score = Math.min(score, 4.5);
+
+  score = Math.max(0, Math.min(10, +score.toFixed(1)));
+  const verdict = !off ? "Unverifiable"
+    : score >= 8 ? "Transparent" : score >= 6 ? "Mostly transparent" : score >= 4 ? "Partly disclosed" : score >= 2 ? "Poorly disclosed" : "Opaque";
+  const transparency = !off?.ingredients ? "Low" : undeclared === 0 ? "High" : undeclared <= 2 ? "Medium" : "Low";
+
+  // How much is actually known about this product — separate from the score,
+  // because sparse data is a caveat on the analysis, not a fault of the product
+  const fields = ["name","brand","ingredients","image","nutriScore","novaGroup"];
+  const known = off ? fields.filter(f => off[f] != null && off[f] !== "").length : 0;
+  const nutKnown = off?.nut ? Object.values(off.nut).filter(v => v != null).length : 0;
+
+  return {
+    score, verdict, transparency, factors,
+    undeclared, declaredHigh: high,
+    dataCompleteness: Math.round(((known / fields.length) * 0.7 + Math.min(1, nutKnown / 8) * 0.3) * 100),
+    hitCount: rec?.hitCount || 1,
+  };
+}
+
+// ─── BRAND SCORE (stable) ──────────────────────────────────────────────────────
+// Computed only from the shared database, which is the same for everyone, so a
+// brand scores identically no matter which of its products you are viewing and
+// no matter what you have scanned this session. Session scans are deliberately
+// excluded: including them made the figure drift as you worked.
+function brandScoreStable(brand) {
+  if (!brand) return null;
+  const identity = ratingIdentity(brand);           // parent company when known
+  const idl = identity.toLowerCase().trim();
+
+  // A product belongs to this company if any brand on its record — or the
+  // parent resolved from it — matches. This is what makes a product filed
+  // under "Maggi" count towards Nestlé.
+  const recs = Object.values(_ghDb.products || {}).filter(p => {
+    const chain = brandChain(p.offData).map(b => b.toLowerCase().trim());
+    if (chain.includes(idl)) return true;
+    return chain.some(b => (ratingIdentity(b) || "").toLowerCase().trim() === idl);
+  });
+  if (!recs.length) return null;
+
+  const agg = { count: recs.length, high: 0, medium: 0, low: 0, undeclared: 0, ns: { a:0,b:0,c:0,d:0,e:0 }, hits: 0 };
+  const subBrands = new Set();
+  recs.forEach(p => {
+    agg.hits += p.hitCount || 1;
+    if (p.risk === "high") agg.high++; else if (p.risk === "medium") agg.medium++; else if (p.risk === "low") agg.low++;
+    agg.undeclared += undeclaredOf(p);
+    const ns = p.offData?.nutriScore;
+    if (ns && agg.ns[ns] != null) agg.ns[ns]++;
+    const b = p.offData?.brand;
+    if (b && b.toLowerCase().trim() !== idl) subBrands.add(b.trim());
+  });
+  const { score, verdict } = brandScoreOf(agg);
+  return { ...agg, score, verdict, identity, isParent: identity.toLowerCase() !== brand.toLowerCase().trim(), subBrands: [...subBrands] };
 }
 
 // Free healthier alternatives via the Open Food Facts search API
@@ -278,6 +939,11 @@ async function fetchOFFCalorieAlts(kcal) {
 // top and can only ever ADD to the baseline, never replace it, so a failed or
 // empty enhanced response degrades silently instead of blanking the analysis.
 async function analyzeProduct(offData, label) {
+  // The product itself decides which engine runs — food limits and cosmetic
+  // limits answer different questions and must never be applied to the wrong
+  // thing, whatever mode the interface happens to be in.
+  const productDomain = offData?._domain || DOMAIN;
+  if (productDomain === "cosmetics") return { ...analyzeCosmetic(offData, label), domain: "cosmetics" };
   const name = offData?.name || label;
   const subs = localHazards(name, offData?.ingredients || null, offData?.additives || [], offData?.categories || []);
   let sugar = localSugar(offData, name);
@@ -295,17 +961,18 @@ async function analyzeProduct(offData, label) {
   const diet = await aiDietClassify(name, offData?.ingredients || null, offData?.labels || [], offData?.allergens || []).catch(() => "unknown");
   // Undeclared = documented for the product but absent from its ingredient list
   const undeclared = offData?.ingredients ? subs.filter(s => s.ingredientConfirmed === false) : [];
-  return { offData, aiSugarData: sugar, allSubs: subs, risk: getRisk(subs), diet, undeclared, undeclaredCount: undeclared.length };
+  return { offData, aiSugarData: sugar, allSubs: subs, risk: getRisk(subs), diet, undeclared, undeclaredCount: undeclared.length, domain: "food" };
 }
 
 // Resolve + analyze, bridging through the assisted path only when the network
 // blocked OFF outright. Returns null when the caller should show a picker.
 async function lookupAndAnalyze(label) {
-  const { product, candidates } = await resolveProduct(label).catch(() => ({ product: null, candidates: [] }));
-  if (candidates.length > 1) return { candidates };
+  const { product, candidates, domain } = await resolveProduct(label).catch(() => ({ product: null, candidates: [], domain: "food" }));
+  if (candidates.length > 1) return { candidates, domain };
   let offData = product;
   if (!offData && (AI_MODE || _offStatus === "network")) offData = await offViaAssisted(label);
-  return { analysis: await analyzeProduct(offData, label) };
+  if (offData && !offData._domain) offData._domain = domain;
+  return { analysis: await analyzeProduct(offData, label), domain };
 }
 
 // ─── CONSTANTS ─────────────────────────────────────────────────────────────────
@@ -350,7 +1017,10 @@ function getRisk(subs) {
   return "low";
 }
 function normKey(str) {
-  return str.toLowerCase().trim().replace(/\s+/g, " ").replace(/[^a-z0-9 ]/g, "").slice(0, 80);
+  const base = str.toLowerCase().trim().replace(/\s+/g, " ").replace(/[^a-z0-9 ]/g, "").slice(0, 80);
+  // Namespace cosmetic keys so a shampoo and a soup of the same name cannot
+  // collide in the shared database.
+  return DOMAIN === "cosmetics" ? "cos:" + base : base;
 }
 function lastText(d) {
   return (d.content || []).filter(b => b.type === "text").map(b => b.text).reverse()[0] || "";
@@ -417,6 +1087,12 @@ let _offStatus = "ok"; // status of last direct lookup: "ok" | "nomatch" | "netw
 // resolve makes ONE request in the common case and at most three.
 const OFF_HOST = "https://world.openfoodfacts.org";
 const OFF_SEARCH_HOST = "https://search.openfoodfacts.org";
+// Open Beauty Facts is the cosmetics sister project — same API shape and the
+// same barcode keys, so the entire lookup path is reused unchanged.
+const OBF_HOST = "https://world.openbeautyfacts.org";
+const hostFor     = (d) => (d === "cosmetics" ? OBF_HOST : OFF_HOST);
+const domainHost  = () => hostFor(DOMAIN);
+const domainLabel = () => (DOMAIN === "cosmetics" ? "Open Beauty Facts" : "Open Food Facts");
 
 async function offJson(url) {
   let directErr = null;
@@ -430,14 +1106,198 @@ async function offJson(url) {
   return r.json();
 }
 
-async function offGetByCode(code) {
-  const d = await offJson(`${OFF_HOST}/api/v2/product/${code}.json?fields=${OFF_FIELDS}`);
+async function offGetByCode(code, domain = DOMAIN) {
+  const d = await offJson(`${hostFor(domain)}/api/v2/product/${code}.json?fields=${OFF_FIELDS}`);
   return d.product?.product_name ? d.product : null;
 }
 
-async function offSearch(terms, limit) {
-  const d = await offJson(`${OFF_HOST}/cgi/search.pl?search_terms=${encodeURIComponent(terms)}&search_simple=1&action=process&json=1&page_size=${limit}&fields=${OFF_FIELDS}`);
+async function offSearch(terms, limit, domain = DOMAIN) {
+  const d = await offJson(`${hostFor(domain)}/cgi/search.pl?search_terms=${encodeURIComponent(terms)}&search_simple=1&action=process&json=1&page_size=${limit}&fields=${OFF_FIELDS}`);
   return (d.products || []).filter(p => p.product_name);
+}
+
+// ─── CLOUD DISCOVERY ───────────────────────────────────────────────────────────
+// Category questions ("products with no additives", "vegan snacks") should
+// surface products the user has never seen, so they query the live product
+// database with real filters rather than re-listing the shared scan history.
+//
+// Open Food Facts and Open Beauty Facts both expose tag filters on /api/v2/search.
+// Numeric range filtering is not supported, so nutritional intent is expressed
+// through the graded tags (nutrition_grades_tags, nova_groups_tags) instead.
+const DISCOVERY_FILTERS = [
+  { m: /no additives|without additives|additive.?free|clean label|good e.?numbers?|safe e.?numbers?|no e.?numbers?/i,
+    params: { additives_n: "0" }, label: "no additives declared", domain: "food" },
+  { m: /(?:good|best|high|top).{0,12}nutri.?score|nutri.?score a\b|healthiest/i,
+    params: { nutrition_grades_tags: "a" }, label: "Nutri-Score A", domain: "food" },
+  { m: /(?:low|poor|bad|worst).{0,12}nutri.?score|nutri.?score [de]\b/i,
+    params: { nutrition_grades_tags: "d,e" }, label: "Nutri-Score D or E", domain: "food" },
+  { m: /ultra.?processed|nova ?4/i,
+    params: { nova_groups_tags: "4" }, label: "ultra-processed (NOVA 4)", domain: "food" },
+  { m: /unprocessed|minimally processed|nova ?1/i,
+    params: { nova_groups_tags: "1" }, label: "unprocessed (NOVA 1)", domain: "food" },
+  { m: /\bvegan\b/i,           params: { labels_tags: "en:vegan" },        label: "vegan", domain: null },
+  { m: /\bvegetarian\b/i,      params: { labels_tags: "en:vegetarian" },   label: "vegetarian", domain: "food" },
+  { m: /\borganic\b|\bbio\b/i, params: { labels_tags: "en:organic" },      label: "organic", domain: null },
+  { m: /gluten.?free/i,        params: { labels_tags: "en:gluten-free" },  label: "gluten-free", domain: "food" },
+  { m: /palm.?oil.?free|no palm oil/i, params: { labels_tags: "en:palm-oil-free" }, label: "palm-oil free", domain: "food" },
+  { m: /fair.?trade/i,         params: { labels_tags: "en:fair-trade" },    label: "fair trade", domain: null },
+  { m: /no sugar|sugar.?free|without sugar/i, params: { labels_tags: "en:no-added-sugar" }, label: "no added sugar", domain: "food" },
+  { m: /cruelty.?free/i,       params: { labels_tags: "en:cruelty-free" },  label: "cruelty-free", domain: "cosmetics" },
+  { m: /fragrance.?free|without fragrance|no parfum/i, params: { labels_tags: "en:fragrance-free" }, label: "fragrance-free", domain: "cosmetics" },
+  { m: /paraben.?free|no parabens/i, params: { labels_tags: "en:paraben-free" }, label: "paraben-free", domain: "cosmetics" },
+];
+
+// A free-text remainder is used as the search term alongside the filters, so
+// "vegan chocolate" filters by the vegan label AND searches for chocolate.
+const DISCOVERY_STOPWORDS = /\b(?:products?|items?|foods?|with|without|good|bad|best|worst|show|find|list|me|any|the|a|an|and|or|of|in|for|that|have|has|are|is|which|what|no)\b/gi;
+
+function discoveryIntent(query) {
+  const q = String(query || "");
+  const matched = DISCOVERY_FILTERS.filter(f => f.m.test(q));
+  if (!matched.length) return null;
+  const params = Object.assign({}, ...matched.map(f => f.params));
+  // Domain: honour an explicit signal from a matched filter, else guess
+  const explicit = matched.map(f => f.domain).find(Boolean);
+  const domain = explicit || guessDomain(q) || "food";
+  // Anything left after removing the filter phrases and stopwords is a term
+  let remainder = q;
+  matched.forEach(f => { remainder = remainder.replace(f.m, " "); });
+  remainder = remainder.replace(DISCOVERY_STOPWORDS, " ").replace(/[^\w\s-]/g, " ").replace(/\s+/g, " ").trim();
+  return { params, domain, term: remainder, labels: matched.map(f => f.label) };
+}
+
+// Run the discovery query against the live database.
+async function cloudDiscover(intent, limit = 8) {
+  const qs = new URLSearchParams({
+    ...intent.params,
+    page_size: String(limit),
+    sort_by: "unique_scans_n",
+    fields: OFF_FIELDS,
+  });
+  if (intent.term) qs.set("search_terms", intent.term);
+  const url = `${hostFor(intent.domain)}/api/v2/search?${qs.toString()}`;
+  const d = await offJson(url);
+  return (d.products || []).filter(p => p.product_name).map(p => {
+    const parsed = parseOFF(p);
+    parsed._domain = intent.domain;
+    return parsed;
+  });
+}
+
+// ─── DOMAIN DETECTION ──────────────────────────────────────────────────────────
+// Food and cosmetics live in separate databases, but the user should not have
+// to say which. A keyword guess decides which database to try FIRST; if that
+// misses, the other is tried. So the common case still costs one request, and
+// the worst case two — well inside Open Food Facts' rate limit.
+const COSMETIC_HINT = /shampoo|conditioner|serum|moisturi|cleanser|toner|sunscreen|spf|lotion|cream(?!\s*(?:cheese|biscuit|cracker))|lipstick|mascara|foundation|concealer|deodorant|antiperspirant|perfume|fragrance|body ?wash|face ?wash|micellar|exfoliat|peel|retinol|niacinamide|hyaluronic|salicylic|glycolic|balm|shower ?gel|hand ?wash|soap|scrub|nail|polish|eyeliner|eyeshadow|blush|primer|essence|ampoule|masque|hair ?oil|hair ?mask|dye|bleach|talc|powder ?compact/i;
+const FOOD_HINT = /milk|bread|noodle|pasta|rice|cereal|biscuit|cookie|chocolate|yogh?urt|cheese|butter|juice|soda|cola|water|snack|chips|crisps|sauce|ketchup|jam|honey|tea|coffee|oil(?! ?(?:hair|body|face))|flour|sugar|salt|spice|masala|dal|atta|namkeen|candy|sweets|drink|beverage|protein ?(?:bar|powder)|cracker|wafer|ice ?cream|pizza|burger|soup|curry/i;
+
+function guessDomain(query) {
+  const q = String(query || "").toLowerCase();
+  if (COSMETIC_HINT.test(q) && !FOOD_HINT.test(q)) return "cosmetics";
+  if (FOOD_HINT.test(q) && !COSMETIC_HINT.test(q)) return "food";
+  return null;   // no signal either way — try food first, it has far more data
+}
+
+// ─── CLOUD DISCOVERY SEARCH ────────────────────────────────────────────────────
+// Attribute queries ("products with no additives", "vegan", "Nutri-Score A")
+// are questions about the WHOLE catalogue, not about what has been scanned
+// before. Answering them from the shared database would only ever return the
+// handful of products already in it, so these queries go to the live source
+// and are translated into its own filter parameters.
+const CLOUD_FILTERS = [
+  { m: /no additives|without additives|additive.?free|good e.?numbers?|no e.?numbers?|clean label/i,
+    food: { additives_n: 0 }, label: "no additives" },
+  { m: /\be.?numbers?\b|with additives/i,
+    food: { additives_tags: "en:e621,en:e250,en:e102,en:e951" }, label: "containing additives" },
+  { m: /good nutri.?score|nutri.?score a\b|healthiest|most nutritious/i,
+    food: { nutrition_grades_tags: "a" }, label: "Nutri-Score A" },
+  { m: /low nutri.?score|poor nutri.?score|nutri.?score [de]\b|least healthy/i,
+    food: { nutrition_grades_tags: "d,e" }, label: "Nutri-Score D–E" },
+  { m: /ultra.?processed/i,
+    food: { nova_groups_tags: "4" }, label: "ultra-processed (NOVA 4)" },
+  { m: /unprocessed|minimally processed|not ultra.?processed|least processed/i,
+    food: { nova_groups_tags: "1" }, label: "unprocessed (NOVA 1)" },
+  { m: /\bvegan\b/i,
+    food: { ingredients_analysis_tags: "en:vegan" },
+    cosmetics: { labels_tags: "en:vegan" }, label: "vegan" },
+  { m: /\bvegetarian\b/i,
+    food: { ingredients_analysis_tags: "en:vegetarian" }, label: "vegetarian" },
+  { m: /organic|\bbio\b/i,
+    food: { labels_tags: "en:organic" }, cosmetics: { labels_tags: "en:organic" }, label: "organic" },
+  { m: /palm.?oil.?free|no palm oil/i,
+    food: { ingredients_analysis_tags: "en:palm-oil-free" }, label: "palm-oil-free" },
+  { m: /gluten.?free/i,
+    food: { labels_tags: "en:gluten-free" }, label: "gluten-free" },
+  { m: /no added sugar|sugar.?free|without added sugar/i,
+    food: { labels_tags: "en:no-added-sugar" }, label: "no added sugar" },
+  { m: /fragrance.?free|perfume.?free|no fragrance/i,
+    cosmetics: { labels_tags: "en:fragrance-free" }, label: "fragrance-free" },
+  { m: /paraben.?free|no parabens/i,
+    cosmetics: { labels_tags: "en:paraben-free" }, label: "paraben-free" },
+  { m: /cruelty.?free|not tested on animals/i,
+    cosmetics: { labels_tags: "en:cruelty-free" }, label: "cruelty-free" },
+];
+
+// Pull the residual words out of a query so "organic biscuits" filters by
+// organic AND searches for biscuits, rather than returning organic anything.
+const FILTER_STOPWORDS = /\b(products?|foods?|items?|things?|with|without|no|good|bad|best|worst|show|find|list|me|the|a|an|and|or|in|of|that|are|is|free|which|what|any)\b/gi;
+
+async function cloudSearch(query) {
+  const q = String(query || "");
+  const matched = CLOUD_FILTERS.filter(f => f.m.test(q));
+  if (!matched.length) return null;
+
+  // Which catalogue to ask. A cosmetics-only filter forces that side.
+  const hinted = guessDomain(q);
+  const cosmeticOnly = matched.every(f => f.cosmetics && !f.food);
+  const domain = cosmeticOnly ? "cosmetics" : (hinted || "food");
+
+  const params = {};
+  const applied = [];
+  matched.forEach(f => {
+    const set = f[domain] || f.food || f.cosmetics;
+    if (!set) return;
+    Object.assign(params, set);
+    applied.push(f.label);
+  });
+  if (!Object.keys(params).length) return null;
+
+  // Anything left over becomes a free-text term alongside the filters. Words a
+  // filter already consumed must be stripped first: leaving "organic" in the
+  // text would also require it in the product NAME, wrongly narrowing results
+  // to products that happen to say "organic" in their title.
+  let residual = q;
+  matched.forEach(f => { residual = residual.replace(f.m, " "); });
+  residual = residual.replace(FILTER_STOPWORDS, " ").replace(/\s+/g, " ").trim();
+  if (residual.length > 2) params.search_terms = residual;
+
+  const qs = new URLSearchParams({
+    ...params,
+    fields: OFF_FIELDS,
+    page_size: "12",
+    sort_by: "unique_scans_n",
+  }).toString();
+
+  try {
+    const d = await offJson(`${hostFor(domain)}/api/v2/search?${qs}`);
+    const products = (d.products || []).filter(p => p.product_name);
+    return {
+      applied, domain,
+      count: d.count ?? products.length,
+      products: products.slice(0, 8).map(p => ({
+        name: p.product_name.trim(),
+        brand: (p.brands || "").split(",")[0].trim() || null,
+        nutriScore: p.nutriscore_grade || null,
+        nova: p.nova_group || null,
+        raw: p,
+        _domain: domain,
+      })),
+    };
+  } catch (e) {
+    console.warn("cloudSearch:", e);
+    return { applied, domain, count: 0, products: [], failed: true };
+  }
 }
 
 // Resolve a query to a single product, or to a candidate list for the user to
@@ -447,28 +1307,49 @@ async function resolveProduct(query, limit = 6) {
   const q = query.trim();
   let blocked = 0, tried = 0;
   const step = async (fn) => { tried++; try { return await fn(); } catch { blocked++; return null; } };
-  const done = (product, candidates) => {
+  const finish = (product, candidates, domain) => {
     const found = !!product || (candidates && candidates.length > 0);
     _offStatus = found ? "ok" : (tried > 0 && blocked >= tried ? "network" : "nomatch");
-    return { product: product ? parseOFF(product) : null, candidates: candidates || [] };
+    const parsed = product ? parseOFF(product) : null;
+    if (parsed) parsed._domain = domain;
+    return { product: parsed, candidates: (candidates || []).map(c => ({ ...c, _domain: domain })), domain };
   };
 
-  // Barcode: exact lookup, one request.
-  if (/^\d{8,14}$/.test(q)) return done(await step(() => offGetByCode(q)), []);
+  // Which database to try first. A barcode carries no hint, so order is by
+  // likelihood: Open Food Facts is much larger than Open Beauty Facts.
+  const guess = guessDomain(q);
+  const order = guess === "cosmetics" ? ["cosmetics", "food"] : ["food", "cosmetics"];
 
-  // Name: one search request; multiple hits become the picker list.
-  const hits = (await step(() => offSearch(q, limit))) || [];
-  if (hits.length === 1) return done(hits[0], []);
-  if (hits.length > 1)   return done(null, hits);
+  // ── Barcode: exact lookup. Try each database until one knows the code. ──
+  if (/^\d{8,14}$/.test(q)) {
+    for (const d of order) {
+      const hit = await step(() => offGetByCode(q, d));
+      if (hit) return finish(hit, [], d);
+    }
+    return finish(null, [], guess || "food");
+  }
 
-  // Nothing matched — one retry via the modern search host, which handles
-  // fuzzy multi-word queries better, then fetch that product by barcode.
-  const code = await step(async () => {
-    const d = await offJson(`${OFF_SEARCH_HOST}/search?q=${encodeURIComponent(q)}&page_size=3`);
-    return (d.hits || []).find(h => h.code)?.code || null;
-  });
-  if (code) return done(await step(() => offGetByCode(code)), []);
-  return done(null, []);
+  // ── Name search: first database that returns anything wins. ──
+  for (const d of order) {
+    const hits = (await step(() => offSearch(q, limit, d))) || [];
+    if (hits.length === 1) return finish(hits[0], [], d);
+    if (hits.length > 1)   return finish(null, hits, d);
+  }
+
+  // ── Last resort: the modern search host handles fuzzy multi-word queries
+  //    better than the legacy endpoint. Food only — there is no cosmetics
+  //    equivalent — so it is skipped when the query clearly reads cosmetic.
+  if (guess !== "cosmetics") {
+    const code = await step(async () => {
+      const d = await offJson(`${OFF_SEARCH_HOST}/search?q=${encodeURIComponent(q)}&page_size=3`);
+      return (d.hits || []).find(h => h.code)?.code || null;
+    });
+    if (code) {
+      const hit = await step(() => offGetByCode(code, "food"));
+      if (hit) return finish(hit, [], "food");
+    }
+  }
+  return finish(null, [], guess || "food");
 }
 
 // Sandboxed environments (e.g. preview iframes) can block OFF entirely. Only
@@ -498,6 +1379,9 @@ function parseOFF(p) {
   return {
     name: p.product_name || "Unknown",
     brand: (p.brands || "").split(",")[0].trim() || null,
+    // OFF often lists several, e.g. "Maggi,Nestlé" — keep them all rather than
+    // discarding the owning company after the first comma
+    brands: (p.brands || "").split(",").map(b => b.trim()).filter(Boolean),
     image: p.image_url || null,
     quantity: p.quantity || null,
     servingSize: p.serving_size || null,
@@ -726,32 +1610,38 @@ function computeBrandStats(tracked) {
   const map = {}; const seen = new Set();
   const push = (brand, rec) => {
     const bk = brand.toLowerCase().trim();
-    if (!map[bk]) map[bk] = { brand, count:0, high:0, medium:0, low:0, undeclared:0, ns:{a:0,b:0,c:0,d:0,e:0}, hits:0, products:[] };
+    if (!map[bk]) map[bk] = { brand, count:0, high:0, medium:0, low:0, undeclared:0, ns:{a:0,b:0,c:0,d:0,e:0}, hits:0, products:[], subBrands:new Set() };
     const b = map[bk];
     b.count++; b.hits += rec.hitCount || 1;
     if (rec.risk === "high") b.high++; else if (rec.risk === "medium") b.medium++; else if (rec.risk === "low") b.low++;
     const und = undeclaredOf(rec); b.undeclared += und;
     const ns = rec.offData?.nutriScore; if (ns && b.ns[ns] != null) b.ns[ns]++;
-    b.products.push({ name: rec.offData?.name || rec.name || "Unknown", risk: rec.risk || null, ns: ns || null, undeclared: und });
+    const sub = rec.offData?.brand;
+    if (sub && sub.toLowerCase().trim() !== brand.toLowerCase().trim()) b.subBrands.add(sub.trim());
+    b.products.push({ name: rec.offData?.name || rec.name || "Unknown", risk: rec.risk || null, ns: ns || null, undeclared: und, brand: sub || null });
   };
+  // Group under the owning company where one is known, so a company's record
+  // is not split across its sub-brands (Maggi, KitKat and Nescafé all count
+  // towards Nestlé).
   tracked.forEach(f => {
     if (!f.offData?.brand) return;
     const k = (f.offData.brand + "|" + (f.offData.name || f.name || "")).toLowerCase();
-    if (!seen.has(k)) { seen.add(k); push(f.offData.brand, f); }
+    if (!seen.has(k)) { seen.add(k); push(ratingIdentity(f.offData.brand), f); }
   });
   Object.values(_ghDb.products || {}).forEach(rec => {
     if (!rec.offData?.brand) return;
     const k = (rec.offData.brand + "|" + (rec.offData.name || "")).toLowerCase();
-    if (!seen.has(k)) { seen.add(k); push(rec.offData.brand, rec); }
+    if (!seen.has(k)) { seen.add(k); push(ratingIdentity(rec.offData.brand), rec); }
   });
-  return Object.values(map).map(b => ({ ...b, ...brandScoreOf(b) })).sort((a, z) => z.score - a.score || z.count - a.count);
+  return Object.values(map).map(b => ({ ...b, subBrands:[...b.subBrands], ...brandScoreOf(b) })).sort((a, z) => z.score - a.score || z.count - a.count);
 }
 
 function brandHistory(brand) {
-  // Prior record of a brand across the shared DB (for scan-time alerts)
+  // Prior record for this company across the shared DB (for scan-time alerts)
   if (!brand) return null;
-  const bl = brand.toLowerCase().trim();
-  const recs = Object.values(_ghDb.products || {}).filter(p => (p.offData?.brand || "").toLowerCase().trim() === bl);
+  const bl = (ratingIdentity(brand) || brand).toLowerCase().trim();
+  const recs = Object.values(_ghDb.products || {}).filter(p =>
+    brandChain(p.offData).some(b => b.toLowerCase().trim() === bl || (ratingIdentity(b) || "").toLowerCase().trim() === bl));
   if (!recs.length) return null;
   return {
     count: recs.length,
@@ -790,6 +1680,210 @@ function ghLogSearch(query, category) {
 if (typeof document !== "undefined") {
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flushSearchLog(); });
   window.addEventListener("pagehide", flushSearchLog);
+}
+
+// ─── BARCODE SCANNING ──────────────────────────────────────────────────────────
+// A barcode is an exact product key, so scanning one skips fuzzy search
+// entirely: no ambiguity, no picker, one network request.
+//
+// Two decoders, tried in order:
+//   1. BarcodeDetector — built into Chrome/Edge on Android and desktop. Native,
+//      fast, nothing to download.
+//   2. ZXing (via CDN, loaded only on first use) — covers Safari/iOS and
+//      Firefox, which have no BarcodeDetector.
+const BARCODE_FORMATS = ["ean_13", "ean_8", "upc_a", "upc_e", "code_128", "itf"];
+let _zxingPromise = null;
+
+function loadZXing() {
+  if (_zxingPromise) return _zxingPromise;
+  _zxingPromise = new Promise((resolve, reject) => {
+    if (window.ZXingBrowser) return resolve(window.ZXingBrowser);
+    const el = document.createElement("script");
+    el.src = "https://unpkg.com/@zxing/browser@0.1.5/umd/zxing-browser.min.js";
+    el.async = true;
+    el.onload = () => window.ZXingBrowser ? resolve(window.ZXingBrowser) : reject(new Error("ZXing failed to initialise"));
+    el.onerror = () => reject(new Error("Could not load the barcode library"));
+    document.head.appendChild(el);
+  });
+  return _zxingPromise;
+}
+
+// A valid EAN/UPC has a check digit; verifying it rejects most misreads.
+function validBarcodeChecksum(code) {
+  if (!/^\d{8}$|^\d{12,14}$/.test(code)) return /^\d{8,14}$/.test(code);
+  const d = code.split("").map(Number);
+  const check = d.pop();
+  let sum = 0;
+  d.reverse().forEach((n, i) => { sum += n * (i % 2 === 0 ? 3 : 1); });
+  return (10 - (sum % 10)) % 10 === check;
+}
+
+// Camera overlay. Streams the rear camera, decodes continuously, and calls
+// onDetect with the first checksum-valid barcode. Always stops the stream on
+// unmount — a live camera left running is both a privacy and battery problem.
+function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+  const stopRef = useRef(false);
+  const [status, setStatus] = useState("starting");   // starting | scanning | error
+  const [message, setMessage] = useState("");
+  const [torchOn, setTorchOn] = useState(false);
+  const [canTorch, setCanTorch] = useState(false);
+
+  useEffect(() => {
+    stopRef.current = false;
+    let zxingControls = null;
+
+    const stopAll = () => {
+      stopRef.current = true;
+      try { zxingControls?.stop(); } catch {}
+      streamRef.current?.getTracks().forEach(tr => tr.stop());
+      streamRef.current = null;
+    };
+
+    (async () => {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setStatus("error");
+        setMessage("This browser cannot access the camera. Type the barcode number instead.");
+        return;
+      }
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false,
+        });
+      } catch (err) {
+        setStatus("error");
+        setMessage(
+          err?.name === "NotAllowedError" ? "Camera permission was denied. Allow camera access in your browser settings, or type the barcode number."
+          : err?.name === "NotFoundError" ? "No camera was found on this device. Type the barcode number instead."
+          : err?.name === "NotReadableError" ? "The camera is in use by another app. Close it and try again."
+          : "The camera could not be started. Type the barcode number instead."
+        );
+        return;
+      }
+      if (stopRef.current) { stream.getTracks().forEach(tr => tr.stop()); return; }
+      streamRef.current = stream;
+      const video = videoRef.current;
+      if (video) {
+        video.srcObject = stream;
+        video.setAttribute("playsinline", "true");   // iOS refuses fullscreen-less playback without this
+        await video.play().catch(() => {});
+      }
+      // Torch is only available on some Android devices
+      const track = stream.getVideoTracks()[0];
+      setCanTorch(!!track?.getCapabilities?.().torch);
+      setStatus("scanning");
+
+      const handle = (code) => {
+        const clean = String(code).replace(/\D/g, "");
+        if (!clean || !validBarcodeChecksum(clean)) return false;
+        stopAll();
+        onDetect(clean);
+        return true;
+      };
+
+      if ("BarcodeDetector" in window) {
+        try {
+          const supported = await window.BarcodeDetector.getSupportedFormats?.() || BARCODE_FORMATS;
+          const detector = new window.BarcodeDetector({ formats: BARCODE_FORMATS.filter(f => supported.includes(f)) });
+          const tick = async () => {
+            if (stopRef.current || !videoRef.current) return;
+            try {
+              const found = await detector.detect(videoRef.current);
+              if (found?.length && handle(found[0].rawValue)) return;
+            } catch {}
+            requestAnimationFrame(tick);
+          };
+          requestAnimationFrame(tick);
+          return;
+        } catch { /* fall through to ZXing */ }
+      }
+
+      try {
+        const ZX = await loadZXing();
+        if (stopRef.current) return;
+        const reader = new ZX.BrowserMultiFormatReader();
+        zxingControls = await reader.decodeFromVideoElement(videoRef.current, (result) => {
+          if (result) handle(result.getText());
+        });
+      } catch {
+        setStatus("error");
+        setMessage("The barcode reader could not be loaded. Check your connection, or type the number instead.");
+      }
+    })();
+
+    return stopAll;
+  }, [onDetect]);
+
+  const toggleTorch = async () => {
+    const track = streamRef.current?.getVideoTracks?.()[0];
+    if (!track) return;
+    try { await track.applyConstraints({ advanced: [{ torch: !torchOn }] }); setTorchOn(v => !v); } catch {}
+  };
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"#000",zIndex:10000,display:"flex",flexDirection:"column"}}>
+      <div style={{position:"relative",flex:1,overflow:"hidden"}}>
+        <video ref={videoRef} muted playsInline style={{width:"100%",height:"100%",objectFit:"cover"}}/>
+
+        {/* Aiming guide */}
+        {status === "scanning" && (
+          <>
+            <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",pointerEvents:"none"}}>
+              <div style={{width:"min(78vw,320px)",height:170,border:"2px solid rgba(255,255,255,0.9)",borderRadius:14,boxShadow:"0 0 0 100vmax rgba(0,0,0,0.45)"}}/>
+            </div>
+            <div style={{position:"absolute",left:0,right:0,bottom:isMobile?24:32,textAlign:"center",color:"#fff",fontSize:13,textShadow:"0 1px 3px rgba(0,0,0,0.6)",padding:"0 24px"}}>
+              Point the camera at the product barcode
+            </div>
+          </>
+        )}
+
+        {status === "starting" && (
+          <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:13,gap:10}}>
+            <span style={{display:"inline-block",width:14,height:14,border:"2px solid #fff",borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite"}}/>
+            Starting the camera…
+          </div>
+        )}
+
+        {status === "error" && (
+          <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",padding:28}}>
+            <div style={{background:t.bg,borderRadius:14,padding:"22px 24px",maxWidth:360,textAlign:"center"}}>
+              <div style={{fontSize:26,marginBottom:10}}>📷</div>
+              <div style={{fontSize:13,color:t.text,lineHeight:1.65,marginBottom:16}}>{message}</div>
+              <button onClick={onClose} style={{background:t.accent,border:"none",color:t.accentFg,padding:"10px 20px",borderRadius:9,cursor:"pointer",fontSize:13,fontWeight:600}}>Close</button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div style={{padding:"14px 18px",background:"#000",display:"flex",gap:10,alignItems:"center",justifyContent:"space-between"}}>
+        <button onClick={onClose} style={{background:"rgba(255,255,255,0.15)",border:"1px solid rgba(255,255,255,0.3)",color:"#fff",padding:"11px 20px",borderRadius:9,cursor:"pointer",fontSize:13,fontWeight:600}}>Cancel</button>
+        {canTorch && (
+          <button onClick={toggleTorch} style={{background:torchOn?"#fff":"rgba(255,255,255,0.15)",border:"1px solid rgba(255,255,255,0.3)",color:torchOn?"#000":"#fff",padding:"11px 18px",borderRadius:9,cursor:"pointer",fontSize:13,fontWeight:600}}>
+            {torchOn ? "Light on" : "Light"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── RESPONSIVE ────────────────────────────────────────────────────────────────
+// Styles here are inline, which CSS media queries cannot reach, so breakpoints
+// are tracked in JS instead and fed into the style objects.
+function useViewport() {
+  const get = () => (typeof window === "undefined" ? 1200 : window.innerWidth);
+  const [w, setW] = useState(get);
+  useEffect(() => {
+    let raf = null;
+    const onResize = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(() => setW(window.innerWidth)); };
+    window.addEventListener("resize", onResize);
+    window.addEventListener("orientationchange", onResize);
+    return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", onResize); window.removeEventListener("orientationchange", onResize); };
+  }, []);
+  return { w, isMobile: w < 760, isNarrow: w < 1040 };
 }
 
 // ─── FOOD ILLUSTRATION ─────────────────────────────────────────────────────────
@@ -837,11 +1931,122 @@ function Toast({ items, onDismiss, t }) {
   );
 }
 
-// ─── BRAND CARD ────────────────────────────────────────────────────────────────
-function BrandCard({ cred, brand, loading, t }) {
+// ─── FORMULATION CARD (cosmetics) ──────────────────────────────────────────────
+// The four things the cosmetics engine assesses: the formulation as a whole,
+// the pH it must sit at, how actives are delivered, and what stabilises it.
+function FormulationCard({ analysis, t, dark }) {
+  const form = analysis?.formulation;
+  const { ph, delivery, stabilisers } = analysis || {};
+  if (!form && !ph && !delivery?.length && !stabilisers) return null;
+
+  const sec = { padding:"13px 20px", borderTop:`1px solid ${t.border}` };
+  const hdr = { fontSize:10, fontWeight:600, color:t.textMuted, letterSpacing:"0.06em", textTransform:"uppercase", marginBottom:7 };
+  const warn = (level) => ({
+    marginTop:7, padding:"8px 11px",
+    background: level==="high" ? (dark?"rgba(192,57,43,0.1)":"rgba(192,57,43,0.06)") : t.bgSub,
+    border:`1px solid ${level==="high"?"rgba(192,57,43,0.3)":t.border}`,
+    borderRadius:7, fontSize:11, color: level==="high"?"#c0392b":t.textSub, lineHeight:1.6,
+  });
+
+  return (
+    <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:12,overflow:"hidden"}}>
+      {/* Overall formulation */}
+      {form && (
+        <div style={{padding:"16px 20px"}}>
+          <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:5}}>Overall formulation</div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",marginBottom:7}}>
+            <span style={{fontSize:15,fontWeight:700,color:t.text}}>{form.base}</span>
+            <span style={{fontSize:10,fontWeight:600,color:t.textSub,background:t.pill,border:`1px solid ${t.border}`,padding:"2px 8px",borderRadius:5}}>{form.complexity} complexity</span>
+            <span style={{fontSize:10,color:t.textMuted}}>{form.total} ingredients</span>
+          </div>
+          <div style={{fontSize:11,color:t.textMuted,lineHeight:1.6,marginBottom:8}}>{form.note}</div>
+          {form.leading?.length > 0 && (
+            <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:form.flaggedLeading?.length?8:0}}>
+              {form.leading.map((x,i) => (
+                <span key={i} style={{fontSize:10,color:t.textSub,background:t.pill,border:`1px solid ${t.border}`,padding:"3px 9px",borderRadius:5,overflowWrap:"anywhere"}}>{i+1}. {x}</span>
+              ))}
+            </div>
+          )}
+          {form.flaggedLeading?.length > 0 && (
+            <div style={warn("high")}>
+              {form.flaggedLeading.length} restricted ingredient{form.flaggedLeading.length!==1?"s":""} appear{form.flaggedLeading.length===1?"s":""} in the first five entries, so {form.flaggedLeading.length===1?"it is":"they are"} present at a meaningful concentration: {form.flaggedLeading.map(h=>h.name||h.inci).join(", ")}.
+            </div>
+          )}
+          {form.allergens?.length > 0 && (
+            <div style={{marginTop:8,fontSize:11,color:t.textSub,lineHeight:1.6}}>
+              <span style={{fontWeight:600}}>{form.allergens.length} declarable fragrance allergen{form.allergens.length!==1?"s":""}:</span> {form.allergens.slice(0,6).join(", ")}{form.allergens.length>6?` +${form.allergens.length-6}`:""}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* pH */}
+      {ph && (
+        <div style={sec}>
+          <div style={hdr}>pH requirement</div>
+          {ph.known ? (
+            <>
+              <div style={{display:"flex",alignItems:"baseline",gap:9,marginBottom:6,flexWrap:"wrap"}}>
+                <span style={{fontSize:17,fontWeight:800,color:t.text,fontFamily:"monospace"}}>{ph.range}</span>
+                {ph.classification && <span style={{fontSize:11,fontWeight:600,color:t.textSub}}>{ph.classification}</span>}
+              </div>
+              <div style={{fontSize:11,color:t.textSub,lineHeight:1.6}}>{ph.note}</div>
+              <div style={{fontSize:10,color:t.textMuted,lineHeight:1.6,marginTop:6}}>
+                Inferred from the actives present — pH is almost never printed on a pack. Skin's own surface sits around 4.7–5.75.
+              </div>
+              {(ph.conflicts||[]).map((c,i) => <div key={i} style={warn("high")}>{c.detail}</div>)}
+              {(ph.incompatibilities||ph.pairs||[]).map((c,i) => <div key={"p"+i} style={warn("high")}>{c}</div>)}
+            </>
+          ) : (
+            <div style={{fontSize:11,color:t.textSub,lineHeight:1.6}}>{ph.note}</div>
+          )}
+        </div>
+      )}
+
+      {/* Delivery */}
+      {delivery?.length > 0 && (
+        <div style={sec}>
+          <div style={hdr}>Delivery system</div>
+          {delivery.map((d,i) => (
+            <div key={i} style={{marginBottom:i===delivery.length-1?0:9}}>
+              <div style={{fontSize:12,fontWeight:600,color:t.text}}>{d.name}</div>
+              <div style={{fontSize:11,color:t.textMuted,lineHeight:1.55}}>{d.note}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Stabilisers */}
+      {stabilisers && (
+        <div style={sec}>
+          <div style={hdr}>Stabiliser system</div>
+          {stabilisers.present?.length > 0 ? stabilisers.present.map((x,i) => (
+            <div key={i} style={{marginBottom:6}}>
+              <div style={{fontSize:12,fontWeight:600,color:t.text}}>{x.name}</div>
+              <div style={{fontSize:11,color:t.textMuted,lineHeight:1.55}}>{x.note}</div>
+            </div>
+          )) : (
+            <div style={{fontSize:11,color:t.textSub,lineHeight:1.6}}>No stabiliser classes were identified in the ingredient list.</div>
+          )}
+          {(stabilisers.gaps||[]).map((g,i) => <div key={i} style={warn("high")}>{g}</div>)}
+        </div>
+      )}
+
+      <div style={{padding:"10px 20px",borderTop:`1px solid ${t.border}`,background:t.bgSub,fontSize:10,color:t.textMuted,lineHeight:1.6}}>
+        Assessed against <a href="https://health.ec.europa.eu/scientific-committees/scientific-committee-consumer-safety-sccs_en" target="_blank" rel="noopener noreferrer" style={{color:t.accent,textDecoration:"none"}}>SCCS</a> Opinions, which are binding in the EU, and <a href="https://www.cir-safety.org/" target="_blank" rel="noopener noreferrer" style={{color:t.accent,textDecoration:"none"}}>CIR</a> conclusions, which are advisory. These limits describe skin contact only and say nothing about ingestion. Educational purposes — not a substitute for a dermatologist.
+      </div>
+    </div>
+  );
+}
+
+// ─── PRODUCT CREDIBILITY CARD ──────────────────────────────────────────────────
+// Reports on THIS product: what it discloses, what it leaves out, and how
+// complete the available data is. The brand's own score appears as a separate,
+// stable figure so the two are never confused.
+function ProductCredibilityCard({ cred, brandStat, brand, loading, enhanced, t, dark, onOpenBrand }) {
   if (loading) return (
     <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:12,padding:"18px 20px"}}>
-      <div style={{fontSize:12,fontWeight:600,color:t.textSub,marginBottom:12}}>Brand Credibility</div>
+      <div style={{fontSize:12,fontWeight:600,color:t.textSub,marginBottom:12}}>Product Credibility</div>
       <div style={{display:"flex",gap:10,alignItems:"center"}}>
         <div style={{width:48,height:48,borderRadius:10,background:t.pill,animation:"shimmer 1.4s ease infinite"}}/>
         <div style={{flex:1}}><div style={{height:12,width:"60%",background:t.pill,borderRadius:4,marginBottom:6}}/><div style={{height:10,width:"40%",background:t.pill,borderRadius:4}}/></div>
@@ -849,16 +2054,22 @@ function BrandCard({ cred, brand, loading, t }) {
     </div>
   );
   if (!cred) return null;
+
   const sc = cred.score;
   const scoreColor = sc>=8?"#2e7d52":sc>=6?"#b07d2b":sc>=4?"#a0622a":"#c0392b";
   const arc = (sc / 10) * 251;
+  const impactColor = { positive:"#2e7d52", negative:"#c0392b", neutral:t.textMuted };
+  const impactMark  = { positive:"✓", negative:"✕", neutral:"•" };
+
   return (
     <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:12,overflow:"hidden"}}>
       <div style={{padding:"16px 20px",borderBottom:`1px solid ${t.border}`,display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
-        <div>
-          <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:3}}>Brand Credibility</div>
-          <div style={{fontSize:16,fontWeight:700,color:t.text}}>{brand}</div>
-          {cred.founded && <div style={{fontSize:11,color:t.textSub,marginTop:2}}>Est. {cred.founded}{cred.headquarters ? ` · ${cred.headquarters}` : ""}</div>}
+        <div style={{minWidth:0}}>
+          <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:3}}>Product Credibility</div>
+          <div style={{fontSize:16,fontWeight:700,color:scoreColor}}>{cred.verdict}</div>
+          <div style={{fontSize:11,color:t.textSub,marginTop:2}}>
+            Label transparency: {cred.transparency} · {cred.dataCompleteness}% of product data available
+          </div>
         </div>
         <div style={{position:"relative",width:64,height:64,flexShrink:0}}>
           <svg viewBox="0 0 90 90" width={64} height={64} style={{transform:"rotate(-90deg)"}}>
@@ -871,32 +2082,60 @@ function BrandCard({ cred, brand, loading, t }) {
           </div>
         </div>
       </div>
-      <div style={{padding:"10px 20px",background:sc>=8?"rgba(46,125,82,0.06)":sc>=6?"rgba(176,125,43,0.06)":"rgba(192,57,43,0.06)",borderBottom:`1px solid ${t.border}`,display:"flex",gap:14,flexWrap:"wrap",alignItems:"center"}}>
-        <span style={{fontSize:12,fontWeight:700,color:scoreColor}}>{cred.verdict}</span>
-        {cred.transparency && <div style={{display:"flex",gap:5,alignItems:"center"}}><span style={{fontSize:10,color:t.textMuted}}>Transparency:</span><span style={{fontSize:10,fontWeight:600,color:cred.transparency==="High"?"#2e7d52":cred.transparency==="Medium"?"#b07d2b":"#c0392b"}}>{cred.transparency}</span></div>}
-        {cred.recallHistory && <div style={{display:"flex",gap:5,alignItems:"center"}}><span style={{fontSize:10,color:t.textMuted}}>Recalls:</span><span style={{fontSize:10,fontWeight:600,color:cred.recallHistory==="Clean"?"#2e7d52":"#c0392b"}}>{cred.recallHistory}</span></div>}
+
+      {/* What drove the score, for this product */}
+      <div style={{padding:"12px 20px"}}>
+        {cred.factors.map((f,i) => (
+          <div key={i} style={{display:"flex",gap:9,alignItems:"flex-start",marginBottom:i===cred.factors.length-1?0:9}}>
+            <span style={{color:impactColor[f.impact],fontSize:11,lineHeight:1.5,flexShrink:0,fontWeight:700}}>{impactMark[f.impact]}</span>
+            <div style={{minWidth:0}}>
+              <div style={{fontSize:12,fontWeight:600,color:t.text,overflowWrap:"anywhere"}}>{f.label}</div>
+              <div style={{fontSize:11,color:t.textMuted,lineHeight:1.55,overflowWrap:"anywhere"}}>{f.detail}</div>
+            </div>
+          </div>
+        ))}
       </div>
-      {cred.summary && <div style={{padding:"12px 20px",borderBottom:`1px solid ${t.border}`}}><p style={{margin:0,fontSize:12,color:t.textSub,lineHeight:1.7}}>{cred.summary}</p></div>}
-      <div style={{padding:"14px 20px",display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
-        {cred.certifications?.length > 0 && (
-          <div>
-            <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:7}}>Certifications</div>
-            {cred.certifications.slice(0,3).map(c => <div key={c} style={{display:"flex",gap:6,alignItems:"center",marginBottom:4}}><div style={{width:5,height:5,borderRadius:"50%",background:"#2e7d52",flexShrink:0}}/><span style={{fontSize:11,color:t.textSub}}>{c}</span></div>)}
+
+      {/* Brand context — a separate, stable figure across the shared database */}
+      {brand && (
+        <div style={{padding:"11px 20px",borderTop:`1px solid ${t.border}`,background:t.bgSub,display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,flexWrap:"wrap"}}>
+          <div style={{minWidth:0}}>
+            <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.06em",textTransform:"uppercase"}}>{brandStat?.isParent ? "Brand · Company" : "Brand"}</div>
+            <div style={{fontSize:12,fontWeight:600,color:t.text,overflowWrap:"anywhere"}}>
+              {brand}
+              {brandStat?.isParent && <span style={{color:t.textMuted,fontWeight:500}}> · owned by {brandStat.identity}</span>}
+            </div>
           </div>
-        )}
-        {cred.positives?.length > 0 && (
-          <div>
-            <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:7}}>Strengths</div>
-            {cred.positives.slice(0,3).map(p => <div key={p} style={{display:"flex",gap:6,alignItems:"center",marginBottom:4}}><div style={{width:5,height:5,borderRadius:"50%",background:"#3d52c4",flexShrink:0}}/><span style={{fontSize:11,color:t.textSub}}>{p}</span></div>)}
-          </div>
-        )}
-        {cred.controversies?.length > 0 && (
-          <div style={{gridColumn:"1/-1"}}>
-            <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:7}}>Known Concerns</div>
-            {cred.controversies.slice(0,3).map(c => <div key={c} style={{display:"flex",gap:6,alignItems:"flex-start",marginBottom:4}}><div style={{width:5,height:5,borderRadius:"50%",background:"#c0392b",flexShrink:0,marginTop:5}}/><span style={{fontSize:11,color:t.textSub,lineHeight:1.5}}>{c}</span></div>)}
-          </div>
-        )}
-      </div>
+          {brandStat ? (
+            <div style={{textAlign:"right"}}>
+              <div style={{fontSize:13,fontWeight:800,color:brandStat.score>=8?"#2e7d52":brandStat.score>=6?"#b07d2b":brandStat.score>=4?"#a0622a":"#c0392b"}}>
+                {brandStat.score}/10
+              </div>
+              <div style={{fontSize:10,color:t.textMuted}}>
+                {brandStat.identity} · {brandStat.count} product{brandStat.count!==1?"s":""}
+              </div>
+            </div>
+          ) : (
+            <div style={{fontSize:10,color:t.textMuted,textAlign:"right",maxWidth:190,lineHeight:1.5}}>
+              No brand rating yet — it appears once products from this brand are in the shared database.
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Researched brand detail, Enhanced only — clearly marked as brand-level */}
+      {enhanced && (cred.brandResearch?.summary || cred.brandResearch?.controversies?.length) && (
+        <div style={{padding:"12px 20px",borderTop:`1px solid ${t.border}`}}>
+          <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:6}}>Company background</div>
+          {cred.brandResearch.summary && <div style={{fontSize:11,color:t.textSub,lineHeight:1.65,marginBottom:cred.brandResearch.controversies?.length?8:0}}>{cred.brandResearch.summary}</div>}
+          {(cred.brandResearch.controversies || []).slice(0,3).map((c,i) => (
+            <div key={i} style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:4}}>
+              <span style={{color:"#c0392b",fontSize:10,flexShrink:0}}>!</span>
+              <span style={{fontSize:11,color:t.textSub,lineHeight:1.55}}>{c}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -921,7 +2160,7 @@ function NRow({ label, val100, valSrv, unit, ri, bold, indent, type, hasSrv, t }
 }
 
 // ─── OFF PRODUCT CARD ──────────────────────────────────────────────────────────
-function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, brandCred, brandCredLoading, alternatives, altLoading, diet, t, dark }) {
+function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, brandCred, brandStat, brandCredLoading, alternatives, altLoading, diet, t, dark, onOpen, cosmeticAnalysis }) {
   const [showIngr, setShowIngr] = useState(false);
   const n = offData.nut;
   const hasSrv = !!offData.servingSize;
@@ -1013,8 +2252,10 @@ function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, br
         );
       })()}
 
-      {/* BRAND CREDIBILITY */}
-      <BrandCard cred={brandCred} brand={offData.brand} loading={brandCredLoading} t={t}/>
+      {/* PRODUCT CREDIBILITY */}
+      <ProductCredibilityCard cred={brandCred} brandStat={brandStat} brand={offData.brand} loading={brandCredLoading} enhanced={AI_MODE} t={t} dark={dark}/>
+
+      {DOMAIN === "cosmetics" && <FormulationCard analysis={cosmeticAnalysis} t={t} dark={dark}/>}
 
       {/* NUTRITION */}
       {(n.energy_kcal != null || totalSugars != null) && (
@@ -1172,7 +2413,7 @@ function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, br
             ? <div style={{padding:"18px 16px",display:"flex",alignItems:"center",gap:10,color:t.textSub,fontSize:12}}><span style={{display:"inline-block",width:12,height:12,border:`2px solid ${t.accent}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite"}}/>Finding better alternatives…</div>
             : <div style={{padding:"10px 12px",display:"flex",flexDirection:"column",gap:8}}>
                 {alternatives.map((alt,i) => (
-                  <div key={i} style={{background:t.bgSub,border:`1px solid ${t.border}`,borderLeft:"3px solid #2e7d52",borderRadius:7,padding:"12px 14px"}}>
+                  <div key={i} onClick={()=>onOpen?.(alt.name)} title={`Analyse ${alt.name}`} style={{background:t.bgSub,border:`1px solid ${t.border}`,borderLeft:"3px solid #2e7d52",borderRadius:7,padding:"12px 14px",cursor:onOpen?"pointer":"default",transition:"background 0.15s"}} onMouseEnter={e=>{if(onOpen)e.currentTarget.style.background=t.surfaceHov;}} onMouseLeave={e=>{if(onOpen)e.currentTarget.style.background=t.bgSub;}}>
                     <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8,marginBottom:5}}>
                       <div><div style={{fontSize:13,fontWeight:600,color:t.text}}>{alt.name}</div>{alt.brand&&<div style={{fontSize:10,color:t.textSub,marginTop:1}}>{alt.brand}</div>}</div>
                       <div style={{display:"flex",gap:5,alignItems:"center",flexShrink:0}}>
@@ -1212,7 +2453,7 @@ export default function App() {
   const [tracked,setTracked]     = useState([]);
   const [selected,setSelected]   = useState(null);
   const [scanning,setScanning]   = useState(false);
-  const [filterRisk,setFilterRisk] = useState("all");
+  const { isMobile, isNarrow }   = useViewport();
   const [dark,setDark]           = useState(false);
   const [aiMode,setAiMode]       = useState(AI_MODE);
   const [toasts,setToasts]       = useState([]);
@@ -1236,6 +2477,16 @@ export default function App() {
   const [searchQ,setSearchQ]         = useState("");
   const [searchOpen,setSearchOpen]   = useState(false);
   const [picker,setPicker]           = useState(null); // { query, candidates: raw OFF products }
+  const [showPlan,setShowPlan]       = useState(false);
+  const [cameraOpen,setCameraOpen]   = useState(false);
+  const [inputFocus,setInputFocus]   = useState(false);
+  const [discover,setDiscover]       = useState(null);
+  const [discoverLoading,setDiscoverLoading] = useState(false);
+  const [brandStat,setBrandStat]     = useState(null);
+  const [domain,setDomainState]      = useState(DOMAIN);
+  // Entitlement is intentionally session-only. A paid flag persisted in the
+  // browser is trivially forged; the real one must come from the server.
+  const [subscribed,setSubscribed]   = useState(false);
   const warnedReadOnly               = useRef(false);
   const searchRef = useRef(null);
 
@@ -1267,20 +2518,45 @@ export default function App() {
     setTimeout(() => setToasts(p => p.filter(n => n.id !== id)), 6000);
   };
 
+  // Turn Enhanced on and verify the service is actually reachable. Failures
+  // otherwise fall back to Standard silently, which would look like it worked.
+  const enableEnhanced = () => {
+    AI_MODE = true; setAiMode(true);
+    toast("scan", "Enhanced analysis enabled. Verifying service availability…");
+    (async () => {
+      const ok = await callAI("Reply with the single word OK.", 10, false).catch(() => "");
+      if (ok && AI_MODE) toast("database", "Enhanced analysis service connected — scans will include extended research and generated insights.");
+      else if (AI_MODE) toast("high", "Enhanced analysis service is not reachable in this deployment. Scans will use the standard engine until ANTHROPIC_API_KEY is configured on the server (see README).");
+    })();
+  };
+
+  // Switching domain swaps the data source AND the scientific basis, so the
+  // session's results are cleared rather than mixed across two rulebooks.
+  // Domain is detected per product rather than chosen. This only syncs the
+  // indicator and the copy after a lookup resolves.
+  const noteDomain = (d) => {
+    if (!d || d === DOMAIN) return;
+    DOMAIN = d; setDomainState(d);
+  };
+
   const toggleAI = () => {
-    AI_MODE = !AI_MODE; setAiMode(AI_MODE);
     if (AI_MODE) {
-      toast("scan", "Enhanced analysis enabled. Verifying service availability…");
-      // Minimal connectivity probe — confirms whether AI calls actually succeed
-      // in this environment, since failures otherwise fall back silently.
-      (async () => {
-        const ok = await callAI("Reply with the single word OK.", 10, false).catch(() => "");
-        if (ok && AI_MODE) toast("database", "Enhanced analysis service connected — scans will include extended research and generated insights.");
-        else if (AI_MODE) toast("high", "Enhanced analysis service is not reachable in this deployment. Scans will use the standard engine until ANTHROPIC_API_KEY is configured on the server (see README).");
-      })();
-    } else {
+      AI_MODE = false; setAiMode(false);
       toast("scan", "Standard analysis enabled. Product scans use the built-in safety engine and Open Food Facts data.");
+      return;
     }
+    // Enhanced is a paid tier — ask before switching on
+    if (!subscribed) { setShowPlan(true); return; }
+    enableEnhanced();
+  };
+
+  // Called when the plan is accepted. In production this must not enable the
+  // feature directly: it should start a checkout session and only unlock after
+  // the payment provider confirms the subscription server-side.
+  const acceptPlan = () => {
+    setShowPlan(false);
+    setSubscribed(true);
+    enableEnhanced();
   };
 
   const ck = (s) => cache.current;
@@ -1313,6 +2589,11 @@ export default function App() {
       diet: rec.diet || "unknown",
       undeclaredCount: rec.undeclaredCount ?? undeclaredOf(rec),
       date: new Date().toLocaleDateString(),
+      domain: rec.domain || DOMAIN,
+      // Formulation detail for cosmetics; absent for food entries
+      cosmetic: rec.domain === "cosmetics"
+        ? { formulation:rec.formulation, ph:rec.ph, delivery:rec.delivery, stabilisers:rec.stabilisers }
+        : (rec.cosmetic || null),
       ...extra,
     };
   }
@@ -1323,7 +2604,9 @@ export default function App() {
   function commitScan(a, label) {
     const name = a.offData?.name || label;
     const key = nk(name);
-    const payload = { offData:a.offData, aiSugarData:a.aiSugarData, allSubs:a.allSubs, risk:a.risk, diet:a.diet, undeclaredCount:a.undeclaredCount, hitCount:1, savedAt:Date.now() };
+    const payload = { offData:a.offData, aiSugarData:a.aiSugarData, allSubs:a.allSubs, risk:a.risk, diet:a.diet, undeclaredCount:a.undeclaredCount, hitCount:1, savedAt:Date.now(),
+      domain: a.domain || DOMAIN,
+      ...(a.domain === "cosmetics" ? { formulation:a.formulation, ph:a.ph, delivery:a.delivery, stabilisers:a.stabilisers } : {}) };
     const history = a.offData?.brand ? brandHistory(a.offData.brand) : null;
 
     if (a.offData || a.allSubs.length > 0) {
@@ -1386,7 +2669,8 @@ export default function App() {
 
     // 3. Fresh lookup
     try {
-      const { candidates, analysis } = await lookupAndAnalyze(label);
+      const { candidates, analysis, domain } = await lookupAndAnalyze(label);
+      noteDomain(domain);
       if (candidates) {
         // Ambiguous query — let the user choose rather than guessing wrong
         setScanning(false);
@@ -1401,12 +2685,48 @@ export default function App() {
     }
   }
 
+  // One input, one action. A question is answered from what is already known;
+  // anything that looks like a product is opened from cache if we have it and
+  // scanned fresh if we do not. The user should not have to choose which.
+  const QUESTION_RE = /^(who|what|why|how|which|are|is|do|does|show|find|list|tell|compare|any)\b|\?$/i;
+  async function submitQuery(raw) {
+    const q = (raw ?? input).trim();
+    if (!q) return;
+    setInputFocus(false);
+
+    // An attribute query asks about the whole catalogue, so it is answered from
+    // the live source. Answering it from the shared database would only return
+    // the few products already scanned, which is not what was asked.
+    if (CLOUD_FILTERS.some(f => f.m.test(q))) {
+      setDiscoverLoading(true); setDiscover(null); setSelected(null);
+      const res = await cloudSearch(q);
+      setDiscover(res || { applied: [], products: [], count: 0 });
+      setDiscoverLoading(false);
+      if (res?.domain) noteDomain(res.domain);
+      return;
+    }
+
+    setDiscover(null);
+    if (QUESTION_RE.test(q)) { setSearchQ(q); runSearch(q); return; }
+    scan(q);   // checks session cache → shared database → fresh lookup
+  }
+
+  // A scanned barcode is an exact key — go straight to a scan, no picker needed
+  function onBarcodeDetected(code) {
+    setCameraOpen(false);
+    setInput(code);
+    toast("scan", `Barcode ${code} detected.`);
+    scan(code);
+  }
+
   // Continue after the user picks one of the ambiguous candidates
   async function scanCandidate(rawProduct) {
     const label = picker?.query || rawProduct.product_name || "";
     setPicker(null); setScanning(true);
     try {
       const offData = parseOFF(rawProduct);
+      offData._domain = rawProduct._domain || DOMAIN;
+      noteDomain(offData._domain);
       commitScan(await analyzeProduct(offData, label), label);
     } catch (e) {
       console.warn("scanCandidate:", e);
@@ -1427,15 +2747,36 @@ export default function App() {
     setInsight(txt); setInsightLoading(false);
   }
 
-  async function loadBrand(brand, productName, key) {
+  // Product credibility is deterministic, so it is computed rather than fetched.
+  // Enhanced mode only appends researched company background — it never alters
+  // the product score, which must stay reproducible.
+  async function loadBrand(brand, productName, key, entry) {
     const k = key || nk(productName);
-    const cached = fromCache("brand", k);
-    if (cached) { setBrandCred(cached); setBrandCredLoading(false); return; }
+    const rec = entry || tracked.find(f => nk(f.name) === k) || fromCache("scan", k) || ghGet(k);
+    if (!rec) { setBrandCred(null); setBrandCredLoading(false); return; }
+
+    const cred = productCredibility(rec);
+    setBrandCred(cred);
+    // Brand figure comes from the shared database only, so it is identical
+    // regardless of which product it is viewed from.
+    setBrandStat(brandScoreStable(brand));
+
+    if (!AI_MODE || !brand) { setBrandCredLoading(false); return; }
+
+    // Company background is cached per BRAND, not per product — the same brand
+    // must not be researched again for every one of its products.
+    const bkey = "brand:" + (brand || "").toLowerCase().trim();
+    const cachedResearch = fromCache("brand", bkey);
+    if (cachedResearch !== undefined && cachedResearch !== null) {
+      setBrandCred({ ...cred, brandResearch: cachedResearch });
+      setBrandCredLoading(false);
+      return;
+    }
     setBrandCredLoading(true);
-    let cred = AI_MODE ? await aiBrandCredibility(brand, productName).catch(() => null) : localBrandCred(brand, tracked);
-    if (!cred) cred = localBrandCred(brand, tracked); // fallback: community data
-    toCache("brand", k, cred);
-    setBrandCred(cred); setBrandCredLoading(false);
+    const research = await aiBrandCredibility(brand, productName).catch(() => null);
+    toCache("brand", bkey, research || {});
+    setBrandCred({ ...cred, brandResearch: research || {} });
+    setBrandCredLoading(false);
   }
 
   // Alternatives are resolved by the same two-source strategy everywhere:
@@ -1478,15 +2819,68 @@ export default function App() {
     if (rec) ghSet(k, {...rec, alts}, setDbCount);
   }
 
+  // Open a previously-seen product instantly, without re-scanning. Checks the
+  // layers in cost order: already tracked → session cache → shared database.
+  // Only falls back to a live scan when the product is genuinely unknown.
+  function openResult(name, opts = {}) {
+    if (!name) return;
+    const key = nk(name);
+    const nameL = name.toLowerCase();
+    setActiveTab("tracker");
+    setSearchOpen(false);
+
+    // 1. Already in this session's list — just select it
+    const tracked_ = tracked.find(f =>
+      nk(f.name) === key || nk(f.searchTerm || "") === key ||
+      f.name.toLowerCase().includes(nameL) || nameL.includes(f.name.toLowerCase())
+    );
+    if (tracked_) { selectEntry(tracked_); return; }
+
+    // 2. Session cache
+    const cached = fromCache("scan", key);
+    if (cached) {
+      showEntry(entryFrom(cached, name, { fromCache:"session" }), key);
+      toast("cache", "Session cache — instant result.");
+      return;
+    }
+
+    // 3. Shared database
+    const rec = ghGet(key);
+    if (rec) {
+      toCache("scan", key, rec);
+      const entry = entryFrom(rec, name, { fromCache:"shared", hitCount:(rec.hitCount||0)+1 });
+      showEntry(entry, key);
+      if (rec.alts) setAlternatives(rec.alts);
+      toast("shared", "From the shared database — instant result.");
+      const und = undeclaredOf(rec);
+      if (und > 0) toast("undeclared", `"${entry.name}" may contain ${und} substance${und!==1?"s":""} not listed on its label.`);
+      return;
+    }
+
+    // 4. Not seen before — scan it, unless the caller only wants cached results
+    if (opts.cachedOnly) { setInput(name); return; }
+    scan(name);
+  }
+
   function selectEntry(entry) {
+    const k = nk(entry.name);
+    setSelected(entry); setBrandCred(null); setBrandStat(null); setAlternatives([]); setAltLoading(false);
+    loadInsight(entry.name, entry.substances, entry.offData?.nut, entry.offData, k);
+    loadBrand(entry.offData?.brand, entry.name, k, entry);
+    loadAlts(entry, k);
+  }
+
+  // Force-refresh: purge every cache layer (session, per-feature, shared record)
+  // and rescan, so newly-added Open Food Facts data is picked up immediately.
+  function rescan(e, entry) {
     if (e) e.stopPropagation();
     const term = entry.searchTerm || entry.name;
     [nk(term), nk(entry.name)].forEach(k => {
       ["scan","insight","brand","alts","calAlts","panelAlts"].forEach(store => { if (cache.current[store]) delete cache.current[store][k]; });
-      if (_ghDb.products) delete _ghDb.products[k]; // fresh result will re-save
+      if (_ghDb.products) delete _ghDb.products[k]; // a fresh result will re-save it
     });
     setTracked(p => p.filter(f => f.id !== entry.id));
-    if (selected?.id === entry.id) setSelected(null);
+    if (selected?.id === entry.id) { setSelected(null); setBrandCred(null); setBrandStat(null); }
     toast("scan", `Rescanning "${term}" — all caches bypassed.`);
     scan(term);
   }
@@ -1505,9 +2899,20 @@ export default function App() {
     setDbStatsLoading(false);
   }
 
+  // Shortcut queries. Each maps to a real filter on the live product database,
+  // so they return products the user has never scanned.
+  const DISCOVERY_CHIPS = [
+    { label: "No additives",     q: "products with no additives" },
+    { label: "Nutri-Score A",    q: "products with good Nutri-Score" },
+    { label: "Not ultra-processed", q: "unprocessed products" },
+    { label: "Vegan",            q: "vegan products" },
+    { label: "Organic",          q: "organic products" },
+    { label: "Fragrance-free",   q: "fragrance-free products" },
+  ];
+
   // ── SEARCH BAR ───────────────────────────────────────────────────────────────
   const SUGGESTIONS = [
-    "companies with good credibility","high risk products I scanned","vegan products I scanned",
+    "products with good credibility","high risk products I scanned","vegan products I scanned",
     "vegetarian foods I tracked","foods with added sugars","products with E-numbers",
     "low Nutri-Score items","ultra-processed foods","brands with controversies",
   ];
@@ -1516,11 +2921,12 @@ export default function App() {
   // product we have never analysed. One code path for both modes.
   async function bgScanFromSearch(query) {
     try {
-      const { candidates, analysis } = await lookupAndAnalyze(query);
+      const { candidates, analysis, domain } = await lookupAndAnalyze(query);
+      noteDomain(domain);
       // Ambiguous names are skipped rather than guessed — the user can scan
       // properly from the Hazard Tracker tab and choose the right variant.
       if (candidates) {
-        setSearchRes(prev => prev ? { ...prev, savingToDb:false, answer:`Several products match "${query}". Scan it from the Hazard Tracker tab to pick the right one.` } : prev);
+        setSearchRes(prev => prev ? { ...prev, savingToDb:false, answer:`Several products match "${query}". Scan it from the Tracker tab to pick the right one.` } : prev);
         return;
       }
       const a = analysis;
@@ -1548,6 +2954,43 @@ export default function App() {
     if (!query) return;
     setSearchLoading(true); setSearchRes(null); setSearchOpen(true);
     const qLow = query.toLowerCase();
+
+    // ── Category questions go to the live product database ──
+    // "products with no additives" is a request to DISCOVER products, so it
+    // must not be answered from the shared scan history — that would only ever
+    // return things already seen.
+    const intent = discoveryIntent(query);
+    if (intent) {
+      try {
+        const found = await cloudDiscover(intent);
+        noteDomain(intent.domain);
+        if (found.length) {
+          setSearchRes({
+            answer: `${found.length} product${found.length!==1?"s":""} matching ${intent.labels.join(" + ")}${intent.term?` · "${intent.term}"`:""}, from ${intent.domain==="cosmetics"?"Open Beauty Facts":"Open Food Facts"}.`,
+            matches: found.map(p => ({
+              name: p.name + (p.brand ? ` (${p.brand})` : ""),
+              reason: [
+                p.nutriScore ? `Nutri-Score ${p.nutriScore.toUpperCase()}` : null,
+                p.novaGroup ? `NOVA ${p.novaGroup}` : null,
+                p.nut?.sugars != null ? `${p.nut.sugars}g sugar` : null,
+                "not yet analysed",
+              ].filter(Boolean).join(" · "),
+              diet: "unknown",
+            })),
+            tip: "Tap any product to analyse it — the result is then saved for everyone.",
+            category: "discover",
+          });
+          setSearchLoading(false); ghLogSearch(query, "discover");
+          return;
+        }
+        setSearchRes({ answer:`Nothing in ${intent.domain==="cosmetics"?"Open Beauty Facts":"Open Food Facts"} matched ${intent.labels.join(" + ")}${intent.term?` for "${intent.term}"`:""}. Try a broader query.`, matches:[], tip:null, category:"discover" });
+        setSearchLoading(false); ghLogSearch(query, "discover");
+        return;
+      } catch (e) {
+        console.warn("cloudDiscover:", e);
+        // Fall through to the local answer below rather than failing outright
+      }
+    }
 
     const dbMatches = Object.entries(_ghDb.products || {})
       .filter(([k,v]) => k.includes(qLow) || (v.offData?.name||"").toLowerCase().includes(qLow) || (v.offData?.brand||"").toLowerCase().includes(qLow))
@@ -1653,7 +3096,47 @@ export default function App() {
   }
 
   // ── FILTERED LIST ────────────────────────────────────────────────────────────
-  const filteredTracked = filterRisk === "all" ? tracked : tracked.filter(f => f.risk === filterRisk);
+  const filteredTracked = tracked;
+
+  // Products already analysed — this session first, then the shared database.
+  // Clicking one opens the stored result instantly instead of re-scanning.
+  // Known products matching what is being typed — this is the "search" half of
+  // the unified input, answered locally with no network request.
+  const liveMatches = (() => {
+    const q = input.trim().toLowerCase();
+    if (q.length < 2) return [];
+    const out = [], seen = new Set();
+    const add = (name, risk, undeclared, where) => {
+      const k = nk(name);
+      if (seen.has(k) || !name.toLowerCase().includes(q)) return;
+      seen.add(k); out.push({ key:k, name, risk, undeclared, where });
+    };
+    tracked.forEach(f => add(f.name, f.risk, f.undeclaredCount || 0, "this session"));
+    Object.entries(_ghDb.products || {})
+      .sort((a,b) => (b[1].savedAt||0) - (a[1].savedAt||0))
+      .forEach(([k, rec]) => add(rec.offData?.name || k, rec.risk, undeclaredOf(rec), "shared"));
+    return out.slice(0, 5);
+  })();
+
+  const recentResults = (() => {
+    const out = [], seen = new Set();
+    tracked.forEach(f => {
+      const k = nk(f.name);
+      if (seen.has(k)) return;
+      seen.add(k);
+      out.push({ key:k, name:f.name, risk:f.risk, undeclared:f.undeclaredCount || 0, where:"this session" });
+    });
+    Object.entries(_ghDb.products || {})
+      .sort((a,b) => (b[1].savedAt||0) - (a[1].savedAt||0))
+      .forEach(([k, rec]) => {
+        const name = rec.offData?.name || k;
+        const nkey = nk(name);
+        if (seen.has(nkey)) return;
+        seen.add(nkey);
+        out.push({ key:k, name, risk:rec.risk, undeclared:undeclaredOf(rec), where:"shared" });
+      });
+    return out.slice(0, 6);
+  })();
 
   const tabBtn = (id, label) => (
     <button onClick={() => setActiveTab(id)} style={{background:"none",border:"none",borderBottom:`2px solid ${activeTab===id?t.accent:"transparent"}`,color:activeTab===id?t.accent:t.textSub,padding:"11px 16px",cursor:"pointer",fontSize:11,fontWeight:activeTab===id?600:500,marginBottom:-2,whiteSpace:"nowrap",transition:"all 0.18s"}}>{label}</button>
@@ -1733,8 +3216,63 @@ export default function App() {
 
   // ── RENDER ───────────────────────────────────────────────────────────────────
   return (
-    <div style={{minHeight:"100vh",background:t.bg,color:t.text,fontFamily:"Inter,'Segoe UI',system-ui,sans-serif",overflow:"hidden"}}>
+    <div style={{minHeight:"100vh",background:t.bg,color:t.text,fontFamily:"Inter,'Segoe UI',system-ui,sans-serif",overflow:isMobile?"visible":"hidden"}}>
       {/* ════ PRODUCT PICKER MODAL ════ */}
+      {cameraOpen && <BarcodeScanner onDetect={onBarcodeDetected} onClose={()=>setCameraOpen(false)} t={t} isMobile={isMobile}/>}
+
+      {/* ── ENHANCED PLAN ── */}
+      {showPlan && (
+        <div onClick={() => setShowPlan(false)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:16}}>
+          <div onClick={e => e.stopPropagation()} style={{background:t.bg,border:`1px solid ${t.border}`,borderRadius:16,padding:isMobile?"22px 20px":"26px 28px",width:"min(440px,100%)",maxHeight:"85vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,0.35)"}}>
+
+            <div style={{fontSize:10,fontWeight:600,color:t.accent,letterSpacing:"0.08em",textTransform:"uppercase",marginBottom:8}}>Enhanced analysis</div>
+            <div style={{display:"flex",alignItems:"baseline",gap:8,marginBottom:6}}>
+              <span style={{fontSize:32,fontWeight:800,color:t.text,letterSpacing:"-1px"}}>$2</span>
+              <span style={{fontSize:13,color:t.textSub}}>per week</span>
+            </div>
+            <div style={{fontSize:12,color:t.textSub,lineHeight:1.65,marginBottom:18}}>
+              Standard analysis stays free and unlimited. Enhanced adds researched detail on top of it.
+            </div>
+
+            <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:10,padding:"14px 16px",marginBottom:16}}>
+              {[
+                ["Extended substance research", "Looks beyond the built-in database of 50 additives"],
+                ["Researched brand profiles", "Company history, certifications and recall record"],
+                ["Written safety summaries", "Tailored to the product rather than templated"],
+                ["Wider alternative search", "Suggestions beyond the Open Food Facts category match"],
+              ].map(([title, sub]) => (
+                <div key={title} style={{display:"flex",gap:10,alignItems:"flex-start",marginBottom:10}}>
+                  <span style={{color:"#2e7d52",fontSize:13,lineHeight:1.4,flexShrink:0}}>✓</span>
+                  <div>
+                    <div style={{fontSize:12,fontWeight:600,color:t.text}}>{title}</div>
+                    <div style={{fontSize:11,color:t.textMuted,lineHeight:1.5}}>{sub}</div>
+                  </div>
+                </div>
+              ))}
+              <div style={{display:"flex",gap:10,alignItems:"flex-start",paddingTop:8,borderTop:`1px solid ${t.border}`}}>
+                <span style={{color:t.textMuted,fontSize:13,flexShrink:0}}>•</span>
+                <div style={{fontSize:11,color:t.textMuted,lineHeight:1.5}}>
+                  Hazard detection, undeclared-substance alerts, sugar analysis and brand ratings are part of Standard and are not affected by this plan.
+                </div>
+              </div>
+            </div>
+
+            <div style={{display:"flex",gap:10,flexDirection:isMobile?"column-reverse":"row"}}>
+              <button onClick={() => setShowPlan(false)} style={{flex:1,background:t.pill,border:`1px solid ${t.border}`,borderRadius:9,padding:"11px 16px",cursor:"pointer",fontSize:13,fontWeight:600,color:t.textSub}}>
+                Stay on Standard
+              </button>
+              <button onClick={acceptPlan} style={{flex:1,background:t.accent,border:"none",borderRadius:9,padding:"11px 16px",cursor:"pointer",fontSize:13,fontWeight:600,color:t.accentFg}}>
+                Continue — $2/week
+              </button>
+            </div>
+
+            <div style={{fontSize:10,color:t.textMuted,lineHeight:1.6,marginTop:14,textAlign:"center"}}>
+              Demonstration only — no payment is taken and no card details are collected.
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── AMBIGUOUS MATCH PICKER ── */}
       {picker && (
         <div onClick={() => setPicker(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
@@ -1773,6 +3311,11 @@ export default function App() {
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
         *{font-family:'Inter','Segoe UI',system-ui,sans-serif;-webkit-font-smoothing:antialiased;box-sizing:border-box}
+        html,body{margin:0;padding:0;overscroll-behavior-y:none}
+        button{-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+        /* iOS zooms the page when a focused input is under 16px */
+        @media (max-width:760px){ input,select,textarea{font-size:16px !important} button{min-height:38px} }
+        @media (prefers-reduced-motion:reduce){ *{animation-duration:0.01ms !important;transition-duration:0.01ms !important} }
         @keyframes slideIn{from{transform:translateX(110%);opacity:0}to{transform:translateX(0);opacity:1}}
         @keyframes slideUp{from{transform:translateY(100%);opacity:0}to{transform:translateY(0);opacity:1}}
         @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
@@ -1789,7 +3332,7 @@ export default function App() {
       {showDbStats && <DbStatsModal/>}
 
       {/* ── HEADER ── */}
-      <header style={{background:t.header,borderBottom:`1px solid ${t.border}`,padding:"12px 22px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10}}>
+      <header style={{background:t.header,borderBottom:`1px solid ${t.border}`,padding:isMobile?"10px 14px":"12px 22px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:isMobile?8:10}}>
         <div style={{display:"flex",alignItems:"center",gap:12}}>
           <div style={{width:42,height:42,background:t.accent,borderRadius:10,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
             <span style={{fontSize:13,fontWeight:800,color:"#fff",letterSpacing:"-0.5px"}}>HST</span>
@@ -1801,78 +3344,16 @@ export default function App() {
         </div>
         <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
 
-          {/* SEARCH BAR */}
-          <div ref={searchRef} style={{position:"relative"}}>
-            <div style={{display:"flex",alignItems:"center",background:t.inputBg,border:`1.5px solid ${searchOpen?t.accent:t.inputBorder}`,borderRadius:22,padding:"0 14px",gap:8,width:"clamp(180px,22vw,280px)",transition:"all 0.2s",boxShadow:searchOpen?`0 0 0 3px ${t.accent}18`:"none"}}>
-              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" style={{flexShrink:0,opacity:0.4}}><circle cx="6.5" cy="6.5" r="5.5" stroke={t.text} strokeWidth="1.5"/><path d="M11 11l3.5 3.5" stroke={t.text} strokeWidth="1.5" strokeLinecap="round"/></svg>
-              <input value={searchQ} onChange={e=>setSearchQ(e.target.value)} onFocus={()=>setSearchOpen(true)} onKeyDown={e=>{if(e.key==="Enter")runSearch();if(e.key==="Escape"){setSearchOpen(false);setSearchQ("");}}} placeholder="Search anything…" style={{flex:1,background:"none",border:"none",outline:"none",fontSize:12,color:t.inputText,padding:"8px 0",minWidth:0}}/>
-              {searchQ && <button onClick={()=>{setSearchQ("");setSearchRes(null);}} style={{background:"none",border:"none",color:t.textMuted,cursor:"pointer",fontSize:16,padding:0,lineHeight:1,flexShrink:0}}>×</button>}
-            </div>
-            {searchOpen && (
-              <div style={{position:"absolute",top:"calc(100% + 8px)",right:0,width:"clamp(300px,40vw,480px)",background:t.surface,border:`1px solid ${t.border}`,borderRadius:14,boxShadow:`0 12px 40px rgba(0,0,0,${dark?0.5:0.15})`,zIndex:500,overflow:"hidden"}}>
-                {!searchQ && !searchRes && !searchLoading && (
-                  <div style={{padding:"12px 0"}}>
-                    <div style={{padding:"4px 16px 8px",fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.07em",textTransform:"uppercase"}}>Suggested</div>
-                    {SUGGESTIONS.map(s => (
-                      <div key={s} onClick={()=>{setSearchQ(s);runSearch(s);}} style={{padding:"9px 16px",fontSize:12,color:t.textSub,cursor:"pointer",display:"flex",alignItems:"center",gap:10}} onMouseEnter={e=>e.currentTarget.style.background=t.surfaceHov} onMouseLeave={e=>e.currentTarget.style.background=""}>
-                        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" style={{opacity:0.35,flexShrink:0}}><circle cx="6.5" cy="6.5" r="5.5" stroke={t.text} strokeWidth="1.5"/><path d="M11 11l3.5 3.5" stroke={t.text} strokeWidth="1.5" strokeLinecap="round"/></svg>
-                        {s}
-                      </div>
-                    ))}
-                    <div style={{padding:"8px 16px",borderTop:`1px solid ${t.border}`,fontSize:10,color:t.textMuted}}>Press Esc to close</div>
-                  </div>
-                )}
-                {searchLoading && <div style={{padding:"24px 20px",display:"flex",alignItems:"center",gap:12,color:t.textSub,fontSize:13}}><span style={{display:"inline-block",width:14,height:14,border:`2px solid ${t.accent}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite"}}/>Searching…</div>}
-                {searchRes && !searchLoading && (
-                  <div>
-                    <div style={{padding:"16px 18px",borderBottom:`1px solid ${t.border}`}}>
-                      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6,flexWrap:"wrap"}}>
-                        <div style={{fontSize:10,fontWeight:600,color:t.accent,letterSpacing:"0.07em",textTransform:"uppercase"}}>{searchRes.category==="credibility"?"Brand Credibility":searchRes.category==="risk"?"Risk Assessment":searchRes.category==="sugar"?"Sugar Analysis":searchRes.category==="diet"?"Diet":searchRes.category==="database"?"Shared Database":"Search Result"}</div>
-                        {searchRes.fromDb && <span style={{fontSize:9,fontWeight:700,color:"#2e7d52",background:"rgba(46,125,82,0.1)",border:"1px solid rgba(46,125,82,0.2)",padding:"2px 8px",borderRadius:4}}>GitHub DB — instant</span>}
-                        {searchRes.savingToDb && <span style={{display:"inline-flex",alignItems:"center",gap:5,fontSize:9,fontWeight:600,color:"#b07d2b",background:"rgba(176,125,43,0.1)",border:"1px solid rgba(176,125,43,0.2)",padding:"2px 8px",borderRadius:4}}><span style={{display:"inline-block",width:8,height:8,border:"1.5px solid #b07d2b",borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite"}}/>Saving to GitHub…</span>}
-                        {searchRes.savedToDb && <span style={{fontSize:9,fontWeight:700,color:"#2e7d52",background:"rgba(46,125,82,0.1)",border:"1px solid rgba(46,125,82,0.2)",padding:"2px 8px",borderRadius:4}}>Saved to GitHub ✓</span>}
-                      </div>
-                      <p style={{margin:0,fontSize:13,color:t.text,lineHeight:1.7}}>{searchRes.answer}</p>
-                    </div>
-                    {searchRes.matches?.length > 0 && (
-                      <div style={{borderBottom:`1px solid ${t.border}`}}>
-                        <div style={{padding:"8px 18px 4px",fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.07em",textTransform:"uppercase"}}>Matching items</div>
-                        {searchRes.matches.slice(0,5).map((m,i) => {
-                          const dietVal = m.diet || tracked.find(f=>f.name.toLowerCase().includes(m.name.toLowerCase()))?.diet;
-                          const dc2 = dietVal && dietVal!=="unknown" ? DIET_CFG[dietVal] : null;
-                          return (
-                            <div key={i} style={{padding:"9px 18px",display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,borderTop:`1px solid ${t.tableBorder}`,cursor:"pointer"}} onMouseEnter={e=>e.currentTarget.style.background=t.surfaceHov} onMouseLeave={e=>e.currentTarget.style.background=""} onClick={()=>{ const found=tracked.find(f=>f.name.toLowerCase().includes(m.name.toLowerCase())||f.offData?.brand?.toLowerCase().includes(m.name.toLowerCase())); if(found){selectEntry(found);setActiveTab("tracker");setSearchOpen(false);} }}>
-                              <div style={{flex:1,minWidth:0}}>
-                                <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:2,flexWrap:"wrap"}}>
-                                  <span style={{fontSize:12,fontWeight:600,color:t.text}}>{m.name}</span>
-                                  {dc2 && <span style={{display:"inline-flex",alignItems:"center",gap:4,background:dc2.bg,border:`1px solid ${dc2.border}`,borderRadius:5,padding:"1px 7px"}}><span style={{fontSize:11}}>{dc2.icon}</span><span style={{fontSize:9,fontWeight:600,color:dc2.fg}}>{dc2.label}</span></span>}
-                                </div>
-                                <div style={{fontSize:11,color:t.textSub,lineHeight:1.5}}>{m.reason}</div>
-                              </div>
-                              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" style={{flexShrink:0,opacity:0.3,marginTop:3}}><path d="M6 3l5 5-5 5" stroke={t.text} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                    {searchRes.tip && <div style={{padding:"12px 18px",background:dark?"rgba(61,82,196,0.08)":"rgba(61,82,196,0.04)",display:"flex",gap:10,alignItems:"flex-start"}}><div style={{width:18,height:18,borderRadius:"50%",background:t.accent,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,marginTop:1}}><span style={{fontSize:10,color:"#fff",fontWeight:700}}>i</span></div><p style={{margin:0,fontSize:11,color:t.textSub,lineHeight:1.6}}>{searchRes.tip}</p></div>}
-                    <div style={{padding:"8px 18px",display:"flex",justifyContent:"flex-end"}}><button onClick={()=>{setSearchOpen(false);setSearchRes(null);setSearchQ("");}} style={{background:"none",border:"none",fontSize:11,color:t.textMuted,cursor:"pointer",padding:0}}>Dismiss</button></div>
-                  </div>
-                )}
-              </div>
-            )}
+          {/* DETECTED DOMAIN — reflects the last product, not a user choice */}
+          <div title={domain==="cosmetics"?"Assessed against SCCS and CIR (cosmetics)":"Assessed against EFSA and JECFA (food)"} style={{display:"flex",alignItems:"center",gap:6,background:t.pill,border:`1px solid ${t.border}`,borderRadius:20,padding:isMobile?"5px 10px":"5px 12px"}}>
+            <span style={{fontSize:12}}>{domain==="cosmetics"?"🧴":"🍽️"}</span>
+            <span style={{fontSize:10,fontWeight:600,color:t.textSub}}>{domain==="cosmetics"?"SCCS · CIR":"EFSA · JECFA"}</span>
           </div>
 
-          {/* GITHUB DB BADGE */}
-          <button onClick={openDbStats} style={{textAlign:"center",padding:"4px 10px",background:dark?"rgba(61,82,196,0.12)":"rgba(61,82,196,0.07)",border:`1px solid ${dark?"rgba(61,82,196,0.25)":"rgba(61,82,196,0.15)"}`,borderRadius:8,cursor:"pointer",position:"relative",transition:"all 0.18s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.8"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>
-            <div style={{position:"absolute",top:4,right:4,width:5,height:5,borderRadius:"50%",background:dbCount>0?"#2e7d52":"#b07d2b",animation:dbCount>0?"none":"pulse 1.2s infinite"}}/>
-            <div style={{fontSize:16,fontWeight:800,color:t.accent,letterSpacing:"-0.5px"}}>{dbCount}</div>
-            <div style={{fontSize:9,fontWeight:500,color:t.textMuted,marginTop:1}}>GitHub DB</div>
-          </button>
-
           {/* ANALYSIS MODE TOGGLE */}
-          <button onClick={toggleAI} title={aiMode?"Enhanced analysis: extended research and generated insights":"Standard analysis: built-in safety engine and Open Food Facts data"} style={{background:aiMode?`${t.accent}18`:t.pill,border:`1.5px solid ${aiMode?t.accent:t.border}`,borderRadius:20,padding:"6px 14px",cursor:"pointer",display:"flex",alignItems:"center",gap:8,transition:"all 0.25s"}}>
+          <button onClick={toggleAI} title={aiMode?"Enhanced analysis: extended research and generated insights":"Standard analysis (free). Enhanced is $2/week."} style={{background:aiMode?`${t.accent}18`:t.pill,border:`1.5px solid ${aiMode?t.accent:t.border}`,borderRadius:20,padding:"6px 14px",cursor:"pointer",display:"flex",alignItems:"center",gap:8,transition:"all 0.25s"}}>
             <span style={{fontSize:11,fontWeight:600,color:aiMode?t.accent:t.textSub}}>{aiMode?"Enhanced":"Standard"}</span>
+            {!aiMode && !subscribed && <span style={{fontSize:9,fontWeight:600,color:t.textMuted,background:t.pill,border:`1px solid ${t.border}`,padding:"1px 5px",borderRadius:4}}>$2/wk</span>}
             <span style={{width:26,height:14,borderRadius:8,background:aiMode?t.accent:t.borderMed,position:"relative",transition:"background 0.2s",flexShrink:0}}>
               <span style={{position:"absolute",top:2,left:aiMode?14:2,width:10,height:10,borderRadius:"50%",background:"#fff",transition:"left 0.2s"}}/>
             </span>
@@ -1896,42 +3377,77 @@ export default function App() {
 
       {/* ── TABS ── */}
       <div style={{background:t.tabBg,display:"flex",borderBottom:`2px solid ${t.border}`,padding:"0 22px",overflowX:"auto"}}>
-        {tabBtn("tracker","Hazard Tracker")}
-        {tabBtn("alternatives","Alternative Foods")}
-        {tabBtn("brands","Brand Ratings")}
+        {tabBtn("tracker","Tracker")}
+        {tabBtn("alternatives","Alternatives")}
+        {tabBtn("brands","Brand Rankings")}
       </div>
 
       {/* ════ TRACKER TAB ════ */}
       {activeTab==="tracker" && (
-        <div style={{display:"grid",gridTemplateColumns:"minmax(260px,320px) 1fr",height:"calc(100vh - 109px)"}}>
+        <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"minmax(260px,320px) 1fr",height:isMobile?"auto":"calc(100vh - 109px)",minHeight:isMobile?"calc(100vh - 109px)":undefined}}>
 
           {/* LEFT PANEL */}
           <div style={{background:t.leftBg,borderRight:`1px solid ${t.border}`,display:"flex",flexDirection:"column",overflow:"hidden",position:"relative"}}>
             <div style={{padding:"16px 16px 10px"}}>
-              <div style={{fontSize:12,fontWeight:600,color:t.text,marginBottom:3}}>Scan a product</div>
-              <div style={{fontSize:11,color:t.textMuted,marginBottom:10}}>Open Food Facts + {AI_MODE?"enhanced":"standard"} hazard analysis</div>
-              <input value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&scan()} disabled={scanning} placeholder="Product name or barcode…" style={{width:"100%",border:`1.5px solid ${t.inputBorder}`,borderRadius:9,padding:"10px 13px",fontSize:13,outline:"none",background:t.inputBg,color:t.inputText,display:"block"}} onFocus={e=>e.target.style.borderColor=t.accent} onBlur={e=>e.target.style.borderColor=t.inputBorder}/>
-              <button onClick={()=>scan()} disabled={scanning||!input.trim()} style={{marginTop:8,width:"100%",background:scanning?t.pill:t.accent,border:"none",color:scanning?t.textMuted:t.accentFg,padding:"11px",borderRadius:9,cursor:scanning||!input.trim()?"default":"pointer",fontSize:13,fontWeight:600,display:"flex",alignItems:"center",justifyContent:"center",gap:8,opacity:!input.trim()&&!scanning?0.45:1,transition:"all 0.2s"}}>
-                {scanning?<><span style={{display:"inline-block",width:13,height:13,border:`2px solid ${t.textMuted}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite"}}/>Scanning…</>:"Scan"}
+              <div style={{fontSize:12,fontWeight:600,color:t.text,marginBottom:3}}>Scan or search a product</div>
+              <div style={{fontSize:11,color:t.textMuted,marginBottom:10}}>Food and cosmetics — the type is detected automatically.</div>
+              <div style={{display:"flex",gap:7,position:"relative"}}>
+                <input value={input}
+                  onChange={e=>{setInput(e.target.value); setInputFocus(true);}}
+                  onFocus={e=>{e.target.style.borderColor=t.accent; setInputFocus(true);}}
+                  onBlur={e=>{e.target.style.borderColor=t.inputBorder; setTimeout(()=>setInputFocus(false),150);}}
+                  onKeyDown={e=>{ if(e.key==="Enter") submitQuery(); if(e.key==="Escape") setInputFocus(false); }}
+                  disabled={scanning} placeholder="Product name or barcode…" style={{flex:1,minWidth:0,border:`1.5px solid ${t.inputBorder}`,borderRadius:9,padding:"10px 13px",fontSize:13,outline:"none",background:t.inputBg,color:t.inputText}}/>
+                <button onClick={()=>setCameraOpen(true)} disabled={scanning} title="Scan a barcode with the camera" aria-label="Scan a barcode with the camera" style={{flexShrink:0,width:42,border:`1.5px solid ${t.inputBorder}`,borderRadius:9,background:t.inputBg,cursor:scanning?"default":"pointer",display:"flex",alignItems:"center",justifyContent:"center",opacity:scanning?0.5:1}}>
+                  <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke={t.accent} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M3 8V5.5A1.5 1.5 0 014.5 4H7M17 4h2.5A1.5 1.5 0 0121 5.5V8M21 16v2.5a1.5 1.5 0 01-1.5 1.5H17M7 20H4.5A1.5 1.5 0 013 18.5V16"/>
+                    <path d="M7 8.5v7M10 8.5v7M13.5 8.5v7M17 8.5v7"/>
+                  </svg>
+                </button>
+              </div>
+              {/* Already-analysed matches, shown live so a known product opens
+                  instantly instead of being re-scanned */}
+              {inputFocus && liveMatches.length > 0 && (
+                <div style={{marginTop:6,border:`1px solid ${t.border}`,borderRadius:9,background:t.surface,overflow:"hidden",maxHeight:210,overflowY:"auto"}}>
+                  <div style={{padding:"7px 12px 4px",fontSize:9,fontWeight:600,color:t.textMuted,letterSpacing:"0.07em",textTransform:"uppercase"}}>Already analysed</div>
+                  {liveMatches.map(r => (
+                    <div key={r.key} onMouseDown={()=>{ setInput(""); setInputFocus(false); openResult(r.name); }}
+                      style={{padding:"8px 12px",display:"flex",alignItems:"center",gap:8,cursor:"pointer",fontSize:12,color:t.text}}
+                      onMouseEnter={e=>e.currentTarget.style.background=t.surfaceHov}
+                      onMouseLeave={e=>e.currentTarget.style.background=""}>
+                      <span style={{width:6,height:6,borderRadius:"50%",background:r.risk?RISK_CFG[r.risk]?.fg:t.borderMed,flexShrink:0}}/>
+                      <span style={{flex:1,minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={r.name}>{r.name}</span>
+                      {r.undeclared>0 && <span style={{fontSize:9,color:"#c0392b",flexShrink:0}}>⚠</span>}
+                      <span style={{fontSize:9,color:t.textMuted,flexShrink:0}}>{r.where}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <button onClick={()=>submitQuery()} disabled={scanning||!input.trim()} style={{marginTop:8,width:"100%",background:scanning?t.pill:t.accent,border:"none",color:scanning?t.textMuted:t.accentFg,padding:"11px",borderRadius:9,cursor:scanning||!input.trim()?"default":"pointer",fontSize:13,fontWeight:600,display:"flex",alignItems:"center",justifyContent:"center",gap:8,opacity:!input.trim()&&!scanning?0.45:1,transition:"all 0.2s"}}>
+                {scanning?<><span style={{display:"inline-block",width:13,height:13,border:`2px solid ${t.textMuted}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite"}}/>Working…</>:"Scan or search"}
               </button>
-              <div style={{marginTop:9,padding:"8px 11px",background:dark?"rgba(61,82,196,0.1)":"rgba(61,82,196,0.05)",border:`1px solid ${dark?"rgba(61,82,196,0.25)":"rgba(61,82,196,0.15)"}`,borderRadius:8,fontSize:10,color:t.textSub,lineHeight:1.6}}>
-                Scans saved to GitHub — loads instantly for everyone else.
+              {/* Discovery shortcuts — these query the live product database,
+                  not just what has already been scanned */}
+              <div style={{marginTop:11}}>
+                <div style={{fontSize:9,fontWeight:600,color:t.textMuted,letterSpacing:"0.07em",textTransform:"uppercase",marginBottom:6}}>Discover</div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+                  {DISCOVERY_CHIPS.map(c => (
+                    <button key={c.label} onClick={()=>{ setInput(c.q); submitQuery(c.q); }} disabled={scanning}
+                      style={{fontSize:10,fontWeight:500,color:t.textSub,background:t.pill,border:`1px solid ${t.border}`,padding:"4px 10px",borderRadius:14,cursor:scanning?"default":"pointer",opacity:scanning?0.5:1}}>
+                      {c.label}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
 
-            {/* RISK FILTER */}
-            <div style={{padding:"7px 14px",borderBottom:`1px solid ${t.border}`,display:"flex",gap:4}}>
-              {[["all","All"],["high","High"],["medium","Med"],["low","Low"]].map(([r,l])=>(
-                <button key={r} onClick={()=>setFilterRisk(r)} style={{flex:1,padding:"5px 3px",background:filterRisk===r?(r==="all"?t.accent:RISK_CFG[r]?.fg||t.accent):t.pill,border:"none",color:filterRisk===r?"#fff":t.pillText,borderRadius:6,cursor:"pointer",fontSize:10,fontWeight:600,transition:"all 0.18s"}}>{l}</button>
-              ))}
-            </div>
-
             {/* PRODUCT LIST */}
-            <div style={{flex:1,overflowY:"auto",padding:"8px"}}>
+            <div style={{flex:1,overflowY:isMobile?"visible":"auto",padding:"8px"}}>
               {scanning && (
                 <div style={{padding:"12px",marginBottom:4,background:dark?"rgba(61,82,196,0.08)":"rgba(61,82,196,0.05)",border:`1px solid ${dark?"rgba(61,82,196,0.18)":"rgba(61,82,196,0.12)"}`,borderRadius:9,fontSize:11,color:t.accent,display:"flex",alignItems:"center",gap:8,animation:"pulse 1.2s infinite"}}>
                   <span style={{display:"inline-block",width:10,height:10,border:`2px solid ${t.accent}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite",flexShrink:0}}/>
-                  <div><div>Scanning "{input}"…</div><div style={{fontSize:9,color:t.textMuted,marginTop:2}}>Shared DB → Open Food Facts → {AI_MODE?"Enhanced analysis":"Safety engine"}</div></div>
+                  <div><div>Scanning "{input}"…</div><div style={{fontSize:9,color:t.textMuted,marginTop:2}}>Shared DB → {domainLabel()} → {AI_MODE?"Enhanced analysis":"Safety engine"}</div></div>
                 </div>
               )}
               {filteredTracked.length===0 && !scanning && <div style={{padding:"30px 14px",textAlign:"center",color:t.textMuted,fontSize:11,lineHeight:1.9}}>No products scanned yet.</div>}
@@ -1988,7 +3504,7 @@ export default function App() {
                   {panelAltLoading && !panelAlts.length && <div style={{padding:"20px",textAlign:"center",color:t.textSub,fontSize:12,display:"flex",flexDirection:"column",alignItems:"center",gap:10}}><span style={{display:"inline-block",width:18,height:18,border:`2px solid ${t.accent}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite"}}/>Searching…</div>}
                   {!panelAltLoading && panelAlts.length===0 && <div style={{padding:"18px",textAlign:"center",color:t.textMuted,fontSize:12}}>No alternatives found.</div>}
                   {panelAlts.map((alt,i)=>(
-                    <div key={i} style={{background:t.cardBg,border:`1px solid ${t.border}`,borderLeft:"3px solid #2e7d52",borderRadius:8,padding:"11px 12px"}}>
+                    <div key={i} onClick={()=>openResult(alt.name)} title={`Analyse ${alt.name}`} style={{background:t.cardBg,border:`1px solid ${t.border}`,borderLeft:"3px solid #2e7d52",borderRadius:8,padding:"11px 12px",cursor:"pointer",transition:"background 0.15s"}} onMouseEnter={e=>e.currentTarget.style.background=t.surfaceHov} onMouseLeave={e=>e.currentTarget.style.background=t.cardBg}>
                       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:6,marginBottom:5}}>
                         <div style={{flex:1,minWidth:0}}><div style={{fontSize:12,fontWeight:600,color:t.text,lineHeight:1.3}}>{alt.name}</div>{alt.brand&&<div style={{fontSize:10,color:t.textSub,marginTop:1}}>{alt.brand}</div>}</div>
                         <div style={{display:"flex",gap:4,flexShrink:0}}>
@@ -2007,8 +3523,114 @@ export default function App() {
           </div>
 
           {/* RIGHT PANEL */}
-          <div style={{overflowY:"auto",padding:"18px 22px",background:t.rightBg}}>
-            {!selected ? (
+          <div style={{overflowY:isMobile?"visible":"auto",padding:isMobile?"14px 14px 28px":"18px 22px",background:t.rightBg}}>
+            {/* SEARCH / DISCOVERY RESULTS — shown above any selected product */}
+            {(searchLoading || searchRes) && (
+              <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:12,marginBottom:14,overflow:"hidden"}}>
+                <div style={{padding:"12px 18px",borderBottom:`1px solid ${t.border}`,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
+                  <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.06em",textTransform:"uppercase"}}>
+                    {searchRes?.category === "discover" ? "Discovered products" : "Search results"}
+                  </div>
+                  <button onClick={()=>{setSearchRes(null);setSearchQ("");}} style={{background:"none",border:"none",color:t.textMuted,cursor:"pointer",fontSize:15,lineHeight:1,padding:0}}>×</button>
+                </div>
+                {searchLoading ? (
+                  <div style={{padding:"18px",display:"flex",alignItems:"center",gap:9,fontSize:12,color:t.textSub}}>
+                    <span style={{display:"inline-block",width:13,height:13,border:`2px solid ${t.accent}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite"}}/>
+                    Searching the product database…
+                  </div>
+                ) : (
+                  <>
+                    <div style={{padding:"14px 18px"}}>
+                      <p style={{margin:0,fontSize:13,color:t.text,lineHeight:1.7,overflowWrap:"anywhere"}}>{searchRes.answer}</p>
+                      {searchRes.savingToDb && <div style={{marginTop:8,fontSize:11,color:t.textMuted,display:"flex",alignItems:"center",gap:7}}><span style={{display:"inline-block",width:10,height:10,border:`2px solid ${t.accent}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite"}}/>Analysing…</div>}
+                    </div>
+                    {searchRes.matches?.length > 0 && (
+                      <div>
+                        <div style={{padding:"4px 18px 6px",fontSize:9,fontWeight:600,color:t.textMuted,letterSpacing:"0.07em",textTransform:"uppercase"}}>
+                          {searchRes.category === "discover" ? "Tap to analyse" : "Matching items"}
+                        </div>
+                        {searchRes.matches.slice(0,8).map((m,i) => (
+                          <div key={i} onClick={()=>openResult((m.name||"").replace(/\s*\([^)]*\)\s*$/, "").trim())}
+                            style={{padding:"9px 18px",borderTop:`1px solid ${t.tableBorder}`,cursor:"pointer",display:"flex",justifyContent:"space-between",gap:12,alignItems:"flex-start"}}
+                            onMouseEnter={e=>e.currentTarget.style.background=t.surfaceHov}
+                            onMouseLeave={e=>e.currentTarget.style.background=""}>
+                            <div style={{minWidth:0}}>
+                              <div style={{fontSize:12,fontWeight:600,color:t.text,overflowWrap:"anywhere"}}>{m.name}</div>
+                              <div style={{fontSize:11,color:t.textSub,lineHeight:1.5,overflowWrap:"anywhere"}}>{m.reason}</div>
+                            </div>
+                            <span style={{fontSize:13,color:t.textMuted,flexShrink:0}}>→</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {searchRes.tip && (
+                      <div style={{padding:"10px 18px",borderTop:`1px solid ${t.border}`,background:t.bgSub,fontSize:11,color:t.textSub,lineHeight:1.6}}>{searchRes.tip}</div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* Discovery results — live from the product catalogue, not from
+                what has already been scanned */}
+            {(discover || discoverLoading) && !selected ? (
+              <div>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,flexWrap:"wrap",marginBottom:14}}>
+                  <div style={{minWidth:0}}>
+                    <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.07em",textTransform:"uppercase",marginBottom:4}}>
+                      From {discover?.domain === "cosmetics" ? "Open Beauty Facts" : "Open Food Facts"} — live catalogue
+                    </div>
+                    <div style={{fontSize:17,fontWeight:700,color:t.text,letterSpacing:"-0.3px"}}>
+                      {discoverLoading ? "Searching the catalogue…" : `${discover.count?.toLocaleString?.() || discover.products.length} products match`}
+                    </div>
+                    {discover?.applied?.length > 0 && (
+                      <div style={{display:"flex",gap:5,flexWrap:"wrap",marginTop:7}}>
+                        {discover.applied.map(a => (
+                          <span key={a} style={{fontSize:10,fontWeight:600,color:t.accent,background:`${t.accent}14`,border:`1px solid ${t.accent}30`,padding:"2px 9px",borderRadius:5}}>{a}</span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <button onClick={()=>setDiscover(null)} style={{background:t.pill,border:`1px solid ${t.border}`,borderRadius:8,padding:"6px 12px",cursor:"pointer",fontSize:11,fontWeight:600,color:t.textSub,flexShrink:0}}>Clear</button>
+                </div>
+
+                {discoverLoading ? (
+                  <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                    {[0,1,2,3].map(i => <div key={i} style={{height:58,background:t.surface,border:`1px solid ${t.border}`,borderRadius:10,animation:"shimmer 1.4s ease infinite"}}/>)}
+                  </div>
+                ) : discover.products.length === 0 ? (
+                  <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:12,padding:"36px 22px",textAlign:"center"}}>
+                    <div style={{fontSize:13,fontWeight:600,color:t.text,marginBottom:5}}>
+                      {discover.failed ? "The catalogue could not be reached" : "No products matched those filters"}
+                    </div>
+                    <div style={{fontSize:11,color:t.textMuted,lineHeight:1.7}}>
+                      {discover.failed ? "Check the connection and try again." : "Try a broader query, or scan a specific product by name or barcode."}
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"repeat(auto-fill,minmax(260px,1fr))",gap:9}}>
+                      {discover.products.map((p,i) => (
+                        <div key={i} onClick={()=>{ setDiscover(null); scan(p.name); }} title={`Analyse ${p.name}`}
+                          style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:10,padding:"11px 13px",cursor:"pointer",display:"flex",alignItems:"center",gap:10}}
+                          onMouseEnter={e=>e.currentTarget.style.background=t.surfaceHov}
+                          onMouseLeave={e=>e.currentTarget.style.background=t.surface}>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{fontSize:12.5,fontWeight:600,color:t.text,overflowWrap:"anywhere",lineHeight:1.4}}>{p.name}</div>
+                            {p.brand && <div style={{fontSize:10,color:t.textSub,marginTop:2}}>{p.brand}</div>}
+                          </div>
+                          {p.nutriScore && <span style={{fontSize:9,fontWeight:700,color:"#fff",background:NS_COLOR[p.nutriScore]||"#999",padding:"2px 7px",borderRadius:4,flexShrink:0}}>{p.nutriScore.toUpperCase()}</span>}
+                          <span style={{fontSize:13,color:t.textMuted,flexShrink:0}}>→</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{fontSize:10,color:t.textMuted,lineHeight:1.7,marginTop:12}}>
+                      Filtered directly on {discover.domain === "cosmetics" ? "Open Beauty Facts" : "Open Food Facts"} — these are not limited to previously scanned products. Select one to run a full analysis.
+                    </div>
+                  </>
+                )}
+              </div>
+            ) : !selected ? (
               <div style={{position:"relative",height:"100%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",overflow:"hidden"}}>
                 <FoodBg/>
                 <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",pointerEvents:"none",userSelect:"none"}}>
@@ -2018,7 +3640,7 @@ export default function App() {
                   <div style={{width:68,height:68,background:t.accent,borderRadius:16,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 4px 20px ${t.accent}35`}}>
                     <span style={{fontSize:22,fontWeight:800,color:"#fff",letterSpacing:"-1px"}}>HST</span>
                   </div>
-                  <div><div style={{fontSize:20,fontWeight:700,color:t.text,marginBottom:5,letterSpacing:"-0.3px"}}>Hazard Substance Tracker</div><div style={{fontSize:12,color:t.textMuted,fontWeight:500}}>Open Food Facts · AI Hazard Analysis · Brand Credibility · GitHub DB</div></div>
+                  <div><div style={{fontSize:20,fontWeight:700,color:t.text,marginBottom:5,letterSpacing:"-0.3px"}}>Hazard Substance Tracker</div><div style={{fontSize:12,color:t.textMuted,fontWeight:500}}>Open Food Facts · Hazard Analysis · Product Credibility · Shared Database</div></div>
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,width:"100%",marginTop:4}}>
                     {[["Real product data","Free Open Food Facts API"],["Hazard detection",AI_MODE?"Extended research + curated DB":"Curated substance database"],["Full sugar profile","Total, added & natural"],["Brand ratings","Aggregate scores & label alerts"],["Diet classification","Vegan / Veg / Meat"],["Shared database","GitHub — instant results"]].map(([title,sub])=>(
                       <div key={title} style={{background:t.surface,borderRadius:10,padding:"12px 14px",border:`1px solid ${t.border}`,textAlign:"left"}}>
@@ -2031,7 +3653,7 @@ export default function App() {
                 </div>
               </div>
             ) : selected.offData ? (
-              <OFFCard offData={selected.offData} aiSugarData={selected.aiSugarData} substances={selected.substances} insight={insight} insightLoading={insightLoading} brandCred={brandCred} brandCredLoading={brandCredLoading} alternatives={alternatives} altLoading={altLoading} diet={selected.diet||"unknown"} t={t} dark={dark}/>
+              <OFFCard cosmeticAnalysis={selected?.cosmetic} brandStat={brandStat} onOpen={openResult} offData={selected.offData} aiSugarData={selected.aiSugarData} substances={selected.substances} insight={insight} insightLoading={insightLoading} brandCred={brandCred} brandCredLoading={brandCredLoading} alternatives={alternatives} altLoading={altLoading} diet={selected.diet||"unknown"} t={t} dark={dark}/>
             ) : (
               <div style={{display:"flex",flexDirection:"column",gap:12}}>
                 <div style={{background:t.surface,borderRadius:12,padding:"16px 18px",border:`1px solid ${t.border}`}}>
@@ -2067,12 +3689,12 @@ export default function App() {
         const concerning = brands.filter(b=>b.score<4).length;
         const scoreColor = (sc)=> sc>=8?"#2e7d52":sc>=6?"#b07d2b":sc>=4?"#a0622a":"#c0392b";
         return (
-          <div style={{overflowY:"auto",height:"calc(100vh - 109px)",background:t.bg,padding:"20px 24px"}}>
+          <div style={{overflowY:"auto",height:isMobile?"auto":"calc(100vh - 109px)",minHeight:isMobile?"calc(100vh - 109px)":undefined,background:t.bg,padding:isMobile?"16px 14px":"20px 24px"}}>
             <div style={{maxWidth:1100,margin:"0 auto"}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-end",flexWrap:"wrap",gap:12,marginBottom:16}}>
                 <div>
-                  <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.08em",textTransform:"uppercase",marginBottom:4}}>Aggregated from your scans + shared GitHub DB</div>
-                  <div style={{fontSize:19,fontWeight:800,color:t.text,letterSpacing:"-0.4px"}}>Brand Ratings</div>
+                  <div style={{fontSize:10,fontWeight:600,color:t.textMuted,letterSpacing:"0.08em",textTransform:"uppercase",marginBottom:4}}>Ranked by disclosure and hazard record across all known products</div>
+                  <div style={{fontSize:19,fontWeight:800,color:t.text,letterSpacing:"-0.4px"}}>Brand Rankings</div>
                 </div>
                 <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
                   {[["Brands",brands.length,t.accent],["Products",brands.reduce((a,b)=>a+b.count,0),"#2e7d52"],["Undeclared",totalUndeclared,totalUndeclared>0?"#c0392b":"#2e7d52"],["Concerning",concerning,concerning>0?"#c0392b":"#2e7d52"]].map(([l,v,c])=>(
@@ -2087,19 +3709,27 @@ export default function App() {
                 <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:12,padding:"48px 24px",textAlign:"center"}}>
                   <div style={{fontSize:30,marginBottom:10,opacity:0.3}}>🏷️</div>
                   <div style={{fontSize:14,fontWeight:600,color:t.text,marginBottom:5}}>No branded products yet</div>
-                  <div style={{fontSize:12,color:t.textMuted,lineHeight:1.7}}>Scan branded products in the Hazard Tracker tab.<br/>Ratings build automatically from every scan — yours and everyone else's.</div>
+                  <div style={{fontSize:12,color:t.textMuted,lineHeight:1.7}}>Scan branded products in the Tracker tab.<br/>Ratings build automatically from every scan — yours and everyone else's.</div>
                 </div>
               ) : (
                 <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(320px,1fr))",gap:14}}>
-                  {brands.map(b => {
+                  {brands.map((b, rank) => {
                     const sc = scoreColor(b.score);
                     const arc = (b.score/10)*251;
                     return (
                       <div key={b.brand} style={{background:t.surface,border:`1px solid ${t.border}`,borderLeft:`3px solid ${sc}`,borderRadius:12,overflow:"hidden",display:"flex",flexDirection:"column"}}>
                         <div style={{padding:"14px 16px",borderBottom:`1px solid ${t.border}`,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
                           <div style={{minWidth:0}}>
-                            <div style={{fontSize:15,fontWeight:700,color:t.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{b.brand}</div>
-                            <div style={{fontSize:10,color:t.textSub,marginTop:2}}>{b.count} product{b.count!==1?"s":""} · searched {b.hits}×</div>
+                            <div style={{display:"flex",alignItems:"center",gap:7,minWidth:0}}>
+                              <span style={{fontSize:10,fontWeight:800,color:t.textMuted,fontFamily:"monospace",flexShrink:0}}>#{rank+1}</span>
+                              <span style={{fontSize:15,fontWeight:700,color:t.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{b.brand}</span>
+                            </div>
+                            <div style={{fontSize:10,color:t.textSub,marginTop:2}}>Rated across {b.count} product{b.count!==1?"s":""}</div>
+                            {b.subBrands?.length > 0 && (
+                              <div style={{fontSize:10,color:t.textMuted,marginTop:3,overflowWrap:"anywhere"}}>
+                                incl. {b.subBrands.slice(0,4).join(", ")}{b.subBrands.length>4?` +${b.subBrands.length-4}`:""}
+                              </div>
+                            )}
                             <span style={{display:"inline-block",marginTop:6,fontSize:10,fontWeight:700,color:sc,background:`${sc}14`,border:`1px solid ${sc}30`,padding:"2px 9px",borderRadius:5}}>{b.verdict}</span>
                           </div>
                           <div style={{position:"relative",width:58,height:58,flexShrink:0}}>
@@ -2127,16 +3757,6 @@ export default function App() {
                             <span style={{fontSize:10.5,color:"#c0392b",fontWeight:600,lineHeight:1.55}}>{b.undeclared} substance report{b.undeclared!==1?"s":""} not declared on product labels.</span>
                           </div>
                         )}
-                        <div style={{padding:"11px 16px",display:"flex",flexWrap:"wrap",gap:5}}>
-                          {b.products.slice(0,6).map((p,i)=>(
-                            <span key={i} onClick={()=>{setInput(p.name);setActiveTab("tracker");}} title="Click to scan" style={{fontSize:10,color:t.textSub,background:t.pill,border:`1px solid ${p.undeclared>0?"rgba(192,57,43,0.35)":t.border}`,padding:"3px 9px",borderRadius:5,cursor:"pointer",display:"inline-flex",alignItems:"center",gap:5,maxWidth:180}}>
-                              <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.name}</span>
-                              {p.risk&&<span style={{width:6,height:6,borderRadius:"50%",background:RISK_CFG[p.risk]?.fg,flexShrink:0}}/>}
-                              {p.undeclared>0&&<span style={{fontSize:9,color:"#c0392b",flexShrink:0}}>⚠</span>}
-                            </span>
-                          ))}
-                          {b.products.length>6&&<span style={{fontSize:10,color:t.textMuted,padding:"3px 4px"}}>+{b.products.length-6} more</span>}
-                        </div>
                       </div>
                     );
                   })}
@@ -2150,8 +3770,8 @@ export default function App() {
 
       {/* ════ ALTERNATIVE FOODS TAB ════ */}
       {activeTab==="alternatives" && (
-        <div style={{overflowY:"auto",height:"calc(100vh - 109px)",background:t.bg}}>
-          <div style={{display:"grid",gridTemplateColumns:"minmax(280px,340px) 1fr",height:"100%"}}>
+        <div style={{overflowY:"auto",height:isMobile?"auto":"calc(100vh - 109px)",minHeight:isMobile?"calc(100vh - 109px)":undefined,background:t.bg}}>
+          <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"minmax(280px,340px) 1fr",height:isMobile?"auto":"100%"}}>
             {/* LEFT */}
             <div style={{background:t.leftBg,borderRight:`1px solid ${t.border}`,display:"flex",flexDirection:"column",overflow:"hidden"}}>
               <div style={{padding:"16px 16px 12px",borderBottom:`1px solid ${t.border}`}}>
@@ -2214,7 +3834,7 @@ export default function App() {
                       {altTabResults.map((alt,i)=>{
                         const calDiff = alt.calories&&altTabFood.offData?.nut?.energy_kcal?alt.calories-altTabFood.offData.nut.energy_kcal:null;
                         return(
-                          <div key={i} style={{background:t.surface,border:`1px solid ${t.border}`,borderLeft:"3px solid #2e7d52",borderRadius:12,overflow:"hidden"}}>
+                          <div key={i} onClick={()=>openResult(alt.name)} title={`Analyse ${alt.name}`} style={{background:t.surface,border:`1px solid ${t.border}`,borderLeft:"3px solid #2e7d52",borderRadius:12,overflow:"hidden",cursor:"pointer"}}>
                             <div style={{padding:"14px 16px",borderBottom:`1px solid ${t.border}`}}>
                               <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:8}}>
                                 <div style={{flex:1}}><div style={{fontSize:14,fontWeight:700,color:t.text,marginBottom:2}}>{alt.name}</div>{alt.brand&&<div style={{fontSize:11,color:t.textSub}}>{alt.brand}</div>}</div>
@@ -2229,7 +3849,7 @@ export default function App() {
                               </div>
                             </div>
                             <div style={{padding:"12px 16px",borderBottom:`1px solid ${t.border}`}}>
-                              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8}}>
+                              <div style={{display:"grid",gridTemplateColumns:isMobile?"repeat(2,1fr)":"repeat(4,1fr)",gap:8}}>
                                 {[["Protein",alt.protein,"g","#3d6b99"],["Sugars",alt.sugars,"g",tlColor("sugars",alt.sugars)],["Fibre",alt.fiber,"g","#2e7d52"],["Fat",alt.fat,"g",tlColor("fat",alt.fat)]].map(([label,val,unit,col])=>(
                                   <div key={label} style={{textAlign:"center",padding:"8px 4px",background:t.bgSub,borderRadius:7}}>
                                     <div style={{fontSize:9,color:t.textMuted,marginBottom:3,fontWeight:500}}>{label}</div>

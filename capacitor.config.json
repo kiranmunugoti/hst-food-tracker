@@ -1,0 +1,9 @@
+{
+  "appId": "com.hst.foodtracker",
+  "appName": "HST Food Safety",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "server": { "androidScheme": "https" },
+  "ios": { "contentInset": "always" },
+  "android": { "allowMixedContent": false }
+}
