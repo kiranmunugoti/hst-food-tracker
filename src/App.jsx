@@ -890,7 +890,7 @@ async function fetchOFFAlternatives(categories, excludeName) {
     .map(p => {
       const n = p.nutriments || {}; const sg = n["sugars_100g"]; const fb = n["fiber_100g"];
       return {
-        name: p.product_name.trim(), brand: (p.brands || "").split(",")[0].trim() || null,
+        name: asText(p.product_name).trim(), brand: asText(p.brands).split(",")[0].trim() || null,
         reason: `Nutri-Score ${(p.nutriscore_grade || "a").toUpperCase()} option in the same category${sg != null ? ` with ${fmt(Number(sg))}g sugars per 100g` : ""}.`,
         improvements: [sg != null && sg < 5 ? "Low sugar" : null, fb != null && fb > 3 ? "High fibre" : null, "Better Nutri-Score"].filter(Boolean),
         nutriScore: p.nutriscore_grade || "a", sourceUrl: null, sourceName: "Open Food Facts",
@@ -917,7 +917,7 @@ async function fetchOFFCalorieAlts(kcal) {
         const sg = num("sugars_100g"), fb = num("fiber_100g"), pr = num("proteins_100g"), ft = num("fat_100g");
         out.push({
           name: nm, calories: Math.round(Number(e)), caloriesPer: "100g",
-          brand: (p.brands || "").split(",")[0].trim() || null, category: c.replace("en:", ""),
+          brand: asText(p.brands).split(",")[0].trim() || null, category: c.replace("en:", ""),
           protein: pr, sugars: sg, fiber: fb, fat: ft,
           whyBetter: `Nutri-Score A whole-food option at ${Math.round(Number(e))} kcal per 100g.`,
           benefits: [fb != null && fb > 3 ? "High fibre" : null, sg != null && sg < 5 ? "Low sugar" : null, pr != null && pr > 5 ? "Protein source" : null].filter(Boolean),
@@ -1182,6 +1182,45 @@ async function offSearchLegacy(terms, limit, domain = DOMAIN) {
   return (d.products || []).filter(p => p.product_name);
 }
 
+// OFF's v2 API returns text fields as comma-separated strings; Search-a-licious
+// returns several of the same fields as ARRAYS. `asText(p.brands).split(",")`
+// keeps an array (arrays are truthy) and then throws "split is not a function",
+// so every hit from the search index is coerced to the v2 shape at the source
+// boundary — one place, rather than guarding every consumer.
+function asText(v) {
+  if (v == null) return "";
+  if (Array.isArray(v)) return v.filter(x => x != null).join(",");
+  return String(v);
+}
+function asList(v) {
+  if (v == null) return [];
+  if (Array.isArray(v)) return v;
+  return String(v).split(",").map(x => x.trim()).filter(Boolean);
+}
+
+// Coerces a Search-a-licious hit into the exact shape parseOFF and the pickers
+// expect from the v2 API.
+function normalizeHit(p) {
+  if (!p || typeof p !== "object") return p;
+  return {
+    ...p,
+    product_name:     asText(p.product_name) || asText(p.product_name_en),
+    brands:           asText(p.brands),
+    quantity:         asText(p.quantity),
+    serving_size:     asText(p.serving_size),
+    ingredients_text: asText(p.ingredients_text),
+    image_url:        typeof p.image_url === "string" ? p.image_url : (p.image_url?.[0] || null),
+    nutriscore_grade: asText(p.nutriscore_grade).toLowerCase() || null,
+    ecoscore_grade:   asText(p.ecoscore_grade).toLowerCase() || null,
+    nova_group:       p.nova_group == null ? null : Number(asText(p.nova_group)) || null,
+    additives_tags:   asList(p.additives_tags),
+    allergens_tags:   asList(p.allergens_tags),
+    labels_tags:      asList(p.labels_tags),
+    categories_tags:  asList(p.categories_tags),
+    nutriments:       (p.nutriments && typeof p.nutriments === "object") ? p.nutriments : {},
+  };
+}
+
 // Search-a-licious — OFF's Elasticsearch-backed replacement for search.pl.
 // It accepts the same `fields` list, so candidates come back fully populated
 // in ONE request; no per-result product lookup, which keeps the request budget
@@ -1194,7 +1233,7 @@ async function offSearchSAL(terms, limit) {
     if (e instanceof OffNotFound) return [];
     throw e;
   }
-  return (d.hits || []).filter(p => p.product_name);
+  return (d.hits || []).map(normalizeHit).filter(p => p.product_name);
 }
 
 async function offSearch(terms, limit, domain = DOMAIN) {
@@ -1351,7 +1390,7 @@ async function foodSearchMerged(terms, limit) {
   const keysOf = (p) => {
     const k = [];
     if (p.code) k.push("c:" + String(p.code).replace(/^0+/, ""));
-    k.push("n:" + norm(p.product_name) + "|" + norm((p.brands || "").split(",")[0]));
+    k.push("n:" + norm(p.product_name) + "|" + norm(asText(p.brands).split(",")[0]));
     return k;
   };
   const out = [];
@@ -1452,7 +1491,7 @@ async function filterSearch(params, domain, limit = 12) {
     if (q) {
       try {
         const d = await offJson(`${OFF_SEARCH_HOST}/search?q=${encodeURIComponent(q)}&page_size=${limit}&fields=code,${OFF_FIELDS}`);
-        const hits = (d.hits || []).filter(p => p.product_name);
+        const hits = (d.hits || []).map(normalizeHit).filter(p => p.product_name);
         if (hits.length) return { products: hits, count: d.count ?? hits.length };
       } catch { /* fall through to the legacy endpoint */ }
     }
@@ -1625,8 +1664,8 @@ async function cloudSearch(query) {
       applied, domain,
       count,
       products: products.slice(0, 8).map(p => ({
-        name: p.product_name.trim(),
-        brand: (p.brands || "").split(",")[0].trim() || null,
+        name: asText(p.product_name).trim(),
+        brand: asText(p.brands).split(",")[0].trim() || null,
         nutriScore: p.nutriscore_grade || null,
         nova: p.nova_group || null,
         raw: p,
@@ -1729,25 +1768,27 @@ function parseOFF(p) {
   const n = p.nutriments || {};
   const g = (...keys) => { for (const k of keys) { if (n[k] != null && n[k] !== "") return Number(n[k]); } return null; };
   return {
-    name: p.product_name || "Unknown",
+    name: asText(p.product_name) || "Unknown",
     // Which database this record came from, carried through so the result card
     // and the cache both stay honest about provenance.
     source: p._source || "off",
-    brand: (p.brands || "").split(",")[0].trim() || null,
+    brand: asText(p.brands).split(",")[0].trim() || null,
     // OFF often lists several, e.g. "Maggi,Nestlé" — keep them all rather than
     // discarding the owning company after the first comma
-    brands: (p.brands || "").split(",").map(b => b.trim()).filter(Boolean),
+    brands: asText(p.brands).split(",").map(b => b.trim()).filter(Boolean),
     image: p.image_url || null,
     quantity: p.quantity || null,
     servingSize: p.serving_size || null,
-    nutriScore: p.nutriscore_grade?.toLowerCase() || null,
+    nutriScore: asText(p.nutriscore_grade).toLowerCase() || null,
     novaGroup: p.nova_group ? Number(p.nova_group) : null,
-    ecoScore: p.ecoscore_grade?.toLowerCase() || null,
-    ingredients: p.ingredients_text || null,
-    additives: (p.additives_tags || []).map(a => a.replace(/^en:/, "")),
-    allergens: (p.allergens_tags || []).map(a => a.replace(/^en:/, "")),
-    labels: (p.labels_tags || []).map(l => l.replace(/^en:/, "")),
-    categories: (p.categories_tags || []).slice(0, 3).map(c => c.replace(/^en:/, "")),
+    ecoScore: asText(p.ecoscore_grade).toLowerCase() || null,
+    ingredients: asText(p.ingredients_text) || null,
+    // asList + String(): a tag list can arrive as an array, a comma string, or
+    // with non-string members depending on the source.
+    additives: asList(p.additives_tags).map(a => String(a).replace(/^en:/, "")),
+    allergens: asList(p.allergens_tags).map(a => String(a).replace(/^en:/, "")),
+    labels: asList(p.labels_tags).map(l => String(l).replace(/^en:/, "")),
+    categories: asList(p.categories_tags).slice(0, 3).map(c => String(c).replace(/^en:/, "")),
     nut: {
       energy_kcal: g("energy-kcal_100g","energy-kcal"),
       fat:         g("fat_100g"),
@@ -3958,7 +3999,7 @@ export default function App() {
                 </div>}
               {!loading && (list || []).map((p, i) => {
                 const ns = p.nutriscore_grade;
-                const brand = (p.brands || "").split(",")[0].trim();
+                const brand = asText(p.brands).split(",")[0].trim();
                 return (
                   <button key={i} onClick={() => scanCandidate(p)} style={{textAlign:"left",background:t.surface,border:`1.5px solid ${t.border}`,borderRadius:10,padding:"11px 13px",cursor:"pointer",display:"flex",gap:12,alignItems:"center",width:"100%"}}>
                     {p.image_url
