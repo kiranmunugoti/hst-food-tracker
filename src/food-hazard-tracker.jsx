@@ -1094,25 +1094,70 @@ const hostFor     = (d) => (d === "cosmetics" ? OBF_HOST : OFF_HOST);
 const domainHost  = () => hostFor(DOMAIN);
 const domainLabel = () => (DOMAIN === "cosmetics" ? "Open Beauty Facts" : "Open Food Facts");
 
+// A 404 from OFF is a real answer — "no such product" — not a failure to
+// reach OFF. Conflating the two is what made an unknown barcode report as
+// "unreachable", so the two cases are separate types from here down.
+class OffNotFound extends Error {
+  constructor(url) { super("Not in database"); this.name = "OffNotFound"; this.url = url; }
+}
+
+// Reads the body once and only accepts it as JSON. When /api/off does not
+// exist (vite dev, artifact preview, a static host with no functions) the
+// request resolves 200 with index.html, which must not be mistaken for data.
+async function readJson(r) {
+  const text = await r.text();
+  const ct = r.headers.get("content-type") || "";
+  if (!ct.includes("json") && /^\s*</.test(text)) throw new Error("Non-JSON response (no /api/off on this host)");
+  try { return JSON.parse(text); } catch { throw new Error("Malformed JSON response"); }
+}
+
 async function offJson(url) {
   let directErr = null;
   try {
     const r = await fetch(url);
+    if (r.status === 404) throw new OffNotFound(url);
     if (!r.ok) throw new Error("HTTP " + r.status);
-    return await r.json();
-  } catch (e) { directErr = e; }
-  const r = await fetch(`/api/off?url=${encodeURIComponent(url)}`);
-  if (!r.ok) throw directErr || new Error("proxy HTTP " + r.status);
-  return r.json();
+    return await readJson(r);
+  } catch (e) {
+    // A 404 is authoritative — the proxy would only fetch the same 404 again,
+    // and retrying it would burn a request against the rate limit for nothing.
+    if (e instanceof OffNotFound) throw e;
+    directErr = e;
+  }
+  try {
+    const r = await fetch(`/api/off?url=${encodeURIComponent(url)}`);
+    if (r.status === 404 || r.status === 403) throw new OffNotFound(url);
+    if (!r.ok) throw new Error("proxy HTTP " + r.status);
+    return await readJson(r);
+  } catch (e) {
+    if (e instanceof OffNotFound) throw e;
+    // Both routes failed at the transport layer — this is the genuine
+    // "unreachable" case, and the only one that should be reported as such.
+    throw directErr || e;
+  }
 }
 
 async function offGetByCode(code, domain = DOMAIN) {
-  const d = await offJson(`${hostFor(domain)}/api/v2/product/${code}.json?fields=${OFF_FIELDS}`);
+  let d;
+  try {
+    d = await offJson(`${hostFor(domain)}/api/v2/product/${code}.json?fields=${OFF_FIELDS}`);
+  } catch (e) {
+    if (e instanceof OffNotFound) return null;   // barcode simply isn't in this database
+    throw e;                                     // real network/CORS failure — let it count as blocked
+  }
+  // v2 also signals an unknown code as status 0 with HTTP 200.
+  if (d && d.status === 0) return null;
   return d.product?.product_name ? d.product : null;
 }
 
 async function offSearch(terms, limit, domain = DOMAIN) {
-  const d = await offJson(`${hostFor(domain)}/cgi/search.pl?search_terms=${encodeURIComponent(terms)}&search_simple=1&action=process&json=1&page_size=${limit}&fields=${OFF_FIELDS}`);
+  let d;
+  try {
+    d = await offJson(`${hostFor(domain)}/cgi/search.pl?search_terms=${encodeURIComponent(terms)}&search_simple=1&action=process&json=1&page_size=${limit}&fields=${OFF_FIELDS}`);
+  } catch (e) {
+    if (e instanceof OffNotFound) return [];   // searched fine, matched nothing
+    throw e;
+  }
   return (d.products || []).filter(p => p.product_name);
 }
 
@@ -1326,7 +1371,12 @@ async function resolveProduct(query, limit = 6) {
       const hit = await step(() => offGetByCode(q, d));
       if (hit) return finish(hit, [], d);
     }
-    return finish(null, [], guess || "food");
+    const out = finish(null, [], guess || "food");
+    // Every request succeeded and every database said "no such code". That is
+    // a gap in Open Food Facts, not a connectivity problem, and the advice the
+    // user needs is different — so it gets its own status.
+    if (_offStatus === "nomatch") _offStatus = "unknown-code";
+    return out;
   }
 
   // ── Name search: first database that returns anything wins. ──
@@ -1643,11 +1693,17 @@ function brandHistory(brand) {
   const recs = Object.values(_ghDb.products || {}).filter(p =>
     brandChain(p.offData).some(b => b.toLowerCase().trim() === bl || (ratingIdentity(b) || "").toLowerCase().trim() === bl));
   if (!recs.length) return null;
-  return {
+  // Same aggregate shape brandScoreOf expects, so the scan-time rating is
+  // identical to the one shown on the brand page — one scoring rule, not two.
+  const agg = {
     count: recs.length,
-    undeclared: recs.reduce((a, p) => a + undeclaredOf(p), 0),
     high: recs.filter(p => p.risk === "high").length,
+    medium: recs.filter(p => p.risk === "medium").length,
+    undeclared: recs.reduce((a, p) => a + undeclaredOf(p), 0),
+    ns: { a:0, b:0, c:0, d:0, e:0 },
   };
+  recs.forEach(p => { const g = p.offData?.nutriScore; if (g && agg.ns[g] != null) agg.ns[g]++; });
+  return { ...agg, ...brandScoreOf(agg) };
 }
 
 let _searchFlushTimer = null;
@@ -2624,15 +2680,26 @@ export default function App() {
     showEntry(entry, key);
 
     if (a.offData) toast("off", `Found "${name}" on Open Food Facts.`);
-    else toast("scan", _offStatus === "network"
-      ? "Open Food Facts is unreachable from this browser. The analysis is name-based only — press ↻ to retry."
-      : `No Open Food Facts match for "${label}". The analysis is name-based only; nothing was cached, so ↻ retries fresh.`);
+    else if (_offStatus === "network") toast("scan",
+      `${domainLabel()} is unreachable from this browser. The analysis is name-based only — press ↻ to retry.`);
+    else if (_offStatus === "unknown-code") toast("scan",
+      `Barcode ${label} reached ${domainLabel()} but is not in the database yet — a lot of regional products are missing. Search the product by name instead, or add the barcode at openfoodfacts.org to cover it for everyone.`);
+    else toast("scan",
+      `No ${domainLabel()} match for "${label}". The analysis is name-based only; nothing was cached, so ↻ retries fresh.`);
 
     if (a.risk === "high") toast("high", `High risk: ${a.allSubs.filter(s=>s.risk==="high").map(s=>s.name).slice(0,2).join(", ")}.`);
     else if (a.risk === "medium") toast("medium", "Medium risk substances detected.");
 
     if (a.undeclared.length > 0) toast("undeclared", `${a.offData?.brand ? a.offData.brand + " — " : ""}"${name}" may contain ${a.undeclared.length} substance${a.undeclared.length!==1?"s":""} not listed on the label: ${a.undeclared.map(s=>s.name).slice(0,3).join(", ")}.`);
-    if (history && (history.undeclared > 0 || history.high >= 2)) toast("brand", `${a.offData.brand}: ${history.undeclared > 0 ? `${history.undeclared} undeclared-substance report${history.undeclared!==1?"s":""}` : `${history.high} high-risk products`} across ${history.count} product${history.count!==1?"s":""} in the shared database.`);
+    if (history) {
+      // The rating is shown for every brand with any prior record, not only
+      // bad ones — a brand with a clean record is information too. The record
+      // it is based on is stated so the number is never taken on faith.
+      const parts = [];
+      if (history.undeclared > 0) parts.push(`${history.undeclared} undeclared-substance report${history.undeclared!==1?"s":""}`);
+      if (history.high > 0) parts.push(`${history.high} high-risk product${history.high!==1?"s":""}`);
+      toast("brand", `${a.offData.brand} — brand rating ${history.score}/10 (${history.verdict}), based on ${history.count} product${history.count!==1?"s":""} in the shared database${parts.length ? `: ${parts.join(", ")}` : " with nothing flagged"}.`);
+    }
 
     const sugar = a.offData?.nut?.sugars ?? a.aiSugarData?.total_sugars ?? null;
     if (sugar != null && sugar > 22.5) toast("sugar", `High sugar: ${sugar}g per 100g.`);
