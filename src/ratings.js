@@ -356,17 +356,166 @@ export function summariseReviews(reviews = []) {
   };
 }
 
+// ─── 5. PERSONAL SENSITIVITY ───────────────────────────────────────────────────
+// "Organic" is a claim about how an ingredient was farmed, not about whether a
+// given person can tolerate it. Sulphites in organic wine still trigger asthma;
+// organic cashews still cause anaphylaxis. CSPI encodes part of this in its
+// "Certain people should avoid" tier — an additive that is fine for most people
+// and genuinely dangerous for some.
+//
+// A single population-level score cannot express that, because the honest
+// answer differs per person. So sensitivity is a PROFILE the reader sets, and
+// the product is checked against it. Nobody's score is adjusted; the reader is
+// told what is in the product that matters to them specifically.
+export const SENSITIVITY_GROUPS = {
+  sulphites: {
+    label: "Sulphites", note: "Can trigger severe asthma attacks.",
+    additives: ["e220","e221","e222","e223","e224","e225","e226","e227","e228"],
+    allergens: ["sulphur-dioxide-and-sulphites"],
+    ingredients: /sulph?ite|sulfur dioxide|metabisulph?ite/i,
+  },
+  glutamates: {
+    label: "MSG / glutamates", note: "Headache and flushing in sensitive people.",
+    additives: ["e620","e621","e622","e623","e624","e625","e627","e631","e635"],
+    ingredients: /monosodium glutamate|\bmsg\b|glutamate|yeast extract/i,
+  },
+  dyes: {
+    label: "Artificial colours", note: "Linked to hyperactivity in children; allergic reactions.",
+    additives: ["e102","e104","e110","e122","e123","e124","e127","e129","e131","e132","e133","e142","e151"],
+    ingredients: /tartrazine|allura red|sunset yellow|brilliant blue|carmoisine|ponceau/i,
+  },
+  benzoates: {
+    label: "Benzoates", note: "Can worsen asthma and urticaria in sensitive people.",
+    additives: ["e210","e211","e212","e213"],
+    ingredients: /benzoate|benzoic acid/i,
+  },
+  nitrites: {
+    label: "Nitrites / nitrates", note: "Migraine trigger; nitrosamine formation in cured meat.",
+    additives: ["e249","e250","e251","e252"],
+    ingredients: /sodium nitrite|potassium nitrate|curing salt/i,
+  },
+  polyols: {
+    label: "Polyols / sugar alcohols", note: "Laxative effect; a common IBS trigger.",
+    additives: ["e420","e421","e953","e965","e966","e967","e968"],
+    ingredients: /sorbitol|mannitol|maltitol|xylitol|isomalt|erythritol/i,
+  },
+  carrageenan: {
+    label: "Carrageenan", note: "Associated with intestinal inflammation.",
+    additives: ["e407","e407a"],
+    ingredients: /carrageenan/i,
+  },
+  carmine: {
+    label: "Carmine / cochineal", note: "Rare but severe allergic reactions; not vegetarian.",
+    additives: ["e120"],
+    ingredients: /carmine|cochineal|carminic/i,
+  },
+  gluten: {
+    label: "Gluten", note: "Coeliac disease and non-coeliac sensitivity.",
+    allergens: ["gluten"],
+    ingredients: /wheat|barley|rye|spelt|semolina|malt extract/i,
+  },
+  lactose: {
+    label: "Milk / lactose", note: "Lactose intolerance and milk protein allergy.",
+    allergens: ["milk"],
+    ingredients: /milk|lactose|whey|casein|butter|cream/i,
+  },
+  nuts: {
+    label: "Tree nuts & peanuts", note: "Anaphylaxis risk.",
+    allergens: ["nuts","peanuts","tree-nuts"],
+    ingredients: /peanut|almond|cashew|walnut|hazelnut|pistachio|pecan|macadamia/i,
+  },
+  soy: {
+    label: "Soy", note: "Allergy; also present as lecithin.",
+    allergens: ["soybeans","soy"],
+    ingredients: /soy|soya|edamame/i,
+  },
+  caffeine: {
+    label: "Caffeine", note: "Palpitations, insomnia; relevant in pregnancy.",
+    ingredients: /caffeine|guarana|coffee|green tea extract/i,
+  },
+  salicylates: {
+    label: "Salicylates", note: "Intolerance overlaps with aspirin sensitivity.",
+    ingredients: /salicylate|methyl salicylate|willow bark/i,
+  },
+};
+
+// Checks one product against a reader's declared sensitivities.
+// `profile` is an array of SENSITIVITY_GROUPS keys.
+export function personalAlerts({ additives = [], allergens = [], ingredients = "", labels = [] } = {}, profile = []) {
+  const addKeys = additives.map(additiveKey);
+  const allergenSet = new Set(allergens.map(a => String(a).toLowerCase().replace(/^en:/, "")));
+  const text = String(ingredients || "");
+
+  const hits = [];
+  for (const key of profile) {
+    const g = SENSITIVITY_GROUPS[key];
+    if (!g) continue;
+    const matched = [];
+
+    (g.additives || []).forEach(a => { if (addKeys.includes(a)) matched.push(a.toUpperCase()); });
+    (g.allergens || []).forEach(a => { if (allergenSet.has(a)) matched.push(a); });
+    if (g.ingredients && text && g.ingredients.test(text)) matched.push("named in ingredients");
+
+    if (matched.length) hits.push({ key, label: g.label, note: g.note, matched: [...new Set(matched)] });
+  }
+
+  // Organic / natural labelling is checked explicitly, because it is the claim
+  // most likely to be misread as "safe for me". It is not — it constrains
+  // farming method, not tolerability.
+  const claimsNatural = labels.some(l => /organic|bio|natural|clean/i.test(String(l)));
+
+  return {
+    hits,
+    clear: hits.length === 0,
+    // Only meaningful when the reader has actually declared something.
+    checked: profile.length > 0,
+    misleadingClaim: claimsNatural && hits.length > 0,
+  };
+}
+
+// ─── 6. COMMUNITY-REPORTED COMPOSITION ─────────────────────────────────────────
+// Additives readers transcribe from a physical label are shown separately from
+// the source data and do NOT move the safety score. A label transcription is
+// plausible but unverified, and one person's reading should not silently
+// re-rate a product for everyone. What it CAN do is show what the score would
+// be if confirmed, which is information without being an assertion.
+export function communityComposition(sourceAdditives = [], reportedAdditives = []) {
+  const known = new Set(sourceAdditives.map(additiveKey));
+  const novel = [...new Set(reportedAdditives.map(additiveKey))].filter(k => !known.has(k));
+  if (!novel.length) return { reported: [], wouldBe: null, count: 0 };
+
+  const combined = cspiAssess([...sourceAdditives, ...novel]);
+  const current = cspiAssess(sourceAdditives);
+
+  return {
+    reported: novel.map(k => ({ additive: k, ...(cspiTier(k) || { tier: null, name: k, why: "Not in the curated CSPI subset." }) })),
+    count: novel.length,
+    wouldBe: combined.score,
+    current: current.score,
+    // Stated rather than acted on, so the reader decides what to make of it.
+    delta: Math.round((combined.score - current.score) * 10) / 10,
+  };
+}
+
 // ─── COMBINED VIEW ─────────────────────────────────────────────────────────────
 // Returns the three scores side by side. Deliberately NOT a single number:
 // combining safety with taste would let a well-reviewed product mask a
 // composition problem, which is the failure mode this app exists to prevent.
-export function productRatings({ additives = [], accolades = [], reviews = [] } = {}) {
+export function productRatings({
+  additives = [], accolades = [], reviews = [],
+  reportedAdditives = [], allergens = [], ingredients = "", labels = [],
+  profile = [],
+} = {}) {
+  // Safety is computed from SOURCE data only. Reader-reported additives are
+  // reported alongside it, never folded into it.
   const safety = cspiAssess(additives);
   const expert = aggregateAccolades(accolades);
   const community = summariseReviews(reviews);
+  const reported = communityComposition(additives, reportedAdditives);
+  const personal = personalAlerts({ additives, allergens, ingredients, labels }, profile);
+
   return {
-    safety, expert, community,
-    // The headline stays safety-led. Quality and opinion sit alongside it.
-    headline: { score: safety.score, basis: "CSPI Chemical Cuisine additive tiers" },
+    safety, expert, community, reported, personal,
+    headline: { score: safety.score, basis: "CSPI Chemical Cuisine additive tiers (source data only)" },
   };
 }

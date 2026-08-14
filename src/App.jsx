@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { productRatings, addReview, CSPI_TIERS, ACCOLADE_SOURCES, normalizeScore } from "./ratings.js";
+import { productRatings, addReview, CSPI_TIERS, SENSITIVITY_GROUPS } from "./ratings.js";
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────────
 // The shared scan database lives in its OWN repository, separate from this
@@ -1484,15 +1484,17 @@ function salQueryFrom(params) {
 }
 
 // Returns raw product records (OFF shape) for a set of filter params.
-async function filterSearch(params, domain, limit = 12) {
+async function filterSearch(params, domain, limit = 12, page = 1) {
   // Search-a-licious indexes food only — Open Beauty Facts has no equivalent.
   if (domain !== "cosmetics") {
     const q = salQueryFrom(params);
     if (q) {
       try {
-        const d = await offJson(`${OFF_SEARCH_HOST}/search?q=${encodeURIComponent(q)}&page_size=${limit}&fields=code,${OFF_FIELDS}`);
+        const d = await offJson(`${OFF_SEARCH_HOST}/search?q=${encodeURIComponent(q)}&page_size=${limit}&page=${page}&fields=code,${OFF_FIELDS}`);
         const hits = (d.hits || []).map(normalizeHit).filter(p => p.product_name);
-        if (hits.length) return { products: hits, count: d.count ?? hits.length };
+        // An empty page beyond the first is a legitimate end-of-results, not a
+        // failure — returning it stops the caller falling back and re-fetching.
+        if (hits.length || page > 1) return { products: hits, count: d.count ?? hits.length, page };
       } catch { /* fall through to the legacy endpoint */ }
     }
   }
@@ -1500,11 +1502,12 @@ async function filterSearch(params, domain, limit = 12) {
     ...params,
     fields: OFF_FIELDS,
     page_size: String(limit),
+    page: String(page),
     sort_by: "unique_scans_n",
   }).toString();
   const d = await offJson(`${hostFor(domain)}/api/v2/search?${qs}`);
-  const products = (d.products || []).filter(p => p.product_name);
-  return { products, count: d.count ?? products.length };
+  const products = (d.products || []).map(normalizeHit).filter(p => p.product_name);
+  return { products, count: d.count ?? products.length, page };
 }
 
 // ─── CLOUD DISCOVERY ───────────────────────────────────────────────────────────
@@ -1628,7 +1631,7 @@ const CLOUD_FILTERS = [
 // organic AND searches for biscuits, rather than returning organic anything.
 const FILTER_STOPWORDS = /\b(products?|foods?|items?|things?|with|without|no|good|bad|best|worst|show|find|list|me|the|a|an|and|or|in|of|that|are|is|free|which|what|any)\b/gi;
 
-async function cloudSearch(query) {
+async function cloudSearch(query, page = 1) {
   const q = String(query || "");
   const matched = CLOUD_FILTERS.filter(f => f.m.test(q));
   if (!matched.length) return null;
@@ -1659,11 +1662,15 @@ async function cloudSearch(query) {
 
 
   try {
-    const { products, count } = await filterSearch(params, domain, 12);
+    const PAGE_SIZE = 12;
+    const { products, count } = await filterSearch(params, domain, PAGE_SIZE, page);
     return {
-      applied, domain,
+      applied, domain, params, page,
       count,
-      products: products.slice(0, 8).map(p => ({
+      // More pages exist if this page came back full. Using the reported total
+      // alone is unreliable — the two backends count differently.
+      hasMore: products.length >= PAGE_SIZE,
+      products: products.map(p => ({
         name: asText(p.product_name).trim(),
         brand: asText(p.brands).split(",")[0].trim() || null,
         nutriScore: p.nutriscore_grade || null,
@@ -1676,8 +1683,8 @@ async function cloudSearch(query) {
     console.warn("cloudSearch:", e);
     // Carry the reason forward. Swallowing it into a bare failed flag is what
     // made a dead endpoint indistinguishable from an empty catalogue.
-    return { applied, domain, count: 0, products: [], failed: true,
-             error: String(e?.message || e) };
+    return { applied, domain, params, page, count: 0, products: [], failed: true,
+             hasMore: false, error: String(e?.message || e) };
   }
 }
 
@@ -2123,6 +2130,125 @@ function validBarcodeChecksum(code) {
 // Camera overlay. Streams the rear camera, decodes continuously, and calls
 // onDetect with the first checksum-valid barcode. Always stops the stream on
 // unmount — a live camera left running is both a privacy and battery problem.
+// Contrast-boosts a bitmap for a second decode attempt: grayscale, then hard
+// black/white. Barcodes are binary by nature, so thresholding sharpens the bar
+// edges a faded or badly-lit photo blurs.
+//
+// The scale factor is capped by total pixels, NOT fixed at 2x. ImageCapture
+// returns the sensor's full resolution — a 12MP photo upscaled 2x is a 186 MB
+// canvas and a 48MP one is 732 MB, which throws or gets the tab killed on a
+// phone. Small frames still get the upscale that helps them; large ones are
+// already detailed enough and are only thresholded.
+const MAX_DECODE_PIXELS = 12e6;
+
+// Draws a bitmap through a transform, returning a new bitmap. Used to retry a
+// failed decode at a different orientation or crop rather than giving up.
+async function transformBitmap(bitmap, { rotate = 0, crop = null, scale = 1 } = {}) {
+  const src = crop
+    ? { x: bitmap.width * crop.x, y: bitmap.height * crop.y,
+        w: bitmap.width * crop.w, h: bitmap.height * crop.h }
+    : { x: 0, y: 0, w: bitmap.width, h: bitmap.height };
+
+  const swap = rotate === 90 || rotate === 270;
+  const outW = Math.round((swap ? src.h : src.w) * scale);
+  const outH = Math.round((swap ? src.w : src.h) * scale);
+
+  const c = document.createElement("canvas");
+  c.width = outW; c.height = outH;
+  const ctx = c.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+  ctx.translate(outW / 2, outH / 2);
+  ctx.rotate((rotate * Math.PI) / 180);
+  ctx.drawImage(bitmap, src.x, src.y, src.w, src.h,
+    -(src.w * scale) / 2, -(src.h * scale) / 2, src.w * scale, src.h * scale);
+  return createImageBitmap(c);
+}
+
+// The decode ladder. A single failed attempt says almost nothing — decoders
+// fail for different reasons, so each rung addresses a different cause:
+//
+//   1. plain          — the common case
+//   2. contrast       — faded print, poor light
+//   3. rotations      — a barcode read sideways or upside down; the native
+//                       detector is orientation-sensitive in practice
+//   4. centre crop    — background clutter, or the code small in a wide frame
+//   5. second decoder — ZXing uses a different algorithm to BarcodeDetector,
+//                       so it succeeds on images the native one rejects
+//
+// Only after ALL of these fail is the image genuinely unreadable — and then
+// the still is kept rather than discarded, so the reader can type the digits
+// they can plainly see.
+async function decodeLadder(bitmap, detector, onProgress) {
+  const attempts = [
+    ["reading", async () => bitmap],
+    ["boosting contrast", async () => enhanceForDecode(bitmap)],
+    ["rotating 90°", async () => transformBitmap(bitmap, { rotate: 90 })],
+    ["rotating 270°", async () => transformBitmap(bitmap, { rotate: 270 })],
+    ["rotating 180°", async () => transformBitmap(bitmap, { rotate: 180 })],
+    ["zooming in", async () => enhanceForDecode(await transformBitmap(bitmap, { crop: { x: 0.1, y: 0.25, w: 0.8, h: 0.5 } }))],
+
+    // Horizontal bands. A barcode wrapped round a bottle is curved, so the bars
+    // are only parallel across a narrow strip — the full-height image never
+    // decodes, but a single band often does. Three bands cover the code sitting
+    // high, centred or low in the frame.
+    ["scanning upper band", async () => enhanceForDecode(await transformBitmap(bitmap, { crop: { x: 0.05, y: 0.20, w: 0.9, h: 0.22 } }))],
+    ["scanning middle band", async () => enhanceForDecode(await transformBitmap(bitmap, { crop: { x: 0.05, y: 0.40, w: 0.9, h: 0.22 } }))],
+    ["scanning lower band", async () => enhanceForDecode(await transformBitmap(bitmap, { crop: { x: 0.05, y: 0.60, w: 0.9, h: 0.22 } }))],
+
+    // Narrow centre strip at high magnification — the last resort for a code
+    // that is simply small in the frame.
+    ["magnifying centre", async () => enhanceForDecode(await transformBitmap(bitmap, { crop: { x: 0.25, y: 0.38, w: 0.5, h: 0.24 }, scale: 3 }))],
+  ];
+
+  if (detector) {
+    for (const [label, make] of attempts) {
+      onProgress?.(label);
+      try {
+        const found = await detector.detect(await make());
+        if (found?.length) return { code: found[0].rawValue, via: label };
+      } catch { /* next rung */ }
+    }
+  }
+
+  // Different decoder, same image. This is the rung that most often rescues a
+  // still the native detector has already refused.
+  onProgress?.("trying a second decoder");
+  try {
+    const ZX = await loadZXing();
+    const c = document.createElement("canvas");
+    c.width = bitmap.width; c.height = bitmap.height;
+    c.getContext("2d").drawImage(bitmap, 0, 0);
+    const res = await new ZX.BrowserMultiFormatReader()
+      .decodeFromImageUrl(c.toDataURL("image/png")).catch(() => null);
+    const txt = res?.getText?.();
+    if (txt) return { code: txt, via: "second decoder" };
+  } catch { /* exhausted */ }
+
+  return null;
+}
+
+async function enhanceForDecode(bitmap) {
+  const base = bitmap.width * bitmap.height;
+  const scale = base * 4 <= MAX_DECODE_PIXELS ? 2 : base <= MAX_DECODE_PIXELS ? 1 : Math.sqrt(MAX_DECODE_PIXELS / base);
+  const w = Math.max(1, Math.round(bitmap.width * scale));
+  const h = Math.max(1, Math.round(bitmap.height * scale));
+
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.imageSmoothingEnabled = false;      // keep bar edges hard
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const g = d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114;
+    const v = g > 128 ? 255 : 0;
+    d[i] = d[i+1] = d[i+2] = v;
+  }
+  ctx.putImageData(img, 0, 0);
+  return createImageBitmap(c);
+}
+
 function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
   const videoRef = useRef(null);
   const streamRef = useRef(null);
@@ -2130,7 +2256,25 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
   const [status, setStatus] = useState("starting");   // starting | scanning | error
   const [message, setMessage] = useState("");
   const [torchOn, setTorchOn] = useState(false);
+  const detectorRef  = useRef(null);   // BarcodeDetector, reused for file decode
+  const capturingRef = useRef(false);  // guards overlapping capture attempts
+  const captureNowRef = useRef(null);  // manual "Capture" action, set once scanning starts
+  const fileRef      = useRef(null);
+  // When every decode strategy fails the still is KEPT, not discarded. The
+  // digits are printed under the barcode and a person can read them when no
+  // decoder can — throwing the image away wastes the one capture that worked.
+  const [failedShot, setFailedShot] = useState(null);   // { url, typed }
+  const [typedCode, setTypedCode]   = useState("");
   const [canTorch, setCanTorch] = useState(false);
+  // Optical/digital zoom. This is the fix for a small barcode: a phone camera
+  // cannot focus closer than roughly 10 cm, so moving in to fill the frame just
+  // produces a blurred image. Zooming keeps the lens at a distance it can focus
+  // at while making the code occupy far more pixels — which is what the decoder
+  // actually needs. It is not the same as cropping: zoom happens at the sensor,
+  // so it adds real detail rather than enlarging what is already lost.
+  const [trackInfo, setTrackInfo] = useState(null);
+  const [zoomCaps, setZoomCaps] = useState(null);   // { min, max, step }
+  const [zoom, setZoom] = useState(1);
 
   useEffect(() => {
     stopRef.current = false;
@@ -2185,7 +2329,23 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
       }
       // Torch is only available on some Android devices
       const track = stream.getVideoTracks()[0];
-      setCanTorch(!!track?.getCapabilities?.().torch);
+      // What the camera ACTUALLY granted, which is often not what was asked
+      // for. A track that fell back to 640x480 explains a failure that no
+      // amount of retrying or zooming will fix, so it is reported rather than
+      // assumed.
+      const st = track?.getSettings?.() || {};
+      setTrackInfo({
+        w: st.width || 0, h: st.height || 0,
+        fps: Math.round(st.frameRate || 0),
+        focus: st.focusMode || "unknown",
+        downgraded: (st.width || 0) < 1280,
+      });
+      const caps = track?.getCapabilities?.() || {};
+      setCanTorch(!!caps.torch);
+      if (caps.zoom && caps.zoom.max > caps.zoom.min) {
+        setZoomCaps({ min: caps.zoom.min, max: caps.zoom.max, step: caps.zoom.step || 0.1 });
+        setZoom(caps.zoom.min);
+      }
       setStatus("scanning");
 
       // Some real barcodes never pass a checksum — ITF-14 cases, worn or
@@ -2209,6 +2369,42 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
         return false;
       };
 
+      // ── Still capture ──
+      // Live video decoding fights motion blur and a low preview resolution.
+      // A still is sharper: ImageCapture.takePhoto() returns the sensor's full
+      // resolution, several times the video track's. Decoding that still
+      // succeeds on labels the video loop never resolves — curved packaging,
+      // small print, poor light.
+      const captureStill = async () => {
+        const track = streamRef.current?.getVideoTracks?.()[0];
+        // Preferred: full-resolution photo. Chrome/Android only.
+        if (track && typeof window.ImageCapture === "function") {
+          try {
+            const blob = await new window.ImageCapture(track).takePhoto();
+            return await createImageBitmap(blob);
+          } catch { /* fall through to the canvas path */ }
+        }
+        // Fallback: the current video frame at its native size. Lower
+        // resolution than a photo, but still free of the preview's downscaling
+        // and works in Firefox and on iOS.
+        const v = videoRef.current;
+        if (!v?.videoWidth) return null;
+        const c = document.createElement("canvas");
+        c.width = v.videoWidth; c.height = v.videoHeight;
+        c.getContext("2d").drawImage(v, 0, 0);
+        return await createImageBitmap(c);
+      };
+
+      // Runs the full decode ladder over a still and reports progress.
+      const decodeStill = async (detector, bitmap) => {
+        if (!bitmap) return null;
+        const r = await decodeLadder(bitmap, detector, (step) => setMessage(`Captured — ${step}…`));
+        if (r) return r.code;
+        // Every strategy failed. Keep the image so the digits can be typed.
+        keepFailedShot(bitmap);
+        return null;
+      };
+
       if ("BarcodeDetector" in window) {
         try {
           const supported = await window.BarcodeDetector.getSupportedFormats?.() || BARCODE_FORMATS;
@@ -2217,9 +2413,13 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
           // each call queues behind the last and the preview stutters, which
           // makes it HARDER to hold the code steady. ~12/s decodes just as well
           // and leaves the camera responsive.
-          let lastRun = 0;
+          detectorRef.current = detector;
+
+          let lastRun = 0, started = 0, lastStill = 0, stills = 0;
           const tick = async (ts) => {
             if (stopRef.current || !videoRef.current) return;
+            if (!started) started = ts;
+
             if (ts - lastRun >= 80) {
               lastRun = ts;
               try {
@@ -2227,9 +2427,42 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
                 if (found?.length && handle(found[0].rawValue)) return;
               } catch {}
             }
+
+            // Automatic still capture. After a couple of seconds of live
+            // decoding getting nowhere, the video stream is not going to
+            // resolve this label — so grab a sharper still and decode that
+            // instead of continuing to loop. Repeats every 2s, up to 4 tries,
+            // which covers the user bringing the code into frame.
+            if (ts - started > 2000 && ts - lastStill > 2000 && stills < 4 && !capturingRef.current) {
+              lastStill = ts;
+              stills++;
+              capturingRef.current = true;
+              setMessage(`Auto-capturing a sharper photo (${stills}/4)…`);
+              try {
+                const code = await decodeStill(detector, await captureStill());
+                if (code && handle(code)) return;
+                setMessage(stills >= 4
+                  ? "Still no read. Hold the code flat and fill the frame, or use Capture / Choose photo below."
+                  : "Reading — keep the barcode in frame.");
+              } catch { /* keep the live loop running */ }
+              finally { capturingRef.current = false; }
+            }
+
             requestAnimationFrame(tick);
           };
           requestAnimationFrame(tick);
+          captureNowRef.current = async () => {
+            if (capturingRef.current) return;
+            capturingRef.current = true;
+            setMessage("Capturing…");
+            try {
+              const code = await decodeStill(detector, await captureStill());
+              if (code && handle(code)) return;
+              setMessage("No decoder could read that capture — type the digits below instead.");
+            } catch (e) {
+              setMessage("Capture failed: " + String(e?.message || e));
+            } finally { capturingRef.current = false; }
+          };
           return;
         } catch { /* fall through to ZXing */ }
       }
@@ -2241,6 +2474,27 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
         zxingControls = await reader.decodeFromVideoElement(videoRef.current, (result) => {
           if (result) handle(result.getText());
         });
+        // Capture must work on this path too (Firefox, older Safari), or the
+        // button would be present and silently do nothing.
+        captureNowRef.current = async () => {
+          if (capturingRef.current) return;
+          capturingRef.current = true;
+          setMessage("Capturing…");
+          try {
+            const v = videoRef.current;
+            if (!v?.videoWidth) throw new Error("Camera not ready");
+            const c = document.createElement("canvas");
+            c.width = v.videoWidth; c.height = v.videoHeight;
+            c.getContext("2d").drawImage(v, 0, 0);
+            const url = c.toDataURL("image/png");
+            const res = await reader.decodeFromImageUrl(url).catch(() => null);
+            const clean = String(res?.getText?.() || "").replace(/\D/g, "");
+            if (clean.length >= 8) { stopAll(); onDetect(clean); return; }
+            setMessage("No decoder could read that capture — type the digits below instead.");
+          } catch (e) {
+            setMessage("Capture failed: " + String(e?.message || e));
+          } finally { capturingRef.current = false; }
+        };
       } catch {
         setStatus("error");
         setMessage("The barcode reader could not be loaded. Check your connection, or type the number instead.");
@@ -2249,6 +2503,48 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
 
     return stopAll;
   }, [onDetect]);
+
+  function keepFailedShot(bitmap) {
+    try {
+      const c = document.createElement("canvas");
+      // Downscale for display only — the decode already happened at full size.
+      const scale = Math.min(1, 900 / Math.max(bitmap.width, bitmap.height));
+      c.width = Math.round(bitmap.width * scale);
+      c.height = Math.round(bitmap.height * scale);
+      c.getContext("2d").drawImage(bitmap, 0, 0, c.width, c.height);
+      setFailedShot({ url: c.toDataURL("image/jpeg", 0.85) });
+    } catch { /* display is a bonus, not a requirement */ }
+  }
+
+  // Decode a photo the user picked. Useful when the camera cannot hold focus,
+  // when the product is no longer to hand, or for a photo taken earlier.
+  async function decodeFile(file) {
+    if (!file) return;
+    setMessage("Reading the photo…");
+    try {
+      const bitmap = await createImageBitmap(file);
+      let detector = detectorRef.current;
+      if (!detector && "BarcodeDetector" in window) {
+        detector = new window.BarcodeDetector({ formats: BARCODE_FORMATS });
+      }
+      const found = await decodeLadder(bitmap, detector, (step) => setMessage(`Reading the photo — ${step}…`));
+      const code = found?.code || null;
+      if (!code) keepFailedShot(bitmap);
+
+      const clean = String(code || "").replace(/\D/g, "");
+      if (clean.length >= 8) { stopRef.current = true; onDetect(clean); return; }
+      setMessage("No decoder could read that image — the digits under the barcode can be typed below instead.");
+    } catch (e) {
+      setMessage("Could not read that photo: " + String(e?.message || e));
+    }
+  }
+
+  const applyZoom = async (z) => {
+    const track = streamRef.current?.getVideoTracks?.()[0];
+    if (!track) return;
+    setZoom(z);
+    try { await track.applyConstraints({ advanced: [{ zoom: z }] }); } catch { /* unsupported */ }
+  };
 
   const toggleTorch = async () => {
     const track = streamRef.current?.getVideoTracks?.()[0];
@@ -2291,8 +2587,79 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
         )}
       </div>
 
+      {/* Last resort: the capture that no decoder could read, shown at size so
+          the printed digits can be read off it. A person reading numerals is
+          more reliable than any of the rungs above, and the image is already
+          in hand — discarding it would have made the capture worthless. */}
+      {failedShot && (
+        <div style={{background:"#111",padding:"12px 16px",borderTop:"1px solid rgba(255,255,255,0.15)"}}>
+          <div style={{fontSize:11,color:"#fff",fontWeight:600,marginBottom:6}}>
+            Couldn’t decode this — type the number printed under the barcode
+          </div>
+          <img src={failedShot.url} alt="captured barcode"
+            style={{width:"100%",maxHeight:150,objectFit:"contain",background:"#000",borderRadius:8,marginBottom:8}}/>
+          <div style={{display:"flex",gap:8}}>
+            <input value={typedCode} onChange={e => setTypedCode(e.target.value.replace(/\D/g, ""))}
+              inputMode="numeric" placeholder="e.g. 8901234567890" maxLength={14}
+              style={{flex:1,boxSizing:"border-box",fontSize:14,padding:"10px 12px",borderRadius:8,
+                border:"1px solid rgba(255,255,255,0.3)",background:"rgba(255,255,255,0.1)",color:"#fff",
+                letterSpacing:"0.06em"}}/>
+            <button onClick={() => { if (typedCode.length >= 8) { stopRef.current = true; onDetect(typedCode); } }}
+              disabled={typedCode.length < 8}
+              style={{background:typedCode.length>=8?"#fff":"rgba(255,255,255,0.15)",border:"none",
+                color:typedCode.length>=8?"#000":"rgba(255,255,255,0.5)",padding:"10px 18px",borderRadius:8,
+                cursor:typedCode.length>=8?"pointer":"default",fontSize:13,fontWeight:700}}>
+              Search
+            </button>
+          </div>
+          <button onClick={() => { setFailedShot(null); setTypedCode(""); setMessage(""); }}
+            style={{marginTop:8,background:"none",border:"none",color:"rgba(255,255,255,0.6)",
+              fontSize:11,cursor:"pointer",padding:0,textDecoration:"underline"}}>
+            Dismiss and keep scanning
+          </button>
+        </div>
+      )}
+
+      {zoomCaps && status === "scanning" && (
+        <div style={{background:"#000",padding:"8px 18px 0",display:"flex",alignItems:"center",gap:10}}>
+          <span style={{fontSize:11,color:"rgba(255,255,255,0.75)",fontWeight:600,flexShrink:0}}>Zoom</span>
+          <input type="range" min={zoomCaps.min} max={zoomCaps.max} step={zoomCaps.step} value={zoom}
+            onChange={e => applyZoom(parseFloat(e.target.value))}
+            style={{flex:1,accentColor:"#fff"}}/>
+          <span style={{fontSize:11,color:"rgba(255,255,255,0.75)",minWidth:32,textAlign:"right"}}>{zoom.toFixed(1)}×</span>
+        </div>
+      )}
+      {trackInfo && status === "scanning" && (
+        <div style={{background:"#000",padding:"6px 18px 0",fontSize:10,
+                     color: trackInfo.downgraded ? "#ffb347" : "rgba(255,255,255,0.45)", lineHeight:1.5}}>
+          Camera: {trackInfo.w}×{trackInfo.h} @ {trackInfo.fps}fps · focus {trackInfo.focus}
+          {trackInfo.downgraded && " — your browser granted a low resolution, which is very likely the reason small barcodes fail here."}
+        </div>
+      )}
+      {status === "scanning" && (
+        <div style={{background:"#000",padding:"4px 18px 0",fontSize:10,color:"rgba(255,255,255,0.5)",lineHeight:1.5}}>
+          Small barcode? Hold at 15–20 cm and {zoomCaps ? "use zoom" : "keep steady"} — closer than ~10 cm the lens cannot focus, so it blurs.
+          Shiny or curved pack (bottles): turn the light OFF and tilt slightly — glare erases the bars faster than dimness does.
+        </div>
+      )}
+
       <div style={{padding:"14px 18px",background:"#000",display:"flex",gap:10,alignItems:"center",justifyContent:"space-between"}}>
-        <button onClick={onClose} style={{background:"rgba(255,255,255,0.15)",border:"1px solid rgba(255,255,255,0.3)",color:"#fff",padding:"11px 20px",borderRadius:9,cursor:"pointer",fontSize:13,fontWeight:600}}>Cancel</button>
+        <button onClick={onClose} style={{background:"rgba(255,255,255,0.15)",border:"1px solid rgba(255,255,255,0.3)",color:"#fff",padding:"11px 16px",borderRadius:9,cursor:"pointer",fontSize:13,fontWeight:600}}>Cancel</button>
+
+        {/* Manual capture: the user usually knows when the code is properly in
+            frame before the decoder does. */}
+        <button onClick={() => captureNowRef.current?.()} disabled={status !== "scanning"}
+          style={{background:"#fff",border:"none",color:"#000",padding:"11px 18px",borderRadius:9,
+            cursor:status==="scanning"?"pointer":"default",fontSize:13,fontWeight:700,opacity:status==="scanning"?1:0.5}}>
+          Capture
+        </button>
+
+        <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}}
+          onChange={e => { const f = e.target.files?.[0]; e.target.value = ""; decodeFile(f); }}/>
+        <button onClick={() => fileRef.current?.click()}
+          style={{background:"rgba(255,255,255,0.15)",border:"1px solid rgba(255,255,255,0.3)",color:"#fff",padding:"11px 16px",borderRadius:9,cursor:"pointer",fontSize:13,fontWeight:600}}>
+          Photo
+        </button>
         {canTorch && (
           <button onClick={toggleTorch} style={{background:torchOn?"#fff":"rgba(255,255,255,0.15)",border:"1px solid rgba(255,255,255,0.3)",color:torchOn?"#000":"#fff",padding:"11px 18px",borderRadius:9,cursor:"pointer",fontSize:13,fontWeight:600}}>
             {torchOn ? "Light on" : "Light"}
@@ -2593,7 +2960,10 @@ function NRow({ label, val100, valSrv, unit, ri, bold, indent, type, hasSrv, t }
 }
 
 // ─── OFF PRODUCT CARD ──────────────────────────────────────────────────────────
-function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, myReport, setMyReport, onSubmit }) {
+function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, myReport, setMyReport, onSubmit,
+                       freshness, onRefresh, refreshing, contributions, detailsOpen, setDetailsOpen,
+                       myDetails, setMyDetails, onSubmitDetails,
+                       profile, toggleSensitivity, profileOpen, setProfileOpen }) {
   if (!ratings) return null;
   const { safety, expert, community } = ratings;
   const TIER_COLOR = { avoid:"#c0392b", caution:"#d97706", sensitive:"#b8860b", cutback:"#7a8b3a", safe:"#2e7d52" };
@@ -2623,6 +2993,78 @@ function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, 
         “Avoid”. Reviews never change the safety score.
       </div>
 
+      {/* ── For you ──
+          Placed above the population scores on purpose. A general 8/10 is not
+          the answer for someone the product can actually harm, and an "organic"
+          badge is a farming claim, not a tolerability one. */}
+      <div style={{...box, borderColor: ratings.personal?.hits?.length ? "#c0392b55" : t.border}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+          <div style={{...sHdr,color:t.textSub,marginBottom:0,flex:1}}>For you</div>
+          <button onClick={() => setProfileOpen(o => !o)}
+            style={{fontSize:10,fontWeight:600,padding:"4px 9px",borderRadius:6,cursor:"pointer",
+              background:t.pill,color:t.textSub,border:`1px solid ${t.border}`}}>
+            {profileOpen ? "Done" : profile.length ? `${profile.length} set` : "Set sensitivities"}
+          </button>
+        </div>
+
+        {!profileOpen && !ratings.personal?.checked && (
+          <div style={{fontSize:10,color:t.textSub,lineHeight:1.6}}>
+            Tell the app what you react to and it will check every product against it.
+            Kept on this device only — never uploaded.
+          </div>
+        )}
+
+        {!profileOpen && ratings.personal?.checked && ratings.personal.clear && (
+          <div style={{fontSize:11,color:"#2e7d52",lineHeight:1.6}}>
+            Nothing here matches your {profile.length} declared sensitivit{profile.length===1?"y":"ies"}.
+            <span style={{color:t.textMuted}}> Based on the listed ingredients — an incomplete list can still hide something.</span>
+          </div>
+        )}
+
+        {!profileOpen && ratings.personal?.hits?.map(h => (
+          <div key={h.key} style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:7}}>
+            <span style={{flexShrink:0,fontSize:8,fontWeight:700,color:"#fff",background:"#c0392b",padding:"3px 6px",borderRadius:4,marginTop:1}}>FOR YOU</span>
+            <div style={{minWidth:0}}>
+              <div style={{fontSize:11,fontWeight:600,color:t.text}}>{h.label}</div>
+              <div style={{fontSize:10,color:t.textSub,lineHeight:1.5}}>{h.note} Found: {h.matched.join(", ")}.</div>
+            </div>
+          </div>
+        ))}
+
+        {!profileOpen && ratings.personal?.misleadingClaim && (
+          <div style={{fontSize:10,color:"#d97706",lineHeight:1.6,marginTop:6,borderTop:`1px solid ${t.border}`,paddingTop:7}}>
+            This product carries an organic or natural claim. That describes how it was
+            produced, not whether you can tolerate it — the match above still applies.
+          </div>
+        )}
+
+        {profileOpen && (
+          <>
+            <div style={{fontSize:10,color:t.textMuted,lineHeight:1.6,marginBottom:8}}>
+              Select what you react to. This changes what you are warned about; it never
+              changes the product's score for anyone else.
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+              {Object.entries(SENSITIVITY_GROUPS).map(([key, g]) => {
+                const on = profile.includes(key);
+                return (
+                  <button key={key} onClick={() => toggleSensitivity(key)} title={g.note}
+                    style={{fontSize:10,fontWeight:600,padding:"6px 10px",borderRadius:7,cursor:"pointer",
+                      background:on?"#c0392b":t.pill, color:on?"#fff":t.textSub,
+                      border:`1px solid ${on?"#c0392b":t.border}`}}>
+                    {g.label}
+                  </button>
+                );
+              })}
+            </div>
+            <div style={{fontSize:9,color:t.textMuted,marginTop:8,lineHeight:1.6}}>
+              Not medical advice, and not a substitute for reading the pack. If you have a
+              diagnosed allergy, treat the physical label as the authority.
+            </div>
+          </>
+        )}
+      </div>
+
       {/* ── CSPI breakdown ── */}
       <div style={box}>
         <div style={{...sHdr,color:t.textSub}}>CSPI Chemical Cuisine</div>
@@ -2647,6 +3089,33 @@ function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, 
           </div>
         )}
       </div>
+
+      {/* ── Reader-reported composition ── */}
+      {ratings.reported?.count > 0 && (
+        <div style={{...box, borderColor:"#d9770655"}}>
+          <div style={{...sHdr,color:t.textSub}}>Reported by readers · unverified</div>
+          <div style={{fontSize:10,color:t.textSub,lineHeight:1.6,marginBottom:8}}>
+            Readers say these appear on the physical label but are missing from the source
+            data. They are <strong>not</strong> counted in the score above.
+          </div>
+          {ratings.reported.reported.map(r => (
+            <div key={r.additive} style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:6}}>
+              <span style={{flexShrink:0,fontSize:8,fontWeight:700,color:"#fff",background:TIER_COLOR[r.tier]||"#777",padding:"3px 6px",borderRadius:4,marginTop:1}}>
+                {CSPI_TIERS[r.tier]?.short || "Unrated"}
+              </span>
+              <div style={{minWidth:0}}>
+                <div style={{fontSize:11,fontWeight:600,color:t.text}}>{r.name}</div>
+                <div style={{fontSize:10,color:t.textSub,lineHeight:1.5}}>{r.why}</div>
+              </div>
+            </div>
+          ))}
+          <div style={{fontSize:10,color:"#d97706",lineHeight:1.6,marginTop:8,borderTop:`1px solid ${t.border}`,paddingTop:8}}>
+            If confirmed, the safety score would be {ratings.reported.wouldBe}/10 instead of {ratings.reported.current}/10.
+            Shown so you can judge it yourself — one reader's transcription does not re-rate a
+            product for everyone.
+          </div>
+        </div>
+      )}
 
       {/* ── Expert accolades ── */}
       <div style={box}>
@@ -2673,6 +3142,84 @@ function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, 
                 Fewer than three sources — treat as indicative, not a verdict.
               </div>
             )}
+          </>
+        )}
+      </div>
+
+      {/* ── Freshness ── */}
+      {freshness && (
+        <div style={{...box, display:"flex", gap:10, alignItems:"center",
+                     borderColor: freshness.stale ? "#d9770655" : t.border}}>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontSize:11,fontWeight:600,color:t.text}}>
+              {!freshness.known ? "Source date unknown"
+                : freshness.days === 0 ? "Read from source today"
+                : `Read from source ${freshness.days} day${freshness.days !== 1 ? "s" : ""} ago`}
+            </div>
+            <div style={{fontSize:9,color:t.textMuted,lineHeight:1.6,marginTop:2}}>
+              {/* Reformulations happen. A rating is only as current as the data
+                  behind it, so the read date is shown rather than implied. */}
+              Ratings are computed from the source data at that date. Recipes change —
+              refresh to re-read and re-rate.
+            </div>
+          </div>
+          <button onClick={onRefresh} disabled={refreshing}
+            style={{flexShrink:0,fontSize:11,fontWeight:600,padding:"7px 12px",borderRadius:7,
+              background:freshness.stale?"#d97706":t.pill, color:freshness.stale?"#fff":t.textSub,
+              border:`1px solid ${freshness.stale?"#d97706":t.border}`,
+              cursor:refreshing?"default":"pointer",opacity:refreshing?0.6:1}}>
+            {refreshing ? "Refreshing…" : "Refresh"}
+          </button>
+        </div>
+      )}
+
+      {/* ── Add product details ── */}
+      <div style={box}>
+        <div style={{...sHdr,color:t.textSub,marginBottom:6}}>Add product details</div>
+        {contributions?.length > 0 && (
+          <div style={{fontSize:10,color:t.textSub,lineHeight:1.6,marginBottom:8}}>
+            {contributions.length} contribution{contributions.length!==1?"s":""} from readers.
+            Community-supplied and unverified — they fill gaps in the source data, never overwrite it.
+          </div>
+        )}
+        {!detailsOpen ? (
+          <button onClick={() => setDetailsOpen(true)}
+            style={{width:"100%",padding:"9px 0",fontSize:12,fontWeight:600,borderRadius:8,cursor:"pointer",
+              background:t.pill,color:t.textSub,border:`1px solid ${t.border}`}}>
+            Something missing or wrong? Add details
+          </button>
+        ) : (
+          <>
+            <div style={{fontSize:10,color:t.textMuted,lineHeight:1.6,marginBottom:8}}>
+              Copy from the physical label. Additives you list are included in the safety
+              score; the other fields are stored for other readers.
+            </div>
+            {[["ingredients","Full ingredient list from the pack","textarea"],
+              ["additives","Additives / E-numbers on the label (comma separated)","input"],
+              ["quantity","Pack size, e.g. 500 g","input"],
+              ["category","Category, e.g. greek yogurt","input"],
+              ["note","Anything else worth knowing","textarea"]].map(([key,ph,kind]) => (
+              kind === "textarea" ? (
+                <textarea key={key} rows={2} value={myDetails[key]} placeholder={ph}
+                  onChange={e => setMyDetails(d => ({...d, [key]: e.target.value}))}
+                  style={{width:"100%",boxSizing:"border-box",fontSize:11,padding:"7px 9px",borderRadius:7,
+                    border:`1px solid ${t.border}`,background:t.bgSub,color:t.text,resize:"vertical",
+                    fontFamily:"inherit",marginBottom:6}}/>
+              ) : (
+                <input key={key} value={myDetails[key]} placeholder={ph}
+                  onChange={e => setMyDetails(d => ({...d, [key]: e.target.value}))}
+                  style={{width:"100%",boxSizing:"border-box",fontSize:11,padding:"7px 9px",borderRadius:7,
+                    border:`1px solid ${t.border}`,background:t.bgSub,color:t.text,marginBottom:6}}/>
+              )
+            ))}
+            <div style={{display:"flex",gap:6}}>
+              <button onClick={onSubmitDetails}
+                style={{flex:1,padding:"9px 0",fontSize:12,fontWeight:600,borderRadius:8,cursor:"pointer",
+                  background:t.accent,color:t.accentFg,border:"none"}}>Save details</button>
+              <button onClick={() => setDetailsOpen(false)}
+                style={{padding:"9px 14px",fontSize:12,fontWeight:600,borderRadius:8,cursor:"pointer",
+                  background:t.pill,color:t.textSub,border:`1px solid ${t.border}`}}>Cancel</button>
+            </div>
           </>
         )}
       </div>
@@ -3050,6 +3597,24 @@ export default function App() {
   const [showPlan,setShowPlan]       = useState(false);
   const [cameraOpen,setCameraOpen]   = useState(false);
   const [inputFocus,setInputFocus]   = useState(false);
+  const [refreshing,setRefreshing]   = useState(false);
+  // The reader's declared sensitivities. Persisted locally, never uploaded —
+  // health information belongs on the device, not in a shared database.
+  const [profile,setProfile] = useState(() => {
+    try { return JSON.parse(window.localStorage.getItem("hst_profile") || "[]"); } catch { return []; }
+  });
+  const [profileOpen,setProfileOpen] = useState(false);
+  function toggleSensitivity(key) {
+    setProfile(prev => {
+      const next = prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key];
+      try { window.localStorage.setItem("hst_profile", JSON.stringify(next)); } catch { /* private mode */ }
+      return next;
+    });
+  }
+  const [contributions,setContributions] = useState([]);
+  const [detailsOpen,setDetailsOpen] = useState(false);
+  const [myDetails,setMyDetails]     = useState({ ingredients:"", additives:"", quantity:"", category:"", note:"" });
+  const [discoverMore,setDiscoverMore] = useState(false); // loading another page
   const [diag,setDiag]               = useState(null);   // source diagnostics result
   const [diagRunning,setDiagRunning] = useState(false);
   const [discover,setDiscover]       = useState(null);
@@ -3134,6 +3699,7 @@ export default function App() {
   const ck = (s) => cache.current;
   const fromCache = (store, key) => cache.current[store]?.[key] ?? null;
   const toCache   = (store, key, val) => { cache.current[store] = cache.current[store] || {}; cache.current[store][key] = val; };
+  const dropCache = (store, key) => { if (cache.current[store]) delete cache.current[store][key]; };
   const nk        = (s) => normKey(s);
 
   // ── SCAN ────────────────────────────────────────────────────────────────────
@@ -3178,6 +3744,10 @@ export default function App() {
     const name = a.offData?.name || label;
     const key = nk(name);
     const payload = { offData:a.offData, aiSugarData:a.aiSugarData, allSubs:a.allSubs, risk:a.risk, diet:a.diet, undeclaredCount:a.undeclaredCount, hitCount:1, savedAt:Date.now(),
+      // When the source data was actually fetched, as distinct from when the
+      // record was last written. Products change — reformulations, corrected
+      // ingredient lists — so a rating is only as current as its source read.
+      fetchedAt: Date.now(),
       domain: a.domain || DOMAIN,
       ...(a.domain === "cosmetics" ? { formulation:a.formulation, ph:a.ph, delivery:a.delivery, stabilisers:a.stabilisers } : {}) };
     const history = a.offData?.brand ? brandHistory(a.offData.brand) : null;
@@ -3300,7 +3870,7 @@ export default function App() {
       setDiscoverLoading(true); setDiscover(null); setSelected(null);
       try {
         const res = await cloudSearch(q);
-        setDiscover(res || { applied: [], products: [], count: 0 });
+        setDiscover(res ? { ...res, query: q } : { applied: [], products: [], count: 0, query: q });
         if (res?.domain) noteDomain(res.domain);
       } catch (e) {
         console.warn("submitQuery/discover:", e);
@@ -3317,6 +3887,69 @@ export default function App() {
     if (QUESTION_RE.test(q)) { setSearchQ(q); runSearch(q); return; }
     scan(q);   // checks session cache → shared database → fresh lookup
   }
+
+  // Fetch the next page and append. Results accumulate rather than replace, so
+  // "Show more" grows the list instead of paging the user away from what they
+  // have already looked at.
+  async function loadMoreDiscover() {
+    if (!discover || discoverMore) return;
+    setDiscoverMore(true);
+    try {
+      const next = await cloudSearch(discover.query, (discover.page || 1) + 1);
+      if (next && next.products?.length) {
+        // Dedupe on name+brand: paging backends can repeat a record across
+        // page boundaries when the underlying sort is not fully stable.
+        const seen = new Set(discover.products.map(p => nk(p.name) + "|" + nk(p.brand || "")));
+        const fresh = next.products.filter(p => !seen.has(nk(p.name) + "|" + nk(p.brand || "")));
+        setDiscover({ ...discover, page: next.page, hasMore: next.hasMore,
+                      products: [...discover.products, ...fresh] });
+      } else {
+        setDiscover({ ...discover, hasMore: false });
+      }
+    } catch (e) {
+      console.warn("loadMoreDiscover:", e);
+      setDiscover(d => d && { ...d, hasMore: false, error: String(e?.message || e) });
+    } finally {
+      setDiscoverMore(false);
+    }
+  }
+
+  const STALE_AFTER = 30 * 24 * 60 * 60 * 1000;   // 30 days
+
+  function staleness(entry) {
+    const at = entry?.offData?.fetchedAt || entry?.fetchedAt;
+    if (!at) return { known: false, days: null, stale: true };
+    const days = Math.floor((Date.now() - at) / 86400000);
+    return { known: true, days, stale: Date.now() - at > STALE_AFTER };
+  }
+
+  // Re-fetch a product from source and recompute everything from the fresh
+  // data. Cached records are otherwise served indefinitely, so a reformulation
+  // or a corrected ingredient list would never reach an already-scanned
+  // product — its rating would stay frozen at whatever was true when first seen.
+  async function refreshProduct(entry) {
+    if (!entry || refreshing) return;
+    setRefreshing(true);
+    const k = nk(entry.name);
+    try {
+      const code = entry.offData?.code;
+      const { analysis } = await lookupAndAnalyze(code || entry.searchTerm || entry.name);
+      if (!analysis) throw new Error("No fresh data returned");
+      dropCache("scan", k); dropCache("alts", k); dropCache("brand", k);
+      commitScan(analysis, entry.name);
+      toast("refresh", `"${entry.name}" re-read from source and re-rated.`);
+    } catch (e) {
+      console.warn("refreshProduct:", e);
+      toast("refresh", `Could not refresh: ${String(e?.message || e)}`);
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  // Re-run the personal check when the profile changes, without re-fetching.
+  useEffect(() => {
+    if (selected) loadRatings(selected, nk(selected.name));
+  }, [profile]);
 
   async function runDiagnostics() {
     setDiagRunning(true); setDiag(null);
@@ -3442,11 +4075,21 @@ export default function App() {
   function loadRatings(entry, key) {
     const k = key || nk(entry.name);
     const rec = ghGet(k) || {};
+    const contributed = (rec.contributions || []).flatMap(c => c.additives || []);
     setRatings(productRatings({
-      additives: entry.offData?.additives || [],
+      additives: entry.offData?.additives || [],     // source data only
+      reportedAdditives: contributed,                // shown, never scored in
+      allergens:   entry.offData?.allergens || [],
+      ingredients: entry.offData?.ingredients || "",
+      labels:      entry.offData?.labels || [],
       accolades: rec.accolades || [],
       reviews:   rec.reviews || [],
+      profile,
     }));
+    setContributions(rec.contributions || []);
+    const mineD = (rec.contributions || []).find(c => c.by === reviewerId());
+    setMyDetails({ ingredients: mineD?.ingredients || "", additives: (mineD?.additives || []).join(", "),
+                   quantity: mineD?.quantity || "", category: mineD?.category || "", note: mineD?.note || "" });
     const mine = (rec.reviews || []).find(r => r.by === reviewerId());
     setMyStars(mine?.stars || 0);
     setMyReview(mine?.text || "");
@@ -3462,6 +4105,54 @@ export default function App() {
       if (!id) { id = "r" + Math.random().toString(36).slice(2, 10); window.localStorage.setItem("hst_reviewer", id); }
       return id;
     } catch { return null; }
+  }
+
+  // Product-detail contributions. Distinct from reviews: transcribing a label
+  // is a factual claim about composition, not an opinion, so these CAN feed the
+  // analysis — but only where the source data is missing, never overwriting it,
+  // and always labelled as community-supplied and unverified.
+  async function submitDetails() {
+    if (!selected) return;
+    const k = nk(selected.name);
+    const rec = ghGet(k) || {};
+    const clean = (v) => String(v || "").trim().slice(0, 2000);
+    const detail = {
+      by: reviewerId(),
+      ingredients: clean(myDetails.ingredients),
+      additives: myDetails.additives.split(",").map(x => x.trim()).filter(Boolean).slice(0, 30),
+      quantity: clean(myDetails.quantity).slice(0, 60),
+      category: clean(myDetails.category).slice(0, 80),
+      note: clean(myDetails.note).slice(0, 500),
+      ts: Date.now(),
+    };
+    if (!detail.ingredients && !detail.additives.length && !detail.quantity && !detail.category && !detail.note) {
+      toast("details", "Nothing to add — fill at least one field.");
+      return;
+    }
+    const contributions = Array.isArray(rec.contributions) ? [...rec.contributions] : [];
+    const idx = contributions.findIndex(c => c.by && c.by === detail.by);
+    if (idx >= 0) contributions[idx] = detail; else contributions.push(detail);
+
+    await ghSet(k, { ...rec, contributions }, setDbCount);
+
+    // Recompute safety including contributed additives, so a label transcription
+    // immediately improves the rating's coverage rather than sitting unused.
+    const contributed = contributions.flatMap(c => c.additives || []);
+    setContributions(contributions);
+    setRatings(productRatings({
+      additives: selected.offData?.additives || [],
+      reportedAdditives: contributed,
+      allergens:   selected.offData?.allergens || [],
+      ingredients: selected.offData?.ingredients || "",
+      labels:      selected.offData?.labels || [],
+      accolades: rec.accolades || [],
+      reviews:   rec.reviews || [],
+      profile,
+    }));
+    setDetailsOpen(false);
+    toast("details", contributed.length
+      ? "Details saved. Reported additives are shown separately as unverified — they do not change the safety score until confirmed."
+      : "Details saved to the shared database.");
   }
 
   async function submitReview() {
@@ -4377,8 +5068,17 @@ export default function App() {
                         </div>
                       ))}
                     </div>
+                    {discover.hasMore && (
+                      <button onClick={loadMoreDiscover} disabled={discoverMore}
+                        style={{width:"100%",marginTop:11,padding:"11px 0",fontSize:12,fontWeight:600,borderRadius:9,
+                          background:t.pill,color:t.textSub,border:`1px solid ${t.border}`,
+                          cursor:discoverMore?"default":"pointer",opacity:discoverMore?0.6:1}}>
+                        {discoverMore ? "Loading…" : `Show more (${discover.products.length} of ${discover.count?.toLocaleString?.() || "?"} shown)`}
+                      </button>
+                    )}
                     <div style={{fontSize:10,color:t.textMuted,lineHeight:1.7,marginTop:12}}>
                       Filtered directly on {discover.domain === "cosmetics" ? "Open Beauty Facts" : "Open Food Facts"} — these are not limited to previously scanned products. Select one to run a full analysis.
+                      {!discover.hasMore && discover.products.length > 12 && " That is every match for these filters."}
                     </div>
                   </>
                 )}
@@ -4409,7 +5109,12 @@ export default function App() {
               <OFFCard cosmeticAnalysis={selected?.cosmetic} brandStat={brandStat} onOpen={openResult} offData={selected.offData} aiSugarData={selected.aiSugarData} substances={selected.substances} insight={insight} insightLoading={insightLoading} brandCred={brandCred} brandCredLoading={brandCredLoading} alternatives={alternatives} altLoading={altLoading} diet={selected.diet||"unknown"} t={t} dark={dark}
                 ratingsPanel={<RatingsPanel ratings={ratings} t={t} myStars={myStars} setMyStars={setMyStars}
                   myReview={myReview} setMyReview={setMyReview} myReport={myReport} setMyReport={setMyReport}
-                  onSubmit={submitReview}/>}/>
+                  onSubmit={submitReview}
+                  freshness={staleness(selected)} onRefresh={() => refreshProduct(selected)} refreshing={refreshing}
+                  contributions={contributions} detailsOpen={detailsOpen} setDetailsOpen={setDetailsOpen}
+                  myDetails={myDetails} setMyDetails={setMyDetails} onSubmitDetails={submitDetails}
+                  profile={profile} toggleSensitivity={toggleSensitivity}
+                  profileOpen={profileOpen} setProfileOpen={setProfileOpen}/>}/>
             ) : (
               <div style={{display:"flex",flexDirection:"column",gap:12}}>
                 <div style={{background:t.surface,borderRadius:12,padding:"16px 18px",border:`1px solid ${t.border}`}}>

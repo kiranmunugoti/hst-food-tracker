@@ -169,6 +169,26 @@ flag. Unrecognised input returns `null` rather than a guess.
 scores below 50, so a linear map would rate a poor 55 as 5.5/10 — "average".
 The conversion rescales from a 50 floor: 55/100 becomes 2.8, 95/100 becomes 9.2.
 
+### Personal sensitivity profiles
+
+An "organic" label describes how something was farmed, not whether a given
+person can tolerate it — organic wine still contains sulphites, organic cashews
+still cause anaphylaxis. CSPI encodes part of this in its "Certain people should
+avoid" tier: additives that are fine for most people and genuinely dangerous for
+some. A single population-level score cannot express that.
+
+So sensitivity is a **profile the reader sets** (14 groups: sulphites,
+glutamates, artificial colours, benzoates, nitrites, polyols, carrageenan,
+carmine, gluten, milk, nuts, soy, caffeine, salicylates). Products are checked
+against it and matches are shown in a "For you" panel above the population
+scores. Where a product carries an organic or natural claim *and* matches the
+profile, that is called out explicitly, because it is the claim most likely to
+be misread as "safe for me".
+
+The profile is stored in `localStorage` and **never uploaded** — health
+information belongs on the device, not in a shared database. It changes what the
+reader is warned about; it never changes the product's score for anyone else.
+
 ### Community reviews
 
 One review per device (a local id, replaced on resubmission, so one device
@@ -179,3 +199,11 @@ Reviewers can report an ingredient that appears on the physical label but is
 missing from the database. These are tallied per substance and shown as
 **unverified counts** — a prompt to check the label, not a change to the score.
 A vote cannot make a nitrite disappear.
+
+### Reader-reported composition
+
+Additives transcribed from a physical label are shown in their own panel with
+their CSPI tier, and **do not move the safety score**. A transcription is
+plausible but unverified, and one person's reading should not silently re-rate a
+product for everyone. The panel states what the score *would* be if confirmed —
+information without assertion, leaving the judgement with the reader.
