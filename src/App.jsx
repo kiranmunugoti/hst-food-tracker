@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { productRatings, addReview, CSPI_TIERS, SENSITIVITY_GROUPS } from "./ratings.js";
+import { productRatings, addReview, CSPI_TIERS, SENSITIVITY_GROUPS, HEALTH_CONDITIONS } from "./ratings.js";
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────────
 // The shared scan database lives in its OWN repository, separate from this
@@ -876,9 +876,20 @@ async function fetchOFFAlternatives(categories, excludeName) {
       // Goes through filterSearch so it gets the Search-a-licious path, the
       // proxy fallback and the 404/rate-limit handling — a raw fetch here had
       // none of them and failed silently to an empty alternatives list.
-      const { products } = await filterSearch(
+      // Market first — an alternative the reader cannot buy is not an
+      // alternative. Widen only if the local market has nothing.
+      const local = await filterSearch(
+        withMarket({ categories_tags: catTag, nutrition_grades_tags: grades }), "food", 8);
+      if (local.products.length >= 3 || !marketTag()) return local.products;
+      const wide = await filterSearch(
         { categories_tags: catTag, nutrition_grades_tags: grades }, "food", 8);
-      return products;
+      // Local results stay first; the rest fill the gap and are marked so the
+      // card can say where they come from.
+      const key = (x) => asText(x.product_name).toLowerCase().replace(/[^a-z0-9]/g, "");
+      const seenC = new Set(local.products.map(key));
+      return [...local.products,
+              ...wide.products.filter(p => !seenC.has(key(p)))
+                              .map(p => ({ ...p, _elsewhere: true }))];
     } catch { return []; }
   };
   let prods = await grab("a");
@@ -891,7 +902,8 @@ async function fetchOFFAlternatives(categories, excludeName) {
       const n = p.nutriments || {}; const sg = n["sugars_100g"]; const fb = n["fiber_100g"];
       return {
         name: asText(p.product_name).trim(), brand: asText(p.brands).split(",")[0].trim() || null,
-        reason: `Nutri-Score ${(p.nutriscore_grade || "a").toUpperCase()} option in the same category${sg != null ? ` with ${fmt(Number(sg))}g sugars per 100g` : ""}.`,
+        elsewhere: !!p._elsewhere,
+        reason: `Nutri-Score ${(p.nutriscore_grade || "a").toUpperCase()} option in the same category${sg != null ? ` with ${fmt(Number(sg))}g sugars per 100g` : ""}.${p._elsewhere ? " Not confirmed as sold in your market." : ""}`,
         improvements: [sg != null && sg < 5 ? "Low sugar" : null, fb != null && fb > 3 ? "High fibre" : null, "Better Nutri-Score"].filter(Boolean),
         nutriScore: p.nutriscore_grade || "a", sourceUrl: null, sourceName: "Open Food Facts",
       };
@@ -906,7 +918,7 @@ async function fetchOFFCalorieAlts(kcal) {
   for (const c of cats) {
     try {
       const { products } = await filterSearch(
-        { categories_tags: c, nutrition_grades_tags: "a" }, "food", 12);
+        withMarket({ categories_tags: c, nutrition_grades_tags: "a" }), "food", 12);
       products.forEach(p => {
         const n = p.nutriments || {}; const e = n["energy-kcal_100g"];
         if (e == null || Math.abs(e - kcal) > 50) return;
@@ -1365,20 +1377,57 @@ async function usdaGetByCode(code) {
 // NOVA and additive tags that FDC has no equivalent for. USDA is only called
 // when OFF has not already filled the list, so a well-covered query costs the
 // same one request it always did.
+// Which sources are worth querying, and in what order, for a given market.
+//
+// FoodData Central indexes US branded products. That is useful well beyond the
+// US: American brands are widely sold in India, Australia, the Gulf, Singapore,
+// Japan and Latin America, and OFF's coverage of those shelves is thin. So FDC
+// is queried in parallel with OFF almost everywhere.
+//
+// Europe is the exception. OFF originated there, its European coverage is by
+// far its strongest, and European formulations differ from US ones — different
+// permitted additives, different recipes under the same brand. An FDC record
+// would describe a product that is not the one on a European shelf, so it is
+// skipped rather than shown misleadingly.
+//
+// One honest limitation this cannot solve: an FDC record always describes the
+// US formulation. Where a brand sells a locally-made variant, the additive list
+// may differ from the pack in hand — which is why the disclaimer says
+// formulations differ by country.
+const EUROPEAN_MARKETS = new Set(["gb", "ie", "de", "fr", "es", "it", "nl", "be", "ch"]);
+
+function sourcePlan(market) {
+  // US: FDC is the better primary — a US pack is likelier to be there than in OFF.
+  if (market === "us") return { usda: "first" };
+  // Europe: OFF only.
+  if (EUROPEAN_MARKETS.has(market)) return { usda: "skip" };
+  // Everywhere else: both at once. FDC covers the imported American brands,
+  // OFF covers local ones, and neither alone is enough.
+  return { usda: "parallel" };
+}
+
 async function foodSearchMerged(terms, limit) {
+  const plan = sourcePlan(currentMarket());
+
   let offHits = [], offFailed = null;
+  let usdaPromise = null;
+
+  // In the US both sources are asked at once. FDC has its own rate budget
+  // (1,000/hour) separate from OFF's 10/minute, so a parallel call costs OFF
+  // nothing and halves the wait.
+  if (plan.usda === "first" || plan.usda === "parallel") {
+    usdaPromise = usdaSearch(terms, limit).catch(() => []);
+  }
+
   try { offHits = await offSearch(terms, limit, "food"); }
   catch (e) { offFailed = e; }
 
-  // Enough from OFF already — spend nothing on a second source.
-  if (offHits.length >= limit) return offHits;
+  // Enough from OFF and no reason to look further.
+  if (offHits.length >= limit && plan.usda === "skip") return offHits;
 
   let usdaHits = [];
-  try { usdaHits = await usdaSearch(terms, limit - offHits.length + 4); }
-  catch (e) {
-    // If OFF also failed, surface the OFF error — it is the primary source and
-    // its failure mode (rate limit vs unreachable) is what the user needs told.
-    if (offFailed) throw offFailed;
+  if (usdaPromise) {
+    usdaHits = await usdaPromise;
   }
   if (offFailed && !usdaHits.length) throw offFailed;
 
@@ -1393,8 +1442,27 @@ async function foodSearchMerged(terms, limit) {
     k.push("n:" + norm(p.product_name) + "|" + norm(asText(p.brands).split(",")[0]));
     return k;
   };
+  // Order. Appending USDA after OFF buries US products below European ones in
+  // the market where OFF is weakest, so in the US the two are interleaved.
+  // Interleave wherever both sources ran, so neither database's products get
+  // buried under the other's. Which one leads differs: in the US, FDC is the
+  // more likely match; elsewhere OFF leads because it carries the local brands
+  // FDC has never heard of.
+  const interleave = (a, b) => {
+    const mixed = [];
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+      if (a[i]) mixed.push(a[i]);
+      if (b[i]) mixed.push(b[i]);
+    }
+    return mixed;
+  };
+  const ordered =
+    plan.usda === "first"    ? interleave(usdaHits, offHits) :
+    plan.usda === "parallel" ? interleave(offHits, usdaHits) :
+                               offHits;
+
   const out = [];
-  for (const p of [...offHits, ...usdaHits]) {
+  for (const p of ordered) {
     const keys = keysOf(p);
     if (keys.some(k => seen.has(k))) continue;
     keys.forEach(k => seen.add(k));
@@ -1462,6 +1530,7 @@ const SAL_FIELD_MAP = {
   labels_tags: "labels_tags",
   ingredients_analysis_tags: "ingredients_analysis_tags",
   categories_tags: "categories_tags",
+  countries_tags: "countries_tags",
   additives_n: "additives_n",
 };
 
@@ -1484,6 +1553,70 @@ function salQueryFrom(params) {
 }
 
 // Returns raw product records (OFF shape) for a set of filter params.
+// ─── MARKET / LOCATION ─────────────────────────────────────────────────────────
+// Open Food Facts began in France and its coverage is still heaviest there, so
+// an unfiltered query returns European products to everyone. That makes the
+// alternatives useless — nobody in Minnesota can buy a French yoghurt.
+//
+// Queries are therefore filtered to the reader's market. The filter is applied
+// as a PREFERENCE, not a hard constraint: if it returns nothing, the query is
+// re-run unfiltered rather than showing an empty list, because a distant
+// alternative still beats no alternative.
+const MARKETS = {
+  us: { label: "United States", tag: "en:united-states" },
+  ca: { label: "Canada",        tag: "en:canada" },
+  gb: { label: "United Kingdom",tag: "en:united-kingdom" },
+  ie: { label: "Ireland",       tag: "en:ireland" },
+  au: { label: "Australia",     tag: "en:australia" },
+  nz: { label: "New Zealand",   tag: "en:new-zealand" },
+  in: { label: "India",         tag: "en:india" },
+  de: { label: "Germany",       tag: "en:germany" },
+  fr: { label: "France",        tag: "en:france" },
+  es: { label: "Spain",         tag: "en:spain" },
+  it: { label: "Italy",         tag: "en:italy" },
+  nl: { label: "Netherlands",   tag: "en:netherlands" },
+  be: { label: "Belgium",       tag: "en:belgium" },
+  ch: { label: "Switzerland",   tag: "en:switzerland" },
+  mx: { label: "Mexico",        tag: "en:mexico" },
+  br: { label: "Brazil",        tag: "en:brazil" },
+  jp: { label: "Japan",         tag: "en:japan" },
+  za: { label: "South Africa",  tag: "en:south-africa" },
+  ae: { label: "UAE",           tag: "en:united-arab-emirates" },
+  sg: { label: "Singapore",     tag: "en:singapore" },
+  world: { label: "Anywhere",   tag: null },
+};
+
+// Best guess from the browser, used only as the initial value — the reader can
+// override it, and the override is what is stored.
+function guessMarket() {
+  try {
+    const stored = window.localStorage.getItem("hst_market");
+    if (stored && MARKETS[stored]) return stored;
+    const loc = new Intl.Locale(navigator.language || "en-US");
+    const region = (loc.region || "").toLowerCase();
+    if (MARKETS[region]) return region;
+    // Time zone is a better signal than language: en-US is the default locale
+    // on plenty of devices outside the US.
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+    if (/^America\//.test(tz)) return /Toronto|Vancouver|Edmonton|Winnipeg|Halifax/.test(tz) ? "ca" : "us";
+    if (/^Europe\/London|Europe\/Belfast/.test(tz)) return "gb";
+    if (/^Asia\/(Kolkata|Calcutta)/.test(tz)) return "in";
+    if (/^Australia\//.test(tz)) return "au";
+  } catch { /* fall through */ }
+  return "world";
+}
+
+let _market = "world";
+const setMarketTag = (m) => { _market = m; };
+const marketTag = () => MARKETS[_market]?.tag || null;
+const currentMarket = () => _market;
+
+// Adds the market filter to a parameter set, when one is set.
+function withMarket(params) {
+  const tag = marketTag();
+  return tag ? { ...params, countries_tags: tag } : params;
+}
+
 async function filterSearch(params, domain, limit = 12, page = 1) {
   // Search-a-licious indexes food only — Open Beauty Facts has no equivalent.
   if (domain !== "cosmetics") {
@@ -1562,9 +1695,13 @@ function discoveryIntent(query) {
 
 // Run the discovery query against the live database.
 async function cloudDiscover(intent, limit = 8) {
-  const params = { ...intent.params };
+  const params = withMarket({ ...intent.params });
   if (intent.term) params.search_terms = intent.term;
-  const { products } = await filterSearch(params, intent.domain, limit);
+  let { products } = await filterSearch(params, intent.domain, limit);
+  if (!products.length && marketTag()) {
+    // Nothing locally — widen rather than report an empty catalogue.
+    ({ products } = await filterSearch({ ...intent.params, ...(intent.term ? { search_terms: intent.term } : {}) }, intent.domain, limit));
+  }
   return products.map(p => {
     const parsed = parseOFF(p);
     parsed._domain = intent.domain;
@@ -1663,7 +1800,10 @@ async function cloudSearch(query, page = 1) {
 
   try {
     const PAGE_SIZE = 12;
-    const { products, count } = await filterSearch(params, domain, PAGE_SIZE, page);
+    let { products, count } = await filterSearch(withMarket(params), domain, PAGE_SIZE, page);
+    if (!products.length && page === 1 && marketTag()) {
+      ({ products, count } = await filterSearch(params, domain, PAGE_SIZE, page));
+    }
     return {
       applied, domain, params, page,
       count,
@@ -1717,14 +1857,27 @@ async function resolveProduct(query, limit = 6) {
 
   // ── Barcode: exact lookup. Try each database until one knows the code. ──
   if (/^\d{8,14}$/.test(q)) {
+    const plan = sourcePlan(currentMarket());
+
+    // In the US, FoodData Central is checked FIRST for a food barcode. A US
+    // pack is far more likely to be in FDC than in Open Food Facts, so asking
+    // OFF first usually means one wasted request before the answer.
+    if (plan.usda === "first" && guess !== "cosmetics") {
+      const usdaFirst = await step(() => usdaGetByCode(q));
+      if (usdaFirst) return finish(usdaFirst, [], "food");
+    }
+
     for (const d of order) {
       const hit = await step(() => offGetByCode(q, d));
       if (hit) return finish(hit, [], d);
     }
-    // Neither Open Food Facts nor Open Beauty Facts has it — try FoodData
-    // Central before giving up. This is where US products usually turn up.
-    const usda = await step(() => usdaGetByCode(q));
-    if (usda) return finish(usda, [], "food");
+
+    // Elsewhere FDC is checked after OFF — local brands are likelier to be the
+    // match — and in Europe it is not tried at all.
+    if (plan.usda === "parallel") {
+      const usda = await step(() => usdaGetByCode(q));
+      if (usda) return finish(usda, [], "food");
+    }
 
     const out = finish(null, [], guess || "food");
     // Every request succeeded and every database said "no such code". That is
@@ -2960,6 +3113,24 @@ function NRow({ label, val100, valSrv, unit, ri, bold, indent, type, hasSrv, t }
 }
 
 // ─── OFF PRODUCT CARD ──────────────────────────────────────────────────────────
+// parseOFF stores nutrients under short names; the condition checks use OFF's
+// per-100g keys. Mapping here rather than renaming either side, because both
+// names are load-bearing elsewhere. Without this every threshold check reads
+// undefined and silently never fires — a failure that looks like "no alerts".
+function nutFor(nut = {}) {
+  return {
+    "sugars_100g":        nut.sugars,
+    "saturated-fat_100g": nut.saturated,
+    "fat_100g":           nut.fat,
+    "salt_100g":          nut.salt,
+    "sodium_100g":        nut.sodium,
+    "carbohydrates_100g": nut.carbs,
+    "fiber_100g":         nut.fiber,
+    "proteins_100g":      nut.protein,
+    "energy-kcal_100g":   nut.energy_kcal,
+  };
+}
+
 function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, myReport, setMyReport, onSubmit,
                        freshness, onRefresh, refreshing, contributions, detailsOpen, setDetailsOpen,
                        myDetails, setMyDetails, onSubmitDetails,
@@ -2987,11 +3158,15 @@ function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, 
           </div>
         ))}
       </div>
-      <div style={{fontSize:9,color:t.textMuted,lineHeight:1.6,marginBottom:12}}>
-        Scored 1–10. These are kept separate on purpose: a product can be
-        award-winning and well liked and still contain an additive CSPI rates
-        “Avoid”. Reviews never change the safety score.
+      <div style={{fontSize:9,color:t.textMuted,lineHeight:1.6,marginBottom:4}}>
+        Scored 1–10. Kept separate on purpose: something can be award-winning and well liked
+        and still contain an ingredient rated “Avoid”. Reviews never change the safety score.
       </div>
+
+      {/* Directly under the scores — this is the moment a number is read as a
+          verdict, so it is where the qualification belongs. */}
+      <Disclaimer t={t}/>
+      <div style={{height:12}}/>
 
       {/* ── For you ──
           Placed above the population scores on purpose. A general 8/10 is not
@@ -3014,12 +3189,25 @@ function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, 
           </div>
         )}
 
-        {!profileOpen && ratings.personal?.checked && ratings.personal.clear && (
+        {!profileOpen && ratings.personal?.checked && ratings.personal.clear && !ratings.health?.length && (
           <div style={{fontSize:11,color:"#2e7d52",lineHeight:1.6}}>
-            Nothing here matches your {profile.length} declared sensitivit{profile.length===1?"y":"ies"}.
+            Nothing here matches your declared conditions or sensitivities.
             <span style={{color:t.textMuted}}> Based on the listed ingredients — an incomplete list can still hide something.</span>
           </div>
         )}
+
+        {!profileOpen && ratings.health?.map(h => (
+          <div key={h.key} style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:7}}>
+            <span style={{flexShrink:0,fontSize:8,fontWeight:700,color:"#fff",
+              background:h.level==="high"?"#c0392b":"#d97706",padding:"3px 6px",borderRadius:4,marginTop:1}}>
+              {h.short}
+            </span>
+            <div style={{minWidth:0}}>
+              <div style={{fontSize:11,fontWeight:600,color:t.text}}>{h.label}</div>
+              <div style={{fontSize:10,color:t.textSub,lineHeight:1.5}}>{h.detail}</div>
+            </div>
+          </div>
+        ))}
 
         {!profileOpen && ratings.personal?.hits?.map(h => (
           <div key={h.key} style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:7}}>
@@ -3266,6 +3454,42 @@ function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, 
           prompt to check the label, not a change to the rating.
         </div>
       </div>
+    </div>
+  );
+}
+
+// A single disclaimer component, used everywhere a product judgement is shown.
+// One definition rather than several copies, so the wording cannot drift apart
+// between the result card, the alternatives list and the browse results.
+//
+// Deliberately domain-neutral: this app covers food and cosmetics, and the same
+// point holds for both. A "100% pure", "vegan" or "organic" label describes how
+// something was made, not whether it suits the person reading — pure essential
+// oils burn skin, and organic wine still puts asthmatics in hospital.
+function Disclaimer({ t, variant = "full" }) {
+  const box = {
+    fontSize: 10, color: t.textSub, lineHeight: 1.65,
+    background: t.bgSub, border: `1px solid ${t.border}`,
+    borderRadius: 8, padding: "10px 12px", marginTop: 10,
+  };
+  if (variant === "compact") {
+    return (
+      <div style={{ ...box, fontSize: 9.5, color: t.textMuted }}>
+        Suggestions, not recommendations. “Pure”, “natural” or “organic” describes how
+        something was made — not whether it suits you.
+      </div>
+    );
+  }
+  return (
+    <div style={box}>
+      <strong style={{ color: t.text, fontWeight: 700 }}>Choose wisely.</strong>{" "}
+      This is a suggestion to help you decide, not a verdict. Labels like “pure”, “natural”,
+      “organic” or “vegan” describe how something was made — not whether it is safe for
+      <em> you</em>. Something entirely pure can still harm someone sensitive to it.
+      <br /><br />
+      Data can also be incomplete or out of date, and formulations differ by country. The pack
+      in your hand is the authority — and for any diagnosed condition or allergy, your clinician
+      comes first.
     </div>
   );
 }
@@ -3520,7 +3744,7 @@ function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, br
 
       {(altLoading || (alternatives && alternatives.length > 0)) && (
         <div style={{...card}}>
-          <div style={{...sHdr,color:"#2e7d52"}}>Healthier Alternatives</div>
+          <div style={{...sHdr,color:"#2e7d52"}}>Better Alternatives</div>
           {altLoading && !alternatives.length
             ? <div style={{padding:"18px 16px",display:"flex",alignItems:"center",gap:10,color:t.textSub,fontSize:12}}><span style={{display:"inline-block",width:12,height:12,border:`2px solid ${t.accent}`,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.75s linear infinite"}}/>Finding better alternatives…</div>
             : <div style={{padding:"10px 12px",display:"flex",flexDirection:"column",gap:8}}>
@@ -3530,6 +3754,10 @@ function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, br
                       <div><div style={{fontSize:13,fontWeight:600,color:t.text}}>{alt.name}</div>{alt.brand&&<div style={{fontSize:10,color:t.textSub,marginTop:1}}>{alt.brand}</div>}</div>
                       <div style={{display:"flex",gap:5,alignItems:"center",flexShrink:0}}>
                         {alt.nutriScore&&alt.nutriScore!=="unknown"&&<span style={{fontSize:10,fontWeight:700,color:"#fff",background:NS_COLOR[alt.nutriScore]||"#999",padding:"2px 7px",borderRadius:4}}>{alt.nutriScore.toUpperCase()}</span>}
+                        {/* Labelled rather than hidden: a widened result is
+                            still useful, but the reader should know it may not
+                            be on a shelf near them. */}
+                        {alt.elsewhere && <span style={{fontSize:9,fontWeight:600,color:"#d97706",background:"rgba(217,119,6,0.1)",padding:"2px 8px",borderRadius:4}}>Other market</span>}
                         <span style={{fontSize:9,fontWeight:600,color:"#2e7d52",background:"rgba(46,125,82,0.1)",padding:"2px 8px",borderRadius:4}}>Better</span>
                       </div>
                     </div>
@@ -3538,6 +3766,7 @@ function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, br
                     {alt.sourceUrl&&<a href={alt.sourceUrl} target="_blank" rel="noopener noreferrer" style={{display:"inline-flex",alignItems:"center",gap:4,fontSize:10,color:t.accent,textDecoration:"none",borderBottom:`1px solid ${t.accent}40`}}>↗ {alt.sourceName||"View"}</a>}
                   </div>
                 ))}
+                <Disclaimer t={t} variant="compact"/>
               </div>
           }
         </div>
@@ -3554,7 +3783,9 @@ function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, br
           }
         </div>
       </div>
-      <div style={{fontSize:9,color:t.textMuted,lineHeight:1.7,paddingBottom:4}}>Data from Open Food Facts · {AI_MODE?"Extended brand research":"Built-in safety engine"} · Educational purposes only.</div>
+      <div style={{fontSize:9,color:t.textMuted,lineHeight:1.7,padding:"8px 0 4px"}}>
+        Data from Open Food Facts, USDA FoodData Central and Open Beauty Facts · {AI_MODE?"Extended brand research":"Built-in safety engine"} · Educational purposes only.
+      </div>
     </div>
   );
 }
@@ -3603,6 +3834,29 @@ export default function App() {
   const [profile,setProfile] = useState(() => {
     try { return JSON.parse(window.localStorage.getItem("hst_profile") || "[]"); } catch { return []; }
   });
+  const [market,setMarketState] = useState(() => guessMarket());
+  useEffect(() => { setMarketTag(market); }, [market]);
+  function changeMarket(m) {
+    setMarketState(m);
+    setMarketTag(m);
+    try { window.localStorage.setItem("hst_market", m); } catch { /* private mode */ }
+    // Alternatives were fetched against the old market, so the cached list is
+    // now wrong for this reader — drop it and refetch on next view.
+    cache.current.alts = {};
+    if (selected) loadAlts(selected, nk(selected.name));
+  }
+  const [marketOpen,setMarketOpen]     = useState(false);
+  const [profilePanel,setProfilePanel] = useState(false);
+  const [conditions,setConditions] = useState(() => {
+    try { return JSON.parse(window.localStorage.getItem("hst_conditions") || "[]"); } catch { return []; }
+  });
+  function toggleCondition(key) {
+    setConditions(prev => {
+      const next = prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key];
+      try { window.localStorage.setItem("hst_conditions", JSON.stringify(next)); } catch { /* private mode */ }
+      return next;
+    });
+  }
   const [profileOpen,setProfileOpen] = useState(false);
   function toggleSensitivity(key) {
     setProfile(prev => {
@@ -3949,7 +4203,7 @@ export default function App() {
   // Re-run the personal check when the profile changes, without re-fetching.
   useEffect(() => {
     if (selected) loadRatings(selected, nk(selected.name));
-  }, [profile]);
+  }, [profile, conditions]);
 
   async function runDiagnostics() {
     setDiagRunning(true); setDiag(null);
@@ -4082,9 +4336,10 @@ export default function App() {
       allergens:   entry.offData?.allergens || [],
       ingredients: entry.offData?.ingredients || "",
       labels:      entry.offData?.labels || [],
+      nutriments: nutFor(entry.offData?.nut),
       accolades: rec.accolades || [],
       reviews:   rec.reviews || [],
-      profile,
+      profile, conditions,
     }));
     setContributions(rec.contributions || []);
     const mineD = (rec.contributions || []).find(c => c.by === reviewerId());
@@ -4145,9 +4400,10 @@ export default function App() {
       allergens:   selected.offData?.allergens || [],
       ingredients: selected.offData?.ingredients || "",
       labels:      selected.offData?.labels || [],
+      nutriments: nutFor(selected.offData?.nut),
       accolades: rec.accolades || [],
       reviews:   rec.reviews || [],
-      profile,
+      profile, conditions,
     }));
     setDetailsOpen(false);
     toast("details", contributed.length
@@ -4717,6 +4973,7 @@ export default function App() {
             </>);
             })()}
 
+            <Disclaimer t={t} variant="compact"/>
             <button onClick={() => setPicker(null)} style={{marginTop:14,width:"100%",background:t.pill,border:`1px solid ${t.border}`,borderRadius:8,padding:"9px 14px",cursor:"pointer",fontSize:12,fontWeight:600,color:t.textSub}}>Cancel</button>
           </div>
         </div>
@@ -4746,6 +5003,95 @@ export default function App() {
       {showDbStats && <DbStatsModal/>}
 
       {/* ── HEADER ── */}
+      {/* ── LOCATION PICKER ── */}
+      {marketOpen && (
+        <div onClick={()=>setMarketOpen(false)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
+          <div onClick={e=>e.stopPropagation()} style={{background:t.bg,borderRadius:14,padding:20,maxWidth:420,width:"100%",maxHeight:"80vh",overflowY:"auto",border:`1px solid ${t.border}`}}>
+            <h2 style={{margin:"0 0 4px",fontSize:16,fontWeight:700,color:t.text}}>Where do you shop?</h2>
+            <div style={{fontSize:11,color:t.textSub,lineHeight:1.6,marginBottom:14}}>
+              Alternatives and discovery are drawn from this market. Open Food Facts began in
+              France and its coverage still leans European, so without this the suggestions are
+              products you cannot buy. If nothing local matches, the search widens and those
+              results are labelled.
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+              {Object.entries(MARKETS).map(([k,m]) => {
+                const on = market === k;
+                return (
+                  <button key={k} onClick={()=>{ changeMarket(k); setMarketOpen(false); }}
+                    style={{textAlign:"left",padding:"9px 11px",borderRadius:8,fontSize:12,fontWeight:on?700:500,
+                      background:on?t.accent:t.surface,color:on?t.accentFg:t.text,
+                      border:`1px solid ${on?t.accent:t.border}`,cursor:"pointer"}}>
+                    {m.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── PROFILE ── */}
+      {profilePanel && (
+        <div onClick={()=>setProfilePanel(false)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
+          <div onClick={e=>e.stopPropagation()} style={{background:t.bg,borderRadius:14,padding:20,maxWidth:520,width:"100%",maxHeight:"85vh",overflowY:"auto",border:`1px solid ${t.border}`}}>
+            <h2 style={{margin:"0 0 4px",fontSize:16,fontWeight:700,color:t.text}}>Your profile</h2>
+            <div style={{fontSize:11,color:t.textSub,lineHeight:1.6,marginBottom:16}}>
+              Every product is checked against this. It changes what <em>you</em> are warned
+              about and never changes a product's score for anyone else. Stored on this device
+              only — health information is not uploaded to the shared database.
+            </div>
+
+            <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",color:t.textSub,marginBottom:4}}>Health conditions</div>
+            <div style={{fontSize:10,color:t.textMuted,lineHeight:1.6,marginBottom:8}}>
+              These change which nutrient levels are flagged — sugar for diabetes, salt for blood
+              pressure, phosphates for kidney disease — using the UK FSA per-100 g bands.
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:18}}>
+              {Object.entries(HEALTH_CONDITIONS).map(([key,c]) => {
+                const on = conditions.includes(key);
+                return (
+                  <button key={key} onClick={()=>toggleCondition(key)} title={c.note}
+                    style={{fontSize:11,fontWeight:600,padding:"7px 12px",borderRadius:8,cursor:"pointer",
+                      background:on?t.accent:t.pill,color:on?t.accentFg:t.textSub,
+                      border:`1px solid ${on?t.accent:t.border}`}}>
+                    {c.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",color:t.textSub,marginBottom:4}}>Allergies &amp; sensitivities</div>
+            <div style={{fontSize:10,color:t.textMuted,lineHeight:1.6,marginBottom:8}}>
+              Specific substances you react to. An “organic” or “natural” claim describes farming,
+              not tolerability — these are flagged regardless of what the front of pack says.
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+              {Object.entries(SENSITIVITY_GROUPS).map(([key,g]) => {
+                const on = profile.includes(key);
+                return (
+                  <button key={key} onClick={()=>toggleSensitivity(key)} title={g.note}
+                    style={{fontSize:11,fontWeight:600,padding:"7px 12px",borderRadius:8,cursor:"pointer",
+                      background:on?"#c0392b":t.pill,color:on?"#fff":t.textSub,
+                      border:`1px solid ${on?"#c0392b":t.border}`}}>
+                    {g.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div style={{fontSize:10,color:t.textMuted,lineHeight:1.6,marginTop:16,borderTop:`1px solid ${t.border}`,paddingTop:12}}>
+              Guidance, not medical advice, and not a substitute for reading the pack. If you have
+              a diagnosed allergy or a clinician's dietary limits, those take precedence over
+              anything shown here.
+            </div>
+            <button onClick={()=>setProfilePanel(false)}
+              style={{marginTop:12,width:"100%",padding:"10px 0",fontSize:12,fontWeight:600,borderRadius:8,
+                background:t.accent,color:t.accentFg,border:"none",cursor:"pointer"}}>Done</button>
+          </div>
+        </div>
+      )}
+
       <header style={{background:t.header,borderBottom:`1px solid ${t.border}`,padding:isMobile?"10px 14px":"12px 22px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:isMobile?8:10}}>
         <div style={{display:"flex",alignItems:"center",gap:12}}>
           <div style={{width:42,height:42,background:t.accent,borderRadius:10,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
@@ -4753,7 +5099,7 @@ export default function App() {
           </div>
           <div>
             <div style={{fontSize:9,fontWeight:600,color:t.textMuted,letterSpacing:"0.1em",textTransform:"uppercase",marginBottom:2}}>Hazard Substance Tracker</div>
-            <h1 style={{margin:0,fontSize:"clamp(14px,2vw,19px)",fontWeight:800,color:t.text,letterSpacing:"-0.4px"}}>Food Safety <span style={{color:t.accent}}>Monitor</span></h1>
+            <h1 style={{margin:0,fontSize:"clamp(14px,2vw,19px)",fontWeight:800,color:t.text,letterSpacing:"-0.4px"}}>Safety <span style={{color:t.accent}}>Monitor</span></h1>
           </div>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
@@ -4763,6 +5109,25 @@ export default function App() {
             <span style={{fontSize:12}}>{domain==="cosmetics"?"🧴":"🍽️"}</span>
             <span style={{fontSize:10,fontWeight:600,color:t.textSub}}>{domain==="cosmetics"?"SCCS · CIR":"EFSA · JECFA"}</span>
           </div>
+
+          {/* LOCATION — sets which market alternatives are drawn from */}
+          <button onClick={()=>setMarketOpen(true)} title={`Alternatives are drawn from ${MARKETS[market]?.label}`}
+            style={{background:t.pill,border:`1px solid ${t.border}`,borderRadius:20,padding:isMobile?"5px 10px":"6px 12px",cursor:"pointer",display:"flex",alignItems:"center",gap:6}}>
+            <span style={{fontSize:13}}>🌐</span>
+            <span style={{fontSize:11,fontWeight:600,color:t.textSub}}>{MARKETS[market]?.label || "Anywhere"}</span>
+          </button>
+
+          {/* PROFILE — conditions and sensitivities, stored on this device */}
+          <button onClick={()=>setProfilePanel(true)}
+            title="Health conditions and sensitivities — checked against every product"
+            style={{background:(conditions.length||profile.length)?`${t.accent}18`:t.pill,
+              border:`1.5px solid ${(conditions.length||profile.length)?t.accent:t.border}`,
+              borderRadius:20,padding:isMobile?"5px 10px":"6px 12px",cursor:"pointer",display:"flex",alignItems:"center",gap:6}}>
+            <span style={{fontSize:13}}>🧬</span>
+            <span style={{fontSize:11,fontWeight:600,color:(conditions.length||profile.length)?t.accent:t.textSub}}>
+              {conditions.length+profile.length ? `Profile · ${conditions.length+profile.length}` : "Profile"}
+            </span>
+          </button>
 
           {/* ANALYSIS MODE TOGGLE */}
           <button onClick={toggleAI} title={aiMode?"Enhanced analysis: extended research and generated insights":"Standard analysis (free). Enhanced is $2/week."} style={{background:aiMode?`${t.accent}18`:t.pill,border:`1.5px solid ${aiMode?t.accent:t.border}`,borderRadius:20,padding:"6px 14px",cursor:"pointer",display:"flex",alignItems:"center",gap:8,transition:"all 0.25s"}}>
@@ -5076,6 +5441,7 @@ export default function App() {
                         {discoverMore ? "Loading…" : `Show more (${discover.products.length} of ${discover.count?.toLocaleString?.() || "?"} shown)`}
                       </button>
                     )}
+                    <Disclaimer t={t} variant="compact"/>
                     <div style={{fontSize:10,color:t.textMuted,lineHeight:1.7,marginTop:12}}>
                       Filtered directly on {discover.domain === "cosmetics" ? "Open Beauty Facts" : "Open Food Facts"} — these are not limited to previously scanned products. Select one to run a full analysis.
                       {!discover.hasMore && discover.products.length > 12 && " That is every match for these filters."}

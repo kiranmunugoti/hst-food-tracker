@@ -473,6 +473,171 @@ export function personalAlerts({ additives = [], allergens = [], ingredients = "
   };
 }
 
+// ─── 5b. HEALTH CONDITIONS ─────────────────────────────────────────────────────
+// A sensitivity is "this ingredient reacts with me". A condition is broader: it
+// changes which NUTRIENT levels matter, not just which additives to avoid.
+// Someone with diabetes needs sugar figures read differently; someone with
+// hypertension needs salt read differently. Both are checked against the same
+// product, and neither alters the product's public score.
+//
+// Thresholds follow the UK FSA front-of-pack bands (high/low per 100 g), which
+// are the most widely used published cut-offs. They are guidance, not
+// diagnosis — a clinician's advice overrides anything here.
+const FSA = {
+  sugars:   { high: 22.5, low: 5 },
+  satFat:   { high: 5,    low: 1.5 },
+  salt:     { high: 1.5,  low: 0.3 },
+  fat:      { high: 17.5, low: 3 },
+};
+
+export const HEALTH_CONDITIONS = {
+  diabetes: {
+    label: "Diabetes", short: "Sugar",
+    check: ({ n }) => {
+      const sug = n["sugars_100g"];
+      if (sug == null) return null;
+      if (sug >= FSA.sugars.high) return { level: "high", detail: `${sug} g sugars per 100 g — above the ${FSA.sugars.high} g "high" threshold.` };
+      if (sug >= FSA.sugars.low) return { level: "medium", detail: `${sug} g sugars per 100 g — moderate.` };
+      return null;
+    },
+    note: "Carbohydrate and sugar load matter most here.",
+  },
+  hypertension: {
+    label: "High blood pressure", short: "Salt",
+    check: ({ n }) => {
+      const salt = n["salt_100g"] ?? (n["sodium_100g"] != null ? n["sodium_100g"] * 2.5 : null);
+      if (salt == null) return null;
+      if (salt >= FSA.salt.high) return { level: "high", detail: `${salt.toFixed(2)} g salt per 100 g — above the ${FSA.salt.high} g "high" threshold.` };
+      if (salt >= FSA.salt.low) return { level: "medium", detail: `${salt.toFixed(2)} g salt per 100 g — moderate.` };
+      return null;
+    },
+    note: "Sodium drives blood pressure more than any other nutrient here.",
+  },
+  cholesterol: {
+    label: "High cholesterol / heart", short: "Sat fat",
+    check: ({ n, text }) => {
+      const sf = n["saturated-fat_100g"];
+      const trans = /partially hydrogenated|trans fat/i.test(text);
+      if (trans) return { level: "high", detail: "Contains partially hydrogenated or trans fat." };
+      if (sf == null) return null;
+      if (sf >= FSA.satFat.high) return { level: "high", detail: `${sf} g saturated fat per 100 g — above the ${FSA.satFat.high} g "high" threshold.` };
+      if (sf >= FSA.satFat.low) return { level: "medium", detail: `${sf} g saturated fat per 100 g — moderate.` };
+      return null;
+    },
+    note: "Saturated and trans fats are the relevant figures.",
+  },
+  kidney: {
+    label: "Kidney disease", short: "Phosphate / K",
+    check: ({ n, keys }) => {
+      const phos = keys.filter(k => ["e338","e339","e340","e341","e343","e450","e451","e452"].includes(k));
+      const salt = n["salt_100g"] ?? (n["sodium_100g"] != null ? n["sodium_100g"] * 2.5 : null);
+      if (phos.length) return { level: "high", detail: `Added phosphates (${phos.join(", ").toUpperCase()}) — absorbed far more readily than natural phosphorus.` };
+      if (salt != null && salt >= FSA.salt.high) return { level: "medium", detail: `${salt.toFixed(2)} g salt per 100 g.` };
+      return null;
+    },
+    note: "Added phosphates are absorbed almost completely, unlike phosphorus in whole foods.",
+  },
+  pku: {
+    label: "Phenylketonuria (PKU)", short: "Aspartame",
+    check: ({ keys, text }) => {
+      if (keys.includes("e951") || /aspartame|phenylalanine/i.test(text)) {
+        return { level: "high", detail: "Contains aspartame — a source of phenylalanine." };
+      }
+      return null;
+    },
+    note: "Aspartame releases phenylalanine, which must be strictly limited.",
+  },
+  coeliac: {
+    label: "Coeliac disease", short: "Gluten",
+    check: ({ allergens, text, labels }) => {
+      if (labels.some(l => /gluten-free/i.test(l))) return null;
+      if (allergens.has("gluten")) return { level: "high", detail: "Gluten declared in the allergen list." };
+      if (/wheat|barley|rye|spelt|semolina|malt extract/i.test(text)) return { level: "high", detail: "Gluten-containing grain named in the ingredients." };
+      return null;
+    },
+    note: "Even trace gluten matters; treat the physical pack as authoritative.",
+  },
+  gout: {
+    label: "Gout", short: "Purines",
+    check: ({ keys, text }) => {
+      const hit = keys.filter(k => ["e627","e631","e635","e626","e628","e629","e630","e632","e633","e634"].includes(k));
+      if (hit.length) return { level: "medium", detail: `Purine-based flavour enhancers (${hit.join(", ").toUpperCase()}).` };
+      if (/yeast extract|anchov|sardine|liver|mackerel/i.test(text)) return { level: "medium", detail: "High-purine ingredient named." };
+      return null;
+    },
+    note: "Ribonucleotide enhancers and yeast extract raise purine load.",
+  },
+  ibs: {
+    label: "IBS", short: "FODMAPs",
+    check: ({ keys, text }) => {
+      const pol = keys.filter(k => ["e420","e421","e953","e965","e966","e967","e968"].includes(k));
+      if (pol.length) return { level: "high", detail: `Polyols (${pol.join(", ").toUpperCase()}) — common trigger.` };
+      if (/inulin|chicory root|fructo-oligosaccharide|\bfos\b/i.test(text)) return { level: "medium", detail: "Added inulin or FOS." };
+      if (keys.includes("e407")) return { level: "medium", detail: "Contains carrageenan." };
+      return null;
+    },
+    note: "Polyols, inulin and carrageenan are the usual culprits.",
+  },
+  pregnancy: {
+    label: "Pregnancy", short: "Caffeine / nitrite",
+    check: ({ keys, text }) => {
+      const out = [];
+      if (/caffeine|guarana/i.test(text)) out.push("caffeine");
+      if (keys.some(k => ["e249","e250","e251","e252"].includes(k))) out.push("nitrites");
+      if (/unpasteuri[sz]ed|raw milk/i.test(text)) out.push("unpasteurised dairy");
+      if (/\balcohol\b|ethanol/i.test(text)) out.push("alcohol");
+      return out.length ? { level: out.includes("alcohol") || out.includes("unpasteurised dairy") ? "high" : "medium",
+                            detail: `Contains ${out.join(", ")}.` } : null;
+    },
+    note: "Caffeine, nitrites, unpasteurised dairy and alcohol are the usual cautions.",
+  },
+  asthma: {
+    label: "Asthma", short: "Sulphites",
+    check: ({ keys }) => {
+      const s = keys.filter(k => ["e220","e221","e222","e223","e224","e225","e226","e227","e228"].includes(k));
+      const b = keys.filter(k => ["e210","e211","e212","e213"].includes(k));
+      if (s.length) return { level: "high", detail: `Sulphites (${s.join(", ").toUpperCase()}) — can trigger severe attacks.` };
+      if (b.length) return { level: "medium", detail: `Benzoates (${b.join(", ").toUpperCase()}).` };
+      return null;
+    },
+    note: "Sulphites are the strongest trigger; benzoates matter for some.",
+  },
+  migraine: {
+    label: "Migraine", short: "Triggers",
+    check: ({ keys, text }) => {
+      const out = [];
+      if (keys.some(k => ["e249","e250","e251","e252"].includes(k))) out.push("nitrites");
+      if (keys.includes("e621") || /monosodium glutamate|\bmsg\b/i.test(text)) out.push("MSG");
+      if (keys.includes("e951")) out.push("aspartame");
+      if (/tyramine|aged cheese|matured cheese/i.test(text)) out.push("tyramine sources");
+      return out.length ? { level: "medium", detail: `Contains ${out.join(", ")}.` } : null;
+    },
+    note: "Nitrites, MSG, aspartame and tyramine are common dietary triggers.",
+  },
+};
+
+// Checks a product against declared conditions. Returns one alert per matching
+// condition, never a score — the reader's clinician sets the thresholds that
+// matter, not this app.
+export function conditionAlerts(product = {}, conditions = []) {
+  const n = product.nutriments || {};
+  const keys = (product.additives || []).map(additiveKey);
+  const text = String(product.ingredients || "");
+  const allergens = new Set((product.allergens || []).map(a => String(a).toLowerCase().replace(/^en:/, "")));
+  const labels = (product.labels || []).map(String);
+
+  const alerts = [];
+  for (const key of conditions) {
+    const c = HEALTH_CONDITIONS[key];
+    if (!c) continue;
+    const hit = c.check({ n, keys, text, allergens, labels });
+    if (hit) alerts.push({ key, label: c.label, short: c.short, note: c.note, ...hit });
+  }
+  // Highest severity first — a high-level alert should not sit under a moderate one.
+  const rank = { high: 2, medium: 1 };
+  return alerts.sort((a, b) => (rank[b.level] || 0) - (rank[a.level] || 0));
+}
+
 // ─── 6. COMMUNITY-REPORTED COMPOSITION ─────────────────────────────────────────
 // Additives readers transcribe from a physical label are shown separately from
 // the source data and do NOT move the safety score. A label transcription is
@@ -504,7 +669,7 @@ export function communityComposition(sourceAdditives = [], reportedAdditives = [
 export function productRatings({
   additives = [], accolades = [], reviews = [],
   reportedAdditives = [], allergens = [], ingredients = "", labels = [],
-  profile = [],
+  nutriments = {}, profile = [], conditions = [],
 } = {}) {
   // Safety is computed from SOURCE data only. Reader-reported additives are
   // reported alongside it, never folded into it.
@@ -513,9 +678,10 @@ export function productRatings({
   const community = summariseReviews(reviews);
   const reported = communityComposition(additives, reportedAdditives);
   const personal = personalAlerts({ additives, allergens, ingredients, labels }, profile);
+  const health = conditionAlerts({ additives, allergens, ingredients, labels, nutriments }, conditions);
 
   return {
-    safety, expert, community, reported, personal,
+    safety, expert, community, reported, personal, health,
     headline: { score: safety.score, basis: "CSPI Chemical Cuisine additive tiers (source data only)" },
   };
 }

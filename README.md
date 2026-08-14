@@ -31,10 +31,35 @@ hard to spot — the requests still return HTTP 200.
 | **USDA FoodData Central** | food, supplement | Strong US branded coverage and ingredient statements. No Nutri-Score or NOVA — those stay blank rather than being invented |
 | **Open Beauty Facts** | cosmetics | Separate database, own picker tab |
 
-Ordering is deliberate: OFF answers first and wins on conflict, USDA only tops
-up what OFF did not cover, and the cosmetics tab is queried only when opened.
-OFF allows roughly **10 search requests per minute per IP**, so every avoidable
-request is avoided.
+### Source order depends on the selected market
+
+American brands sell widely outside the US and OFF's coverage of those shelves
+is thin, so FoodData Central is queried **in parallel with OFF almost
+everywhere**:
+
+| Market | Name search | Barcode lookup |
+|---|---|---|
+| United States | USDA + OFF in parallel, **USDA leads** | USDA → OFF → OBF |
+| India, Australia, Canada, Japan, UAE, Singapore, Brazil, South Africa, Mexico, NZ, Anywhere | USDA + OFF in parallel, **OFF leads** | OFF → OBF → USDA |
+| UK, Ireland, Germany, France, Spain, Italy, Netherlands, Belgium, Switzerland | OFF only | OFF → OBF |
+
+Europe is the exception: OFF originated there, its European coverage is its
+strongest, and European formulations genuinely differ from US ones — different
+permitted additives, different recipes under the same brand — so an FDC record
+would describe a product that is not on the shelf.
+
+Which source leads differs by market. In the US, FDC is the likelier match.
+Elsewhere OFF leads because it carries local brands FDC has never indexed, with
+FDC interleaved to surface the imported American products.
+
+FDC has its own budget (1,000/hour) separate from OFF's 10/minute, so parallel
+calls cost OFF nothing and halve the wait.
+
+**Known limitation:** an FDC record always describes the US formulation. Where a
+brand sells a locally-made variant, the additive list may differ from the pack in
+hand — which is why the disclaimer states that formulations differ by country.
+
+The cosmetics tab is queried only when opened.
 
 ### Deduplication
 
@@ -207,3 +232,22 @@ their CSPI tier, and **do not move the safety score**. A transcription is
 plausible but unverified, and one person's reading should not silently re-rate a
 product for everyone. The panel states what the score *would* be if confirmed —
 information without assertion, leaving the judgement with the reader.
+
+
+---
+
+## Disclaimer placement (v9.1)
+
+One `Disclaimer` component, used in four places: the product card (full), the
+alternatives list, the browse picker and discovery results (compact). Single
+definition so the wording cannot drift apart between surfaces.
+
+The specific claim it counters: a label reading "vegan", "organic", "natural" or
+"100% pure" describes how a product was made or what it excludes — it is not a
+statement that the product is safe for the person reading. Cyanide is vegan.
+Sulphites in organic wine still send asthmatics to hospital. A general score
+cannot capture an allergen, an interaction or a personal limit.
+
+It also states plainly that source data can be incomplete, out of date, or wrong
+for a local version of a product, since recipes differ between countries and
+change without notice. The physical pack is the authority.

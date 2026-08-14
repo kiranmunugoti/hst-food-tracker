@@ -1,7 +1,7 @@
 {
   "name": "hst-food-tracker",
   "private": true,
-  "version": "8.8.0",
+  "version": "9.4.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
