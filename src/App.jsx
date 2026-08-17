@@ -2282,6 +2282,88 @@ function photoKeyFor(entry) {
 //   "mismatch"  — the label clearly shows something else; the upload is refused
 //   "unclear"   — no legible label, or the check is unavailable; accepted but
 //                 recorded as unverified rather than silently trusted
+// Deterministic verification, tried first: decode any barcode visible in the
+// photo and compare it with the record's barcode.
+//
+// This is stronger than reading label text, and needs no API and no server.
+// A barcode is an exact identifier — if the photo shows 7613034626844 and the
+// record is 7613034626844, it is the same product, full stop. Reading the brand
+// name can only ever say "plausibly".
+//
+// Returns null when no barcode is legible, which is common for a photo framed on
+// the front of a pack — the caller then falls back to the label check.
+async function verifyPhotoByBarcode(bitmap, expectedCode) {
+  const want = String(expectedCode || "").replace(/\D/g, "").replace(/^0+/, "");
+  if (!want) return null;
+  let detector = null;
+  if ("BarcodeDetector" in window) {
+    try { detector = new window.BarcodeDetector({ formats: BARCODE_FORMATS }); } catch { /* none */ }
+  }
+  const found = await decodeLadder(bitmap, detector, null, { fast: true }).catch(() => null);
+  if (!found?.code) return null;
+  const got = String(found.code).replace(/\D/g, "").replace(/^0+/, "");
+  if (!got) return null;
+  return got === want
+    ? { verdict: "match", reason: `Barcode ${got} in the photo matches the record.`, seen: got }
+    : { verdict: "mismatch", reason: `The photo shows barcode ${got}, but this record is ${want}.`, seen: got };
+}
+
+// Reads the human-readable digits printed under a barcode.
+//
+// This is the last resort after every decode strategy has failed. A barcode's
+// bars can be unreadable — foil glare, curvature, damage — while the digits
+// beside them are perfectly legible, so a photo that no decoder can parse often
+// still carries the number in plain type.
+//
+// The result is always PROPOSED, never applied. OCR confuses 8/B, 5/S, 1/7, and
+// a wrong barcode silently returns a different product's analysis — which for
+// someone checking for gelatin is worse than no answer at all. So the digits are
+// filled into the field for the reader to check against the pack, with the
+// checksum result shown as evidence.
+async function readBarcodeDigits(base64) {
+  const prompt = `This photo shows a product barcode. Read ONLY the human-readable digits printed beside or beneath the bars.
+
+Reply with ONLY a JSON object, no other text:
+{"digits":"<the digits, no spaces or dashes>","confidence":"high"|"low","note":"<what you could and could not read>"}
+
+Rules:
+- Return digits exactly as printed, including any leading zero and any digit set apart from the main block.
+- Typical lengths are 8, 12, 13 or 14 digits.
+- If any digit is uncertain or obscured, set confidence to "low" and still return your best reading.
+- If no digits are legible at all, return {"digits":"","confidence":"low","note":"not legible"}.`;
+
+  const body = {
+    model: "claude-sonnet-4-6",
+    max_tokens: 200,
+    messages: [{ role: "user", content: [
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64 } },
+      { type: "text", text: prompt },
+    ]}],
+  };
+
+  const call = async (url) => {
+    const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
+    const d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error?.message || ("HTTP " + r.status));
+    return (d.content || []).filter(c => c.type === "text").map(c => c.text).join("");
+  };
+
+  let text = "";
+  try { text = await call("https://api.anthropic.com/v1/messages"); }
+  catch { text = await call("/api/claude"); }
+
+  const parsed = JSON.parse(String(text).replace(/```json|```/g, "").trim());
+  const digits = String(parsed.digits || "").replace(/\D/g, "");
+  return {
+    digits,
+    confidence: parsed.confidence === "high" ? "high" : "low",
+    note: String(parsed.note || ""),
+    // Independent evidence the reader can weigh: a GTIN check digit that
+    // validates means the reading is almost certainly correct.
+    checksumOk: digits.length >= 8 ? validBarcodeChecksum(digits) : false,
+  };
+}
+
 async function verifyPhotoMatches(base64, name, brand) {
   const prompt = `You are checking whether a product photo matches a database record.
 
@@ -2586,7 +2668,7 @@ async function transformBitmap(bitmap, { rotate = 0, crop = null, scale = 1 } = 
 // Only after ALL of these fail is the image genuinely unreadable — and then
 // the still is kept rather than discarded, so the reader can type the digits
 // they can plainly see.
-async function decodeLadder(bitmap, detector, onProgress) {
+async function decodeLadder(bitmap, detector, onProgress, { fast = false } = {}) {
   const attempts = [
     ["reading", async () => bitmap],
     ["boosting contrast", async () => enhanceForDecode(bitmap)],
@@ -2609,10 +2691,14 @@ async function decodeLadder(bitmap, detector, onProgress) {
     // Tiled sweep — the rung that finds small codes on small packs. Nine
     // overlapping tiles, each magnified, so a code occupying a ninth of the
     // frame is decoded as though it filled it.
-    ...tileRegions().map((crop, i) => [
+    //
+    // Skipped in fast mode. Twenty rungs over a full-resolution photo takes
+    // seconds, and the background loop runs every two seconds — so the slow
+    // path belongs on a deliberate Capture, not on autopilot.
+    ...(fast ? [] : tileRegions().map((crop, i) => [
       `sweeping area ${i + 1}/9`,
       async () => enhanceForDecode(await transformBitmap(bitmap, { crop, scale: 2.5 })),
-    ]),
+    ])),
   ];
 
   if (detector) {
@@ -2624,6 +2710,8 @@ async function decodeLadder(bitmap, detector, onProgress) {
       } catch { /* next rung */ }
     }
   }
+
+  if (fast) return null;
 
   // Different decoder, same image. This is the rung that most often rescues a
   // still the native detector has already refused.
@@ -2722,7 +2810,8 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
   const [message, setMessage] = useState("");
   const [torchOn, setTorchOn] = useState(false);
   const detectorRef  = useRef(null);   // BarcodeDetector, reused for file decode
-  const capturingRef = useRef(false);  // guards overlapping capture attempts
+  const capturingRef = useRef(false);  // manual capture in progress
+  const autoBusyRef  = useRef(false);  // background attempt in progress — must NOT block manual
   const captureNowRef = useRef(null);  // manual "Capture" action, set once scanning starts
   const fileRef      = useRef(null);
   // When every decode strategy fails the still is KEPT, not discarded. The
@@ -2730,6 +2819,21 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
   // decoder can — throwing the image away wastes the one capture that worked.
   const [failedShot, setFailedShot] = useState(null);   // { url, typed }
   const [typedCode, setTypedCode]   = useState("");
+  const [readState, setReadState]   = useState(null);   // { busy } | { digits, confidence, checksumOk, note }
+
+  // Proposes the digits from the photo. Fills the field rather than searching,
+  // so the reader confirms against the pack before anything is looked up.
+  async function readDigitsFromShot() {
+    if (!failedShot?.base64) return;
+    setReadState({ busy: true });
+    try {
+      const r = await readBarcodeDigits(failedShot.base64);
+      setReadState(r);
+      if (r.digits) setTypedCode(r.digits);
+    } catch (e) {
+      setReadState({ error: String(e?.message || e) });
+    }
+  }
   const [canTorch, setCanTorch] = useState(false);
   // Optical/digital zoom. This is the fix for a small barcode: a phone camera
   // cannot focus closer than roughly 10 cm, so moving in to fill the frame just
@@ -2861,12 +2965,14 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
       };
 
       // Runs the full decode ladder over a still and reports progress.
-      const decodeStill = async (detector, bitmap) => {
+      const decodeStill = async (detector, bitmap, { fast = false, keepOnFail = true } = {}) => {
         if (!bitmap) return null;
-        const r = await decodeLadder(bitmap, detector, (step) => setMessage(`Captured — ${step}…`));
+        const r = await decodeLadder(bitmap, detector, (step) => setMessage(`Captured — ${step}…`), { fast });
         if (r) return r.code;
-        // Every strategy failed. Keep the image so the digits can be typed.
-        keepFailedShot(bitmap);
+        // Only a deliberate capture keeps the image. Auto attempts run in the
+        // background, and popping the type-the-digits panel up mid-scan while
+        // the user is still framing the code is noise.
+        if (keepOnFail) keepFailedShot(bitmap);
         return null;
       };
 
@@ -2898,32 +3004,40 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
             // resolve this label — so grab a sharper still and decode that
             // instead of continuing to loop. Repeats every 2s, up to 4 tries,
             // which covers the user bringing the code into frame.
-            if (ts - started > 2000 && ts - lastStill > 2000 && stills < 4 && !capturingRef.current) {
+            // Auto attempts use their OWN flag, not the shared one. The manual
+            // Capture button was gated on capturingRef, which this loop held for
+            // the duration of each attempt — so pressing Capture during an auto
+            // attempt returned silently and the button appeared dead.
+            if (ts - started > 1500 && ts - lastStill > 2500 && stills < 4
+                && !autoBusyRef.current && !capturingRef.current) {
               lastStill = ts;
               stills++;
-              capturingRef.current = true;
-              setMessage(`Auto-capturing a sharper photo (${stills}/4)…`);
+              autoBusyRef.current = true;
+              setMessage(`Looking harder (${stills}/4)…`);
               try {
-                const code = await decodeStill(detector, await captureStill());
+                const code = await decodeStill(detector, await captureStill(), { fast: true, keepOnFail: false });
                 if (code && handle(code)) return;
                 setMessage(stills >= 4
-                  ? "Still no read. Small foil-wrapped packs (KitKat, Reese's) are the hardest — try Capture with the code filling half the frame, light OFF to kill glare, or type the digits."
+                  ? "Not readable from the video. Press Capture for a full-strength scan of one photo — or type the digits."
                   : "Reading — keep the barcode in frame.");
               } catch { /* keep the live loop running */ }
-              finally { capturingRef.current = false; }
+              finally { autoBusyRef.current = false; }
             }
 
             requestAnimationFrame(tick);
           };
           requestAnimationFrame(tick);
           captureNowRef.current = async () => {
-            if (capturingRef.current) return;
+            // Only guards against a second press, never against the background
+            // loop — a pressed button must always do something visible.
+            if (capturingRef.current) { setMessage("Already scanning that photo…"); return; }
             capturingRef.current = true;
-            setMessage("Capturing…");
+            stills = 99;                     // stand the auto loop down; the user has taken over
+            setMessage("Capturing — full scan, this takes a few seconds…");
             try {
-              const code = await decodeStill(detector, await captureStill());
+              const code = await decodeStill(detector, await captureStill(), { fast: false, keepOnFail: true });
               if (code && handle(code)) return;
-              setMessage("No decoder could read that capture — type the digits below instead.");
+              setMessage("No decoder could read that photo — the digits under the barcode can be typed below.");
             } catch (e) {
               setMessage("Capture failed: " + String(e?.message || e));
             } finally { capturingRef.current = false; }
@@ -2977,7 +3091,8 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
       c.width = Math.round(bitmap.width * scale);
       c.height = Math.round(bitmap.height * scale);
       c.getContext("2d").drawImage(bitmap, 0, 0, c.width, c.height);
-      setFailedShot({ url: c.toDataURL("image/jpeg", 0.85) });
+      const url = c.toDataURL("image/jpeg", 0.85);
+      setFailedShot({ url, base64: url.split(",")[1] });
     } catch { /* display is a bonus, not a requirement */ }
   }
 
@@ -3063,8 +3178,31 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
           </div>
           <img src={failedShot.url} alt="captured barcode"
             style={{width:"100%",maxHeight:150,objectFit:"contain",background:"#000",borderRadius:8,marginBottom:8}}/>
+          {/* Offered before the manual field, because it saves typing 13 digits
+              off a screen — but it fills the field rather than searching, so the
+              reader still confirms. */}
+          <button onClick={readDigitsFromShot} disabled={readState?.busy}
+            style={{width:"100%",padding:"9px 0",fontSize:12,fontWeight:600,borderRadius:8,marginBottom:8,
+              background:"rgba(255,255,255,0.15)",color:"#fff",
+              border:"1px solid rgba(255,255,255,0.35)",cursor:readState?.busy?"default":"pointer"}}>
+            {readState?.busy ? "Reading the digits…" : "Read the number from the photo"}
+          </button>
+
+          {readState && !readState.busy && (
+            <div style={{fontSize:10,lineHeight:1.6,marginBottom:8,
+              color: readState.error ? "#ff9b9b" : readState.checksumOk ? "#9be7b4" : "#ffd08a"}}>
+              {readState.error
+                ? `Could not read it automatically (${readState.error}). Type the digits below.`
+                : !readState.digits
+                  ? `No digits were legible. ${readState.note} Type them below.`
+                  : readState.checksumOk
+                    ? `Read ${readState.digits} — the check digit validates, so this is very likely correct. Compare it with the pack, then search.`
+                    : `Read ${readState.digits} — but the check digit does NOT validate, so at least one digit is misread. Correct it against the pack before searching.`}
+            </div>
+          )}
+
           <div style={{display:"flex",gap:8}}>
-            <input value={typedCode} onChange={e => setTypedCode(e.target.value.replace(/\D/g, ""))}
+            <input value={typedCode} onChange={e => { setTypedCode(e.target.value.replace(/\D/g, "")); setReadState(null); }}
               inputMode="numeric" placeholder="e.g. 8901234567890" maxLength={14}
               style={{flex:1,boxSizing:"border-box",fontSize:14,padding:"10px 12px",borderRadius:8,
                 border:"1px solid rgba(255,255,255,0.3)",background:"rgba(255,255,255,0.1)",color:"#fff",
@@ -3077,7 +3215,7 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
               Search
             </button>
           </div>
-          <button onClick={() => { setFailedShot(null); setTypedCode(""); setMessage(""); }}
+          <button onClick={() => { setFailedShot(null); setTypedCode(""); setReadState(null); setMessage(""); }}
             style={{marginTop:8,background:"none",border:"none",color:"rgba(255,255,255,0.6)",
               fontSize:11,cursor:"pointer",padding:0,textDecoration:"underline"}}>
             Dismiss and keep scanning
@@ -4252,6 +4390,8 @@ export default function App() {
   const addPhotoRef = useRef(null);
   const [addOpen,setAddOpen] = useState(false);
   const [addPrompt,setAddPrompt] = useState(false);
+  const [newPhoto,setNewPhoto]   = useState(null);
+  const newPhotoRef = useRef(null);
   const [noListFor,setNoListFor] = useState(null);   // { name, label, key }
   const [noListText,setNoListText] = useState("");
   const [newProduct,setNewProduct] = useState({
@@ -4444,20 +4584,27 @@ export default function App() {
       `${domainLabel()} is rate-limiting requests (10 per minute). Wait a minute, then press ↻.`);
     else if (_offStatus === "network") toast("scan",
       `${domainLabel()} is unreachable from this browser — the analysis is name-based only. Press ↻ to retry.`);
-    else if (_offStatus === "unknown-code") {
-      setNewProduct(p => ({ ...p, code: label.replace(/\D/g, "") }));
-      setAddPrompt(true);
-    } else if (_offStatus === "nomatch") {
-      setNewProduct(p => ({ ...p, name: p.name || label }));
-      setAddPrompt(true);
-    }
 
-    // A missing ingredient list is the one gap worth interrupting for: every
-    // check the app performs depends on it, and the reader is holding the pack
-    // right now. Raised as a dialog they can fill in on the spot rather than a
-    // toast that scrolls away.
+    // Two different gaps, two different forms. Conflating them meant a product
+    // that no database had at all was only ever asked for its ingredient list —
+    // no name, brand, barcode or photo — so the record stayed a stub.
+    const hasRecord = !!a.offData?.name && a.offData?.source !== "community-stub";
     const noList = !String(a.offData?.ingredients || "").trim();
-    if (noList) setNoListFor({ name, label, key });
+
+    if (_offStatus === "unknown-code" || _offStatus === "nomatch" || !hasRecord) {
+      // Nothing on file: ask for the whole product, prefilled with what is known.
+      const digits = label.replace(/\D/g, "");
+      setNewProduct(p => ({
+        ...p,
+        code: digits.length >= 8 ? digits : p.code,
+        name: digits.length >= 8 ? p.name : (p.name || label),
+        domain: a.domain === "cosmetics" ? "cosmetics" : "food",
+      }));
+      setAddPrompt(true);
+    } else if (noList) {
+      // Record exists but the ingredient list is missing — the narrower ask.
+      setNoListFor({ name, label, key });
+    }
 
     if (history) {
       // The rating is shown for every brand with any prior record, not only
@@ -4776,6 +4923,12 @@ export default function App() {
         setAddPhoto(null);
       }
       toast("add", `"${offData.name}" added to the shared database${offData.code ? ` under barcode ${offData.code}` : ""}. It will be found by anyone who scans it.`);
+      // The photo goes through the same verification and quality gate as any
+      // other upload, so a new product is not a way around those checks.
+      if (newPhoto) {
+        await attachPhoto(newPhoto, { name: offData.name, offData });
+        setNewPhoto(null);
+      }
       setNewProduct({ name:"", brand:"", code:"", domain:"food", ingredients:"", additives:"", allergens:"", labels:"", quantity:"", category:"" });
     } catch (e) {
       console.warn("submitNewProduct:", e);
@@ -4840,7 +4993,10 @@ export default function App() {
       // sharp, well-lit photo of the wrong pack passes every quality check, so
       // this is the only step that catches it.
       setPhotoNote("Checking the photo matches this product…");
-      const check = await verifyPhotoMatches(img.base64, entry.name, entry.offData?.brand);
+      // Barcode first: exact, free, offline. The label check is only reached
+      // when no barcode is visible in the shot.
+      let check = await verifyPhotoByBarcode(original, entry.offData?.code).catch(() => null);
+      if (!check) check = await verifyPhotoMatches(img.base64, entry.name, entry.offData?.brand);
       setPhotoNote("");
       if (check.verdict === "mismatch") {
         setPhotoBusy(false);
@@ -5867,6 +6023,17 @@ export default function App() {
                 📷 Add a photo of the pack
               </button>
             )}
+
+            {/* Photo, in the same form. Adding a product without one leaves an
+                unidentifiable record, and the pack is in the user's hand now. */}
+            <input ref={newPhotoRef} type="file" accept="image/*" capture="environment" style={{display:"none"}}
+              onChange={e => { const f = e.target.files?.[0]; e.target.value = ""; if (f) setNewPhoto(f); }}/>
+            <button onClick={() => newPhotoRef.current?.click()}
+              style={{width:"100%",padding:"9px 0",fontSize:12,fontWeight:600,borderRadius:8,cursor:"pointer",
+                background:newPhoto?`${t.accent}18`:t.pill, color:newPhoto?t.accent:t.textSub,
+                border:`1px solid ${newPhoto?t.accent:t.border}`,marginBottom:7}}>
+              {newPhoto ? `✓ Photo attached (${Math.round(newPhoto.size/1024)} KB) — tap to change` : "📷 Add a photo of the pack"}
+            </button>
 
             <div style={{fontSize:9.5,color:t.textMuted,lineHeight:1.6,margin:"6px 0 12px"}}>
               The ingredient list is what the hazard analysis reads, so it matters most. Nutri-Score

@@ -499,3 +499,72 @@ header, iOS home-screen title — which is why they had drifted apart.
 The one exception is `capacitor.config.json` (`appName`, `appId`): native app
 stores read it at package time, not build time, so edit it by hand if you ship a
 native build.
+
+## v10.4 — capture, add-product and verification fixes
+
+### The Capture button did nothing
+
+Manual capture and the background auto-capture shared one `capturingRef` flag.
+The background loop held it for the duration of each attempt, and the button's
+handler returned immediately when it was set — so a press during an auto attempt
+was silently discarded. With attempts every ~2s and each running all 20 decode
+rungs over a full-resolution photo (~3.6s), the flag was set most of the time.
+
+Fixed three ways:
+- Separate flags. `autoBusyRef` for background attempts, `capturingRef` for
+  manual only. A press now guards only against a second press, and says so.
+- Auto attempts use a **fast ladder** (6 rungs, no tiled sweep, no second
+  decoder) so they fit inside their interval. The full 20-rung sweep is reserved
+  for a deliberate Capture, which is what makes the button worth pressing.
+- Pressing Capture stands the auto loop down — the user has taken over.
+
+Auto attempts also no longer pop the type-the-digits panel; only a deliberate
+capture does.
+
+### A not-found product now asks for everything
+
+Any product with no record routes to the **full add-product form** — name, brand,
+barcode, food/cosmetic, pack size, category, ingredients, additives, allergens,
+claims **and a photo** — prefilled with the scanned barcode or search term.
+Previously an unknown barcode only ever raised the ingredient-list dialog, so the
+record stayed a stub with no name or photo. The narrower dialog is now used only
+where a record exists but its ingredient list is missing.
+
+### Photo verification by barcode, not by API
+
+Verification now tries the **barcode in the photo** first: decode it and compare
+with the record's code. Exact, free, offline, no API key. A barcode is an
+identifier — matching codes prove the same product, where reading a brand name
+can only say "plausibly".
+
+The label-text check is reached only when no barcode is legible in the shot
+(common when framing the front of a pack). Order: barcode → label text →
+`unclear`.
+
+## v10.5 — reading the printed digits
+
+When every decode strategy fails, the kept photo now has a **"Read the number
+from the photo"** button. A barcode's bars can be unreadable — foil glare,
+curvature, damage — while the digits beside them are perfectly legible, so a
+photo no decoder can parse often still carries the number in plain type.
+
+**The reading is proposed, never applied.** It fills the field for the reader to
+check against the pack; it does not search. OCR confuses 8/6, 5/S, 1/7, and a
+wrong barcode silently returns a *different product's* analysis — for someone
+checking for gelatin, worse than no answer.
+
+The **GTIN check digit** is shown as independent evidence:
+
+| result | message |
+|---|---|
+| checksum validates | "very likely correct — compare with the pack, then search" |
+| checksum fails | "at least one digit is misread — correct it before searching" |
+| nothing legible | "type them below" |
+
+Tested against plausible misreads of a real KitKat barcode: the check digit
+caught 3/3 single-digit and transposition errors. It cannot catch a
+compensating pair of errors, which is why the pack remains the authority.
+
+Requires `ANTHROPIC_API_KEY` on the server. Without it the button reports that it
+is unavailable and the manual field still works — reading is a convenience over
+typing, never the only route.
