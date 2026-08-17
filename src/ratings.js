@@ -129,7 +129,28 @@ export function cspiTier(additive) {
 
 // Assesses a product against the CSPI tiers.
 // Returns a 1–10 score where 10 is cleanest, plus the reasoning behind it.
-export function cspiAssess(additives = []) {
+// `hasIngredients` distinguishes the two situations an empty additive list can
+// mean, which are opposite in every way that matters:
+//
+//   a clean label   — an ingredient list exists and contains nothing of concern
+//   no data at all  — nothing has been examined
+//
+// Both used to score 10/10. That put an unexamined product level with a
+// genuinely clean one, which is the most misleading output the app could
+// produce. With no data the score is now null, and null must be rendered as
+// "unknown" rather than coerced to a number.
+export function cspiAssess(additives = [], { hasIngredients = true } = {}) {
+  if (!additives.length && !hasIngredients) {
+    return {
+      score: null, unknown: true, worstTier: null, worstLabel: null,
+      counts: { avoid: 0, caution: 0, sensitive: 0, cutback: 0, safe: 0 },
+      rated: [], unrated: [], coverage: 0,
+    };
+  }
+  return cspiScore(additives);
+}
+
+function cspiScore(additives = []) {
   const rated = [], unrated = [];
   for (const a of additives) {
     const rec = cspiTier(a);
@@ -409,6 +430,23 @@ export const SENSITIVITY_GROUPS = {
     additives: ["e120"],
     ingredients: /carmine|cochineal|carminic/i,
   },
+  gelatin: {
+    label: "Gelatin", note: "Animal collagen — usually pork or beef. Avoided for dietary, religious and ethical reasons.",
+    additives: ["e441"],
+    ingredients: /\bgelatin(e|es)?\b|gelling agent \(?gelatin|hydrolysed collagen|hydrolyzed collagen|isinglass|kosher gelatin|halal gelatin/i,
+  },
+  animalDerived: {
+    label: "Animal-derived additives", note: "Additives that may be animal-sourced without saying so on the front of pack.",
+    // E471 and E570 can be plant or animal and the label rarely says which;
+    // flagged as possible rather than certain, which is the honest reading.
+    additives: ["e441","e120","e542","e901","e904","e910","e913","e920","e921","e471","e570","e631","e632"],
+    ingredients: /\bgelatin|rennet|shellac|carmine|cochineal|lard|tallow|suet|isinglass|lanolin|l-cysteine|bone (char|phosphate)|beeswax|casein|whey|albumen|anchov/i,
+  },
+  pork: {
+    label: "Pork derivatives", note: "Includes gelatin and enzymes of porcine origin, which are often unlabelled as such.",
+    additives: ["e441","e542","e920"],
+    ingredients: /\bpork\b|bacon|lard|porcine|gelatin(?!e?\s*\(fish)/i,
+  },
   gluten: {
     label: "Gluten", note: "Coeliac disease and non-coeliac sensitivity.",
     allergens: ["gluten"],
@@ -464,9 +502,17 @@ export function personalAlerts({ additives = [], allergens = [], ingredients = "
   // farming method, not tolerability.
   const claimsNatural = labels.some(l => /organic|bio|natural|clean/i.test(String(l)));
 
+  // Absence of evidence is not evidence of absence. With no ingredient list and
+  // no additive tags there is nothing to match against, so zero hits means
+  // "could not check" — NOT "safe". Reporting the latter is how someone eats
+  // gelatin they were avoiding: the product looked cleared when it was simply
+  // unexamined.
+  const insufficientData = !text.trim() && additives.length === 0 && allergenSet.size === 0;
+
   return {
     hits,
-    clear: hits.length === 0,
+    insufficientData,
+    clear: hits.length === 0 && !insufficientData,
     // Only meaningful when the reader has actually declared something.
     checked: profile.length > 0,
     misleadingClaim: claimsNatural && hits.length > 0,
@@ -633,6 +679,8 @@ export function conditionAlerts(product = {}, conditions = []) {
     const hit = c.check({ n, keys, text, allergens, labels });
     if (hit) alerts.push({ key, label: c.label, short: c.short, note: c.note, ...hit });
   }
+  // Attached so callers can tell "checked, nothing found" from "nothing to check".
+  alerts.insufficientData = !text.trim() && keys.length === 0 && Object.values(n).every(v => v == null);
   // Highest severity first — a high-level alert should not sit under a moderate one.
   const rank = { high: 2, medium: 1 };
   return alerts.sort((a, b) => (rank[b.level] || 0) - (rank[a.level] || 0));
@@ -649,8 +697,8 @@ export function communityComposition(sourceAdditives = [], reportedAdditives = [
   const novel = [...new Set(reportedAdditives.map(additiveKey))].filter(k => !known.has(k));
   if (!novel.length) return { reported: [], wouldBe: null, count: 0 };
 
-  const combined = cspiAssess([...sourceAdditives, ...novel]);
-  const current = cspiAssess(sourceAdditives);
+  const combined = cspiScore([...sourceAdditives, ...novel]);
+  const current = cspiScore(sourceAdditives);
 
   return {
     reported: novel.map(k => ({ additive: k, ...(cspiTier(k) || { tier: null, name: k, why: "Not in the curated CSPI subset." }) })),
@@ -673,7 +721,8 @@ export function productRatings({
 } = {}) {
   // Safety is computed from SOURCE data only. Reader-reported additives are
   // reported alongside it, never folded into it.
-  const safety = cspiAssess(additives);
+  const hasIngredients = String(ingredients || "").trim().length > 0;
+  const safety = cspiAssess(additives, { hasIngredients });
   const expert = aggregateAccolades(accolades);
   const community = summariseReviews(reviews);
   const reported = communityComposition(additives, reportedAdditives);
@@ -682,6 +731,11 @@ export function productRatings({
 
   return {
     safety, expert, community, reported, personal, health,
-    headline: { score: safety.score, basis: "CSPI Chemical Cuisine additive tiers (source data only)" },
+    headline: {
+      score: safety.score,
+      basis: safety.unknown
+        ? "Not scored — no ingredient data on record"
+        : "CSPI Chemical Cuisine additive tiers (source data only)",
+    },
   };
 }

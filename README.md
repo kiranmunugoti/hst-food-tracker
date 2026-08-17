@@ -251,3 +251,251 @@ cannot capture an allergen, an interaction or a personal limit.
 It also states plainly that source data can be incomplete, out of date, or wrong
 for a local version of a product, since recipes differ between countries and
 change without notice. The physical pack is the authority.
+
+---
+
+## Adding products (v9.6)
+
+Regional brands, small producers and local formulations are missing from every
+open database. A reader holding the pack is a better source than anything
+queryable, so they can create the record.
+
+**Where it appears:** a prompt at the dead end — an unknown barcode or a
+no-match search — with the barcode or name prefilled. Not buried in a menu.
+
+**What it captures:** name, brand, barcode, food/cosmetic, pack size, category,
+full ingredient list, additives, allergens and pack claims. The ingredient list
+matters most: it is what the hazard analysis reads.
+
+**What it deliberately does not capture:** Nutri-Score, NOVA and Eco-Score stay
+null. Those are computed by Open Food Facts from data this form does not
+collect, and a guessed grade would be worse than none.
+
+**Discovery:** community records live in the same shared database as scanned
+ones and are checked by barcode *before* any remote source — free, instant, and
+the only place a product absent from every open database can be found. Leading
+zeros are normalised, so GTIN-12 and GTIN-13 forms of the same code match.
+
+**Provenance:** a community record shows an amber banner above the scores saying
+it was typed in from a pack by a reader and is unverified. It never passes as
+curated source data.
+
+The form also suggests adding the product to openfoodfacts.org, which benefits
+every app using that data rather than only this one.
+
+---
+
+## Product photos (v9.7)
+
+USDA records carry no photography at all, and community-added products start
+with none, so readers can attach a photo — from the camera or the gallery.
+
+**Storage: separate repository files, never inside `db.json`.** `ghWrite()`
+rewrites the entire database file on every save, so an embedded base64 image
+would be re-uploaded on every subsequent write by anyone. At 640px that is
+~75 KB per product — 1,000 products would mean a 74 MB upload each time a single
+review is saved, past what GitHub's contents API accepts. One file per image
+under `images/<key>.jpg` keeps the database holding a ~90-byte URL.
+
+**Compression before upload** — 640px longest edge, JPEG quality 0.72:
+
+| source | before | after |
+|---|---|---|
+| iPhone 12MP | 3.4 MB | ~33 KB |
+| Android 48MP | 7.8 MB | ~33 KB |
+
+**Without a write token** the photo is saved to `localStorage` for that device
+and labelled "On this device only", rather than silently appearing shared. If
+local storage is full the failure is reported rather than swallowed.
+
+The image upload happens *after* the product record is saved, so a failed photo
+never blocks the product itself.
+
+## Product photos (v9.7)
+
+Photos are stored one file per product under `images/` in the database repo, not
+inside the shared JSON. `ghWrite` rewrites the whole database file on every save,
+so an embedded base64 image would be re-uploaded on every subsequent write by
+anyone — at 640px that is ~75 KB per product, and 1,000 products would mean a
+74 MB upload each time someone saves a review.
+
+### Replacing a duplicate
+
+A second upload for a product that already has a photo does **not** simply
+overwrite it. Both are scored and the better one wins:
+
+| Signal | Weight | What it catches |
+|---|---|---|
+| Sharpness | 0.55 | Variance of a Laplacian — blur collapses it |
+| Exposure | 0.25 | Clipping **and** dynamic range (p5–p95) |
+| Resolution | 0.20 | Diminishing returns, so it cannot outweigh blur |
+
+The new photo must beat the existing one by a margin of 0.06, because two shots
+of the same pack score within noise of each other and churning the shared image
+on a 1% difference is worse than leaving a good one alone. When it loses, the
+user is told both scores and why.
+
+Scores are stored with the record so the next comparison needs no re-download.
+Where an old record has no stored score, the existing image is fetched and
+scored; if that fails the state is treated as unknown and the new photo wins,
+which is stated rather than silently assumed.
+
+Both photos are scored **before** compression, so the comparison reflects what
+the cameras captured rather than the encoder.
+
+### One photo per barcode, verified against the record
+
+Images are keyed by **barcode**, not product name (`images/code-<gtin>.jpg`).
+Two differently-named records for the same pack therefore share one image, and a
+re-upload targets the same file instead of accumulating duplicates. Leading zeros
+are normalised, so GTIN-12 and GTIN-13 forms resolve to the same file. Products
+with no barcode fall back to the name key.
+
+Before an image is shared it is checked against the record: the label in the
+photo is read and compared with the product name and brand. Quality scoring
+cannot do this — a sharp, well-lit photo of the wrong pack scores perfectly.
+
+| Verdict | Result |
+|---|---|
+| `match` | Accepted, subject to the quality gate |
+| `mismatch` | **Refused**, naming what was seen instead |
+| `unclear` | Accepted but marked unverified for other readers |
+
+A mismatch is refused regardless of quality — a better photo of the wrong
+product is still the wrong product. An unparseable or unavailable verification
+returns `unclear`, never `match`, so a failed check cannot read as approval.
+
+Verification requires `ANTHROPIC_API_KEY` on the server. Without it every photo
+is `unclear`: still accepted, still labelled unverified.
+
+## Missing ingredient lists (v9.9)
+
+### The bug this fixes
+
+`personalAlerts` previously returned `clear: true` when a product had no
+ingredient list, because zero matches was treated as zero risk. The panel then
+said "Nothing here matches your declared sensitivities" — a clearance for a
+product nobody had examined. Someone avoiding gelatin would have been told a
+Moon Pie was fine.
+
+Absence of evidence is not evidence of absence. There is now a third state:
+
+| state | meaning | shown as |
+|---|---|---|
+| `hits.length > 0` | matched something in the profile | red per-item alerts |
+| `clear` | checked against real data, nothing matched | green, with a caveat |
+| `insufficientData` | nothing to check against | **red "Cannot check this product"** |
+
+`clear` can no longer be true when `insufficientData` is. The same distinction
+was added to `conditionAlerts`.
+
+### Adding a missing list
+
+The "cannot check" warning carries a button straight to the ingredient field,
+and a matching notice appears on the card whether or not a profile is set —
+a missing list is a data gap everyone should see.
+
+Saving **re-runs the whole analysis immediately**: hazards, CSPI tiers,
+conditions and profile checks all recompute from the supplied text, and the list
+is written to the shared record so the next person scanning it gets the same
+check. Adding the list has to change the verdict now, not just store text for
+someone else later.
+
+### New sensitivity groups
+
+- **Gelatin** — matches `gelatin`, `gelatine`, `gelling agent (gelatin)`,
+  hydrolysed collagen, isinglass and E441, without false-positiving on "gelato".
+- **Animal-derived additives** — E441, E120 carmine, E542 bone phosphate,
+  E901 beeswax, E904 shellac, E913 lanolin, E920 L-cysteine, plus rennet, lard,
+  tallow and suet. E471 and E570 are included because they may be either plant
+  or animal and the label rarely says which.
+- **Pork derivatives** — for the common case where gelatin and enzymes are
+  porcine but not labelled as such.
+
+## v10.0
+
+### An unrated product no longer scores 10/10
+
+`cspiAssess` returned 10 for an empty additive list, which is correct for a
+clean label and badly wrong for a product with no data — an unexamined product
+ranked level with a genuinely clean one. It now takes `hasIngredients`:
+
+| additives | ingredient list | score |
+|---|---|---|
+| none | present | 10 — genuinely clean |
+| none | **absent** | **null — not scored** |
+| present | either | scored normally |
+
+`null` renders as "—" with "Not scored. A product with no ingredient list cannot
+be rated — an empty score is not a good one."
+
+### Fewer popups, one that matters
+
+Toasts confirming the source, risk level and undeclared counts were removed: the
+card already shows all of it, so the popups were noise over the thing being read.
+What remains is only what the card cannot show — a rate limit, an unreachable
+service, a failed database write.
+
+A **missing ingredient list now raises a dialog** with a text box in it. Every
+check the app performs reads that list, and the reader is holding the pack, so it
+is worth interrupting for. Saving re-analyses immediately and shares the list.
+"Not now" leaves the product marked unrated rather than scored.
+
+### Search is now profile- and location-aware
+
+Previously neither applied to search — only to alternatives and discovery.
+
+- **Location:** results are **reordered** so products sold in the selected market
+  come first. Reordered, not filtered: a product sold elsewhere is still a valid
+  answer to "what is this", and dropping it could hide the item in hand.
+- **Profile:** each result carries a ⚠ flag naming the first conflict, so a
+  reader avoiding gelatin sees it in the list instead of opening each candidate.
+  Flagged, never hidden. A hit with no ingredient data gets no flag and no
+  reassurance either.
+
+## v10.1 — record merging (data-loss fix)
+
+`ghSet` assigned records wholesale: `_ghDb.products[key] = { ...data }`. Any
+writer that did not carry every field destroyed the rest. `commitScan` writes
+only the scan payload — offData, substances, risk — so **a single rescan wiped
+every review, contribution, accolade and photo score** attached to that product.
+
+It now merges: `{ ...prior, ...data }`. Scan fields still overwrite, which is
+intended — a fresh analysis should replace a stale one. Only keys absent from the
+write are preserved.
+
+### Where a contributed ingredient list goes
+
+1. Merged into the product's `offData.ingredients`, with `ingredientsSource:
+   "community"` and the contributor id and timestamp.
+2. Also stored as a `contributions` entry, so the original transcription survives
+   even if a later source refresh overwrites `offData`.
+3. Written to the shared database via `ghSet` → `ghWrite`, so the next person who
+   scans that barcode gets the same analysis.
+4. The barcode is carried onto the record. Without it a list added for a product
+   no database has would be unreachable by scanning — the next person points the
+   camera at the same pack and gets nothing.
+
+**Requires `VITE_GH_TOKEN`.** Without it the list is kept for the session only and
+the app says so ("Read-only mode"); it is not silently discarded, but it is not
+shared either.
+
+## Renaming the app
+
+Edit **`src/brand.js`** only:
+
+```js
+export const APP_NAME  = "HST — Safety Monitor";  // tab title, PWA install prompt
+export const APP_SHORT = "HST";                   // home-screen icon label
+export const APP_TITLE_LEAD   = "Safety";         // header, first word
+export const APP_TITLE_ACCENT = "Monitor";        // header, coloured word
+```
+
+A Vite plugin injects these into `index.html` and rewrites
+`dist/manifest.webmanifest` at build time. The name previously appeared in five
+places with four different values — tab title, manifest, Capacitor config,
+header, iOS home-screen title — which is why they had drifted apart.
+
+The one exception is `capacitor.config.json` (`appName`, `appId`): native app
+stores read it at package time, not build time, so edit it by hand if you ship a
+native build.

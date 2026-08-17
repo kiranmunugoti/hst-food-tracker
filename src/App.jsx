@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { productRatings, addReview, CSPI_TIERS, SENSITIVITY_GROUPS, HEALTH_CONDITIONS } from "./ratings.js";
+import { APP_TITLE_LEAD, APP_TITLE_ACCENT } from "./brand.js";
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────────
 // The shared scan database lives in its OWN repository, separate from this
@@ -1090,7 +1091,7 @@ async function callAI(prompt, maxTokens = 1500, useWeb = true) {
 // ─── FREE OPEN FOOD FACTS API (no key, no cost) ────────────────────────────────
 // Direct REST calls to world.openfoodfacts.org — completely free & CORS-enabled.
 // Falls back to the AI-powered lookup only when direct fetch is blocked/fails.
-const OFF_FIELDS = "product_name,brands,image_url,nutriscore_grade,nova_group,ecoscore_grade,quantity,serving_size,ingredients_text,additives_tags,allergens_tags,labels_tags,categories_tags,nutriments";
+const OFF_FIELDS = "product_name,brands,image_url,nutriscore_grade,nova_group,ecoscore_grade,quantity,serving_size,ingredients_text,additives_tags,allergens_tags,labels_tags,categories_tags,countries_tags,nutriments";
 
 let _offStatus = "ok"; // status of last direct lookup: "ok" | "nomatch" | "network"
 
@@ -1468,6 +1469,22 @@ async function foodSearchMerged(terms, limit) {
     keys.forEach(k => seen.add(k));
     out.push(p);
   }
+
+  // Market ranking. Search results were not market-aware at all — only
+  // alternatives and discovery were — so a name search returned whatever the
+  // index ranked highest regardless of where the reader shops. Results are
+  // REORDERED rather than filtered: a product sold elsewhere is still a valid
+  // answer to "what is this", and dropping it could hide the very item in hand.
+  const tag = marketTag();
+  if (tag) {
+    const localFirst = (p) => {
+      const c = p.countries_tags || p.countries || [];
+      const list = Array.isArray(c) ? c.map(String) : String(c).split(",");
+      return list.some(x => x.toLowerCase().includes(tag.replace("en:", ""))) ? 0 : 1;
+    };
+    out.sort((a, b) => localFirst(a) - localFirst(b));
+  }
+
   return out.slice(0, Math.max(limit, offHits.length));
 }
 
@@ -1857,6 +1874,14 @@ async function resolveProduct(query, limit = 6) {
 
   // ── Barcode: exact lookup. Try each database until one knows the code. ──
   if (/^\d{8,14}$/.test(q)) {
+    // Community-added products first. Free, instant, and the only place a
+    // product absent from every open database can possibly be found.
+    const local = ghGetByCode(q);
+    if (local?.rec?.offData) {
+      _offStatus = "ok";
+      return { product: local.rec.offData, candidates: [], domain: local.rec.domain || "food", fromCommunity: true };
+    }
+
     const plan = sourcePlan(currentMarket());
 
     // In the US, FoodData Central is checked FIRST for a food barcode. A US
@@ -2093,6 +2118,21 @@ async function ghLoad(setDbCount) {
   }
 }
 
+// Looks up a barcode in the shared database. Community-added products live in
+// the same store as scanned ones, so a product someone added by hand is found
+// by the next person who scans it — which is the whole point of adding it.
+// The database is already in memory, so this costs no request and is checked
+// before any remote source.
+function ghGetByCode(code) {
+  const want = String(code || "").replace(/^0+/, "");
+  if (!want) return null;
+  for (const [key, rec] of Object.entries(_ghDb.products || {})) {
+    const c = rec?.offData?.code;
+    if (c && String(c).replace(/^0+/, "") === want) return { key, rec };
+  }
+  return null;
+}
+
 function ghGet(ck) {
   const rec = _ghDb.products?.[ck];
   if (!rec) return null;
@@ -2102,6 +2142,71 @@ function ghGet(ck) {
 
 // Write the whole DB to GitHub. Returns "saved" | "no-token" | "error".
 // Handles stale/missing sha (409/422) by refetching and retrying once.
+// ─── PRODUCT IMAGES ────────────────────────────────────────────────────────────
+// Images are stored as SEPARATE repository files, never inside db.json.
+//
+// ghWrite() rewrites the whole database file on every save, so an embedded
+// base64 image is re-uploaded on every subsequent write by anyone. At 640px
+// that is ~75 KB per product: 1,000 products would mean a 74 MB upload each
+// time a single review is saved, past the point GitHub's contents API accepts.
+// One file per image keeps the database holding a ~90-byte URL instead.
+const IMG_MAX_DIM = 640;      // enough for a card; a barcode photo is not art
+const IMG_QUALITY = 0.72;
+
+// Downscales and re-encodes before upload. A modern phone photo is 3–8 MB,
+// which is both slow to upload and pointless at the size it will be displayed.
+async function compressImage(source, maxDim = IMG_MAX_DIM, quality = IMG_QUALITY) {
+  const bitmap = source instanceof Blob ? await createImageBitmap(source) : source;
+  const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
+  const w = Math.round(bitmap.width * scale), h = Math.round(bitmap.height * scale);
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  c.getContext("2d").drawImage(bitmap, 0, 0, w, h);
+  const dataUrl = c.toDataURL("image/jpeg", quality);
+  return { dataUrl, base64: dataUrl.split(",")[1], w, h,
+           bytes: Math.round(dataUrl.length * 0.75) };
+}
+
+// Uploads to the database repo under images/. Returns the public raw URL.
+async function ghPutImage(key, base64) {
+  if (!GH_TOKEN) return null;                       // read-only deployment
+  const path = `images/${key}.jpg`;
+  const url = `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${path}`;
+  const headers = { Authorization: `Bearer ${GH_TOKEN}`, Accept: "application/vnd.github.v3+json" };
+  try {
+    // An existing file needs its sha to overwrite; a missing one 404s, which is
+    // the normal first-upload case rather than an error.
+    let sha;
+    const head = await fetch(url, { headers });
+    if (head.ok) sha = (await head.json()).sha;
+
+    const r = await fetch(url, {
+      method: "PUT", headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ message: `image: ${key}`, content: base64, branch: GH_BRANCH, ...(sha ? { sha } : {}) }),
+    });
+    if (!r.ok) {
+      console.warn("ghPutImage failed:", r.status, await r.text().catch(() => ""));
+      return null;
+    }
+    return `https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${GH_BRANCH}/${path}`;
+  } catch (e) {
+    console.warn("ghPutImage:", e);
+    return null;
+  }
+}
+
+// Device-only fallback when the deployment has no write token. The photo is
+// still worth keeping for the person who took it, and localStorage is honest
+// about its scope — it is not presented as shared.
+function localImageKey(key) { return `hst_img_${key}`; }
+function saveLocalImage(key, dataUrl) {
+  try { window.localStorage.setItem(localImageKey(key), dataUrl); return true; }
+  catch { return false; }   // quota exceeded — images are the first thing to fill it
+}
+function getLocalImage(key) {
+  try { return window.localStorage.getItem(localImageKey(key)); } catch { return null; }
+}
+
 async function ghWrite(message) {
   if (!GH_TOKEN) return "no-token";
   try {
@@ -2137,12 +2242,162 @@ async function ghWrite(message) {
   } catch (e) { console.warn("ghWrite:", e); return "error"; }
 }
 
+// Merges rather than replaces.
+//
+// This previously assigned the record wholesale, so any writer that did not
+// happen to carry every field destroyed the rest. commitScan writes only the
+// scan payload — offData, substances, risk — so a single rescan wiped every
+// review, contribution, accolade and photo score attached to that product.
+// Community data is append-only in spirit and must survive writers that know
+// nothing about it.
+//
+// Scan fields still overwrite, which is intended: a fresh analysis should
+// replace a stale one. Only keys absent from `data` are preserved.
 async function ghSet(ck, data, setDbCount) {
   _ghDb.products = _ghDb.products || {};
-  _ghDb.products[ck] = { ...data, savedAt: Date.now(), version: 1 };
+  const prior = _ghDb.products[ck] || {};
+  _ghDb.products[ck] = { ...prior, ...data, savedAt: Date.now(), version: 1 };
   _ghDb._meta = { lastUpdated: new Date().toISOString().slice(0,10), totalProducts: Object.keys(_ghDb.products).length };
   setDbCount(Object.keys(_ghDb.products).length);
   return ghWrite(`db: ${ck}`);
+}
+
+// One photo per barcode. Keying on the barcode rather than the product name
+// means two differently-named records for the same pack share one image, and a
+// re-upload targets the same file instead of creating a second one. Products
+// with no barcode still fall back to the name key — the alternative would be no
+// photo at all for community-added items that lack a code.
+function photoKeyFor(entry) {
+  const code = String(entry?.offData?.code || "").replace(/\D/g, "").replace(/^0+/, "");
+  return code ? `code-${code}` : normKey(entry?.name || "");
+}
+
+// Checks that the photo actually shows the product it is being attached to.
+// Quality scoring cannot do this: a sharp, well-lit photo of the wrong pack
+// scores perfectly. This reads the label in the image and compares it with the
+// record.
+//
+// Returns { verdict, reason, seen } where verdict is:
+//   "match"     — the label agrees with the product name
+//   "mismatch"  — the label clearly shows something else; the upload is refused
+//   "unclear"   — no legible label, or the check is unavailable; accepted but
+//                 recorded as unverified rather than silently trusted
+async function verifyPhotoMatches(base64, name, brand) {
+  const prompt = `You are checking whether a product photo matches a database record.
+
+Record name: ${name}
+Record brand: ${brand || "(unknown)"}
+
+Look at the image and read any product name, brand or packaging text you can see.
+Reply with ONLY a JSON object, no other text:
+{"verdict":"match"|"mismatch"|"unclear","seen":"<product/brand text you can read, or empty>","reason":"<one short sentence>"}
+
+Rules:
+- "match" only if the visible branding is plausibly the same product.
+- "mismatch" if the packaging clearly shows a different product or brand.
+- "unclear" if no label text is legible, the image is not a product, or you cannot tell.
+- A different flavour, size or language variant of the SAME brand and product line is a match.`;
+
+  const body = {
+    model: "claude-sonnet-4-6",
+    max_tokens: 300,
+    messages: [{
+      role: "user",
+      content: [
+        { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64 } },
+        { type: "text", text: prompt },
+      ],
+    }],
+  };
+
+  const call = async (url) => {
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error?.message || ("HTTP " + r.status));
+    return (d.content || []).filter(c => c.type === "text").map(c => c.text).join("");
+  };
+
+  let text = "";
+  try { text = await call("https://api.anthropic.com/v1/messages"); }
+  catch { try { text = await call("/api/claude"); } catch { return { verdict: "unclear", reason: "Verification is unavailable in this deployment.", seen: "" }; } }
+
+  try {
+    const parsed = JSON.parse(String(text).replace(/```json|```/g, "").trim());
+    const v = ["match", "mismatch", "unclear"].includes(parsed.verdict) ? parsed.verdict : "unclear";
+    return { verdict: v, reason: String(parsed.reason || ""), seen: String(parsed.seen || "") };
+  } catch {
+    // An unparseable reply must not be read as approval.
+    return { verdict: "unclear", reason: "The verification reply could not be read.", seen: "" };
+  }
+}
+
+// Measurable photo quality, so "better" is decided by the image rather than by
+// whoever uploaded most recently.
+//
+//   sharpness — variance of a Laplacian. A blurred photo has little
+//               high-frequency detail, so its variance collapses. This is the
+//               single most useful signal for a label photo.
+//   exposure  — fraction of pixels crushed to pure black or blown to pure
+//               white. Detail lost that way cannot be recovered.
+//   size      — resolution, with sharply diminishing returns; a huge blurry
+//               photo should not beat a modest sharp one.
+async function scoreImage(bitmap) {
+  const MAX = 720;
+  const scale = Math.min(1, MAX / Math.max(bitmap.width, bitmap.height));
+  const w = Math.max(1, Math.round(bitmap.width * scale));
+  const h = Math.max(1, Math.round(bitmap.height * scale));
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  const d = ctx.getImageData(0, 0, w, h).data;
+
+  const gray = new Float32Array(w * h);
+  let clipped = 0;
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    const g = d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114;
+    gray[p] = g;
+    if (g <= 4 || g >= 251) clipped++;
+  }
+
+  let sum = 0, sumSq = 0, n = 0;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const lap = 4 * gray[i] - gray[i-1] - gray[i+1] - gray[i-w] - gray[i+w];
+      sum += lap; sumSq += lap * lap; n++;
+    }
+  }
+  const variance = n ? (sumSq / n) - (sum / n) ** 2 : 0;
+
+  // Dynamic range from the 5th/95th percentiles rather than min/max, so a few
+  // stray pixels do not make a flat, murky photo look well exposed.
+  const hist = new Array(256).fill(0);
+  for (let p = 0; p < gray.length; p++) hist[Math.max(0, Math.min(255, gray[p] | 0))]++;
+  const total = gray.length;
+  let acc = 0, p5 = 0, p95 = 255;
+  for (let i = 0; i < 256; i++) { acc += hist[i]; if (acc >= total * 0.05) { p5 = i; break; } }
+  acc = 0;
+  for (let i = 255; i >= 0; i--) { acc += hist[i]; if (acc >= total * 0.05) { p95 = i; break; } }
+  const range = p95 - p5;
+
+  // Sharpness: the divisor is set high enough that the metric does not saturate.
+  // At a low divisor every in-focus photo pegged at 1.0 and a slightly soft one
+  // scored identically to a crisp one, which made the comparison useless.
+  const sharpness = Math.min(1, Math.sqrt(variance) / 45);
+
+  // Exposure combines two failures that look different but both destroy detail:
+  // clipping (blown highlights, crushed blacks) and low contrast. A dark photo
+  // with nothing clipped scored a perfect 1.0 before the range term was added.
+  const clipPenalty = Math.max(0, 1 - (clipped / (w * h)) * 4);
+  const rangeScore  = Math.min(1, range / 140);
+  const exposure    = clipPenalty * 0.5 + rangeScore * 0.5;
+
+  const size = Math.min(1, Math.sqrt((bitmap.width * bitmap.height) / (1280 * 960)));
+
+  const score = +(sharpness * 0.55 + exposure * 0.25 + size * 0.20).toFixed(3);
+  return { score, sharpness: +sharpness.toFixed(3), exposure: +exposure.toFixed(3),
+           size: +size.toFixed(3), range, w: bitmap.width, h: bitmap.height };
 }
 
 // ─── BRAND RATINGS ─────────────────────────────────────────────────────────────
@@ -2348,9 +2603,16 @@ async function decodeLadder(bitmap, detector, onProgress) {
     ["scanning middle band", async () => enhanceForDecode(await transformBitmap(bitmap, { crop: { x: 0.05, y: 0.40, w: 0.9, h: 0.22 } }))],
     ["scanning lower band", async () => enhanceForDecode(await transformBitmap(bitmap, { crop: { x: 0.05, y: 0.60, w: 0.9, h: 0.22 } }))],
 
-    // Narrow centre strip at high magnification — the last resort for a code
-    // that is simply small in the frame.
+    // Narrow centre strip at high magnification.
     ["magnifying centre", async () => enhanceForDecode(await transformBitmap(bitmap, { crop: { x: 0.25, y: 0.38, w: 0.5, h: 0.24 }, scale: 3 }))],
+
+    // Tiled sweep — the rung that finds small codes on small packs. Nine
+    // overlapping tiles, each magnified, so a code occupying a ninth of the
+    // frame is decoded as though it filled it.
+    ...tileRegions().map((crop, i) => [
+      `sweeping area ${i + 1}/9`,
+      async () => enhanceForDecode(await transformBitmap(bitmap, { crop, scale: 2.5 })),
+    ]),
   ];
 
   if (detector) {
@@ -2380,6 +2642,55 @@ async function decodeLadder(bitmap, detector, onProgress) {
   return null;
 }
 
+// Otsu's method: computes the threshold that best separates dark from light
+// for THIS image, instead of assuming 128. On a foil or glossy wrapper the
+// lighting is uneven across the label — one end blown out, the other in shadow
+// — and a fixed threshold turns the bright end entirely white and the dark end
+// entirely black, erasing the bars at both. Otsu adapts to the actual histogram.
+function otsuThreshold(data) {
+  const hist = new Array(256).fill(0);
+  let n = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const g = (data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114) | 0;
+    hist[g]++; n++;
+  }
+  let sum = 0;
+  for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let sumB = 0, wB = 0, best = 0, threshold = 128;
+  for (let i = 0; i < 256; i++) {
+    wB += hist[i];
+    if (!wB) continue;
+    const wF = n - wB;
+    if (!wF) break;
+    sumB += i * hist[i];
+    const mB = sumB / wB, mF = (sum - sumB) / wF;
+    const between = wB * wF * (mB - mF) * (mB - mF);
+    if (between > best) { best = between; threshold = i; }
+  }
+  return threshold;
+}
+
+// Splits a frame into overlapping tiles. A small barcode — a single KitKat
+// finger, a two-cup Reese's pack — occupies a fraction of the frame, so the
+// decoder is working with a code that is tiny relative to everything around it.
+// In its own tile the same code is close to full width, which is the condition
+// decoders are built for. Overlap prevents a code from being cut in half by a
+// tile boundary.
+function tileRegions(cols = 3, rows = 3, overlap = 0.35) {
+  const w = 1 / cols, h = 1 / rows;
+  const ow = w * overlap, oh = h * overlap;
+  const out = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      out.push({
+        x: Math.max(0, c * w - ow), y: Math.max(0, r * h - oh),
+        w: Math.min(1, w + ow * 2), h: Math.min(1, h + oh * 2),
+      });
+    }
+  }
+  return out;
+}
+
 async function enhanceForDecode(bitmap) {
   const base = bitmap.width * bitmap.height;
   const scale = base * 4 <= MAX_DECODE_PIXELS ? 2 : base <= MAX_DECODE_PIXELS ? 1 : Math.sqrt(MAX_DECODE_PIXELS / base);
@@ -2393,9 +2704,10 @@ async function enhanceForDecode(bitmap) {
   ctx.drawImage(bitmap, 0, 0, w, h);
   const img = ctx.getImageData(0, 0, w, h);
   const d = img.data;
+  const th = otsuThreshold(d);
   for (let i = 0; i < d.length; i += 4) {
     const g = d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114;
-    const v = g > 128 ? 255 : 0;
+    const v = g > th ? 255 : 0;
     d[i] = d[i+1] = d[i+2] = v;
   }
   ctx.putImageData(img, 0, 0);
@@ -2595,7 +2907,7 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
                 const code = await decodeStill(detector, await captureStill());
                 if (code && handle(code)) return;
                 setMessage(stills >= 4
-                  ? "Still no read. Hold the code flat and fill the frame, or use Capture / Choose photo below."
+                  ? "Still no read. Small foil-wrapped packs (KitKat, Reese's) are the hardest — try Capture with the code filling half the frame, light OFF to kill glare, or type the digits."
                   : "Reading — keep the barcode in frame.");
               } catch { /* keep the live loop running */ }
               finally { capturingRef.current = false; }
@@ -3134,7 +3446,7 @@ function nutFor(nut = {}) {
 function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, myReport, setMyReport, onSubmit,
                        freshness, onRefresh, refreshing, contributions, detailsOpen, setDetailsOpen,
                        myDetails, setMyDetails, onSubmitDetails,
-                       profile, toggleSensitivity, profileOpen, setProfileOpen }) {
+                       profile, toggleSensitivity, profileOpen, setProfileOpen, communityRecord, photoUnverified, onAddIngredients, ingredientsFocus, onSaveIngredients }) {
   if (!ratings) return null;
   const { safety, expert, community } = ratings;
   const TIER_COLOR = { avoid:"#c0392b", caution:"#d97706", sensitive:"#b8860b", cutback:"#7a8b3a", safe:"#2e7d52" };
@@ -3147,7 +3459,7 @@ function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, 
       {/* Three scores, never merged. Combining them would let a well-reviewed
           product mask a composition problem — the exact thing this app is for. */}
       <div style={{display:"flex",gap:8,marginBottom:10}}>
-        {[["Safety", safety.score, "CSPI tiers"],
+        {[["Safety", safety.score, safety.unknown ? "no data" : "CSPI tiers"],
           ["Expert", expert.score, expert.count ? `${expert.count} source${expert.count!==1?"s":""}` : "none yet"],
           ["Community", community.score, community.count ? `${community.count} review${community.count!==1?"s":""}` : "none yet"]
         ].map(([label, val, sub]) => (
@@ -3158,10 +3470,53 @@ function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, 
           </div>
         ))}
       </div>
+      {safety.unknown && (
+        <div style={{fontSize:10,color:"#c0392b",fontWeight:600,lineHeight:1.6,marginBottom:6}}>
+          Not scored. A product with no ingredient list cannot be rated — an empty score is not a
+          good one.
+        </div>
+      )}
       <div style={{fontSize:9,color:t.textMuted,lineHeight:1.6,marginBottom:4}}>
         Scored 1–10. Kept separate on purpose: something can be award-winning and well liked
         and still contain an ingredient rated “Avoid”. Reviews never change the safety score.
       </div>
+
+      {/* Shown whether or not a profile is set: a missing ingredient list is a
+          gap in the data everyone should see, not only people with declared
+          sensitivities. */}
+      {!ratings.safety?.rated?.length && !ratings.safety?.unrated?.length && (
+        <div style={{fontSize:10,color:"#d97706",background:"rgba(217,119,6,0.08)",
+          border:"1px solid rgba(217,119,6,0.3)",borderRadius:8,padding:"9px 11px",lineHeight:1.6,marginTop:10}}>
+          <strong>No ingredient list on record.</strong> Nothing could be analysed — additives,
+          allergens and anything you avoid are all unknown for this product, not absent from it.
+          {" "}
+          <button onClick={onAddIngredients}
+            style={{background:"none",border:"none",padding:0,color:"#d97706",fontWeight:700,
+              textDecoration:"underline",cursor:"pointer",fontSize:10}}>
+            Add it from the pack
+          </button>
+        </div>
+      )}
+
+      {/* Provenance, before the disclaimer. A community record is a stranger's
+          transcription of a label — useful, and not the same thing as a curated
+          database entry. Saying so is the minimum. */}
+      {photoUnverified && (
+        <div style={{fontSize:10,color:t.textMuted,background:t.bgSub,border:`1px solid ${t.border}`,
+          borderRadius:8,padding:"8px 11px",lineHeight:1.6,marginTop:10}}>
+          The photo for this product could not be matched to the label automatically, so it is
+          shown as unverified.
+        </div>
+      )}
+
+      {communityRecord && (
+        <div style={{fontSize:10,color:"#d97706",background:"rgba(217,119,6,0.08)",
+          border:"1px solid rgba(217,119,6,0.3)",borderRadius:8,padding:"9px 11px",lineHeight:1.6,marginTop:10}}>
+          <strong>Added by a reader.</strong> This product is in no open database — the details were
+          typed in from the pack by someone using this app, and have not been verified. Check it
+          against the label in your hand.
+        </div>
+      )}
 
       {/* Directly under the scores — this is the moment a number is read as a
           verdict, so it is where the qualification belongs. */}
@@ -3186,6 +3541,23 @@ function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, 
           <div style={{fontSize:10,color:t.textSub,lineHeight:1.6}}>
             Tell the app what you react to and it will check every product against it.
             Kept on this device only — never uploaded.
+          </div>
+        )}
+
+        {/* The most important state in the app. With no ingredient list there is
+            nothing to match a profile against, and saying "nothing matches"
+            would read as a clearance for a product nobody has examined. */}
+        {!profileOpen && ratings.personal?.checked && ratings.personal.insufficientData && (
+          <div style={{fontSize:11,color:"#c0392b",lineHeight:1.6,background:"rgba(192,57,43,0.07)",
+            border:"1px solid rgba(192,57,43,0.35)",borderRadius:8,padding:"10px 12px"}}>
+            <strong>Cannot check this product.</strong> There is no ingredient list on record, so
+            nothing was compared against your profile. This is <em>not</em> a clearance — a product
+            with no data can still contain exactly what you are avoiding.
+            <button onClick={onAddIngredients}
+              style={{display:"block",marginTop:8,padding:"8px 12px",fontSize:11,fontWeight:600,
+                borderRadius:7,background:"#c0392b",color:"#fff",border:"none",cursor:"pointer"}}>
+              Add the ingredient list from the pack
+            </button>
           </div>
         )}
 
@@ -3379,8 +3751,9 @@ function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, 
         ) : (
           <>
             <div style={{fontSize:10,color:t.textMuted,lineHeight:1.6,marginBottom:8}}>
-              Copy from the physical label. Additives you list are included in the safety
-              score; the other fields are stored for other readers.
+              {ingredientsFocus
+                ? "Copy the ingredient list exactly as printed on the pack. This is what the profile check reads, so it changes the verdict for you and for everyone who scans this product afterwards."
+                : "Copy from the physical label. Reported additives are shown separately as unverified; the other fields are stored for other readers."}
             </div>
             {[["ingredients","Full ingredient list from the pack","textarea"],
               ["additives","Additives / E-numbers on the label (comma separated)","input"],
@@ -3401,9 +3774,11 @@ function RatingsPanel({ ratings, t, myStars, setMyStars, myReview, setMyReview, 
               )
             ))}
             <div style={{display:"flex",gap:6}}>
-              <button onClick={onSubmitDetails}
+              <button onClick={ingredientsFocus ? onSaveIngredients : onSubmitDetails}
                 style={{flex:1,padding:"9px 0",fontSize:12,fontWeight:600,borderRadius:8,cursor:"pointer",
-                  background:t.accent,color:t.accentFg,border:"none"}}>Save details</button>
+                  background:t.accent,color:t.accentFg,border:"none"}}>
+                {ingredientsFocus ? "Save and re-check against my profile" : "Save details"}
+              </button>
               <button onClick={() => setDetailsOpen(false)}
                 style={{padding:"9px 14px",fontSize:12,fontWeight:600,borderRadius:8,cursor:"pointer",
                   background:t.pill,color:t.textSub,border:`1px solid ${t.border}`}}>Cancel</button>
@@ -3494,7 +3869,7 @@ function Disclaimer({ t, variant = "full" }) {
   );
 }
 
-function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, brandCred, brandStat, brandCredLoading, alternatives, altLoading, diet, t, dark, onOpen, cosmeticAnalysis, ratingsPanel }) {
+function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, brandCred, brandStat, brandCredLoading, alternatives, altLoading, diet, t, dark, onOpen, cosmeticAnalysis, ratingsPanel, onAddPhoto, photoBusy }) {
   const [showIngr, setShowIngr] = useState(false);
   const n = offData.nut;
   const hasSrv = !!offData.servingSize;
@@ -3515,8 +3890,33 @@ function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, br
         <div style={{display:"flex",flexWrap:"wrap"}}>
           <div style={{width:156,minHeight:156,background:dark?"#1a1c20":"#f8f7f5",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,borderRight:`1px solid ${t.border}`,overflow:"hidden"}}>
             {offData.image && (offData.image.startsWith("data:image/") || offData.image.startsWith("http"))
-              ? <img src={offData.image} alt={offData.name} style={{width:"100%",height:156,objectFit:"contain",padding:10,boxSizing:"border-box"}}/>
-              : <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6,padding:14,textAlign:"center"}}><span style={{fontSize:34,opacity:0.2}}>🛒</span><span style={{fontSize:9,color:t.textMuted,lineHeight:1.5}}>No image</span></div>
+              ? (
+                <div style={{position:"relative",width:"100%",height:156}}>
+                  <img src={offData.image} alt={offData.name} style={{width:"100%",height:156,objectFit:"contain",padding:10,boxSizing:"border-box"}}/>
+                  {offData._localImage && (
+                    <span style={{position:"absolute",left:6,bottom:6,fontSize:8,fontWeight:600,color:"#fff",
+                      background:"rgba(217,119,6,0.9)",padding:"2px 6px",borderRadius:4}}>On this device only</span>
+                  )}
+                  <button onClick={onAddPhoto} disabled={photoBusy}
+                    style={{position:"absolute",right:6,bottom:6,fontSize:9,fontWeight:600,padding:"3px 7px",
+                      borderRadius:5,background:"rgba(0,0,0,0.55)",color:"#fff",border:"none",cursor:"pointer"}}>
+                    {photoBusy ? "…" : "Replace"}
+                  </button>
+                </div>
+              )
+              : (
+                // USDA records carry no photography at all and community records
+                // start with none, so the empty state offers to fix itself
+                // rather than just reporting the gap.
+                <button onClick={onAddPhoto} disabled={photoBusy}
+                  style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6,padding:14,textAlign:"center",
+                    background:"none",border:"none",cursor:photoBusy?"default":"pointer",width:"100%",height:156,justifyContent:"center"}}>
+                  <span style={{fontSize:30,opacity:0.25}}>📷</span>
+                  <span style={{fontSize:9,color:t.textMuted,lineHeight:1.5}}>
+                    {photoBusy ? "Saving…" : "No image\nAdd one"}
+                  </span>
+                </button>
+              )
             }
           </div>
           <div style={{flex:1,padding:"16px 18px",minWidth:0}}>
@@ -3845,6 +4245,19 @@ export default function App() {
     cache.current.alts = {};
     if (selected) loadAlts(selected, nk(selected.name));
   }
+  const [photoNote,setPhotoNote] = useState("");
+  const [photoBusy,setPhotoBusy] = useState(false);
+  const photoRef = useRef(null);
+  const [addPhoto,setAddPhoto] = useState(null);   // { dataUrl, base64 } for a new product
+  const addPhotoRef = useRef(null);
+  const [addOpen,setAddOpen] = useState(false);
+  const [addPrompt,setAddPrompt] = useState(false);
+  const [noListFor,setNoListFor] = useState(null);   // { name, label, key }
+  const [noListText,setNoListText] = useState("");
+  const [newProduct,setNewProduct] = useState({
+    name:"", brand:"", code:"", domain:"food",
+    ingredients:"", additives:"", allergens:"", labels:"", quantity:"", category:"",
+  });
   const [marketOpen,setMarketOpen]     = useState(false);
   const [profilePanel,setProfilePanel] = useState(false);
   const [conditions,setConditions] = useState(() => {
@@ -3865,8 +4278,11 @@ export default function App() {
       return next;
     });
   }
+  const [photoUnverified,setPhotoUnverified] = useState(false);
+  const [communityRecord,setCommunityRecord] = useState(false);
   const [contributions,setContributions] = useState([]);
   const [detailsOpen,setDetailsOpen] = useState(false);
+  const [ingredientsFocus,setIngredientsFocus] = useState(false);
   const [myDetails,setMyDetails]     = useState({ ingredients:"", additives:"", quantity:"", category:"", note:"" });
   const [discoverMore,setDiscoverMore] = useState(false); // loading another page
   const [diag,setDiag]               = useState(null);   // source diagnostics result
@@ -4020,20 +4436,29 @@ export default function App() {
     const entry = entryFrom({ ...a, offData:a.offData }, label);
     showEntry(entry, key);
 
-    if (a.offData) toast("off", `Found "${name}" on ${a.offData.source === "usda" ? "USDA FoodData Central" : domainLabel()}.`);
-    else if (_offStatus === "ratelimited") toast("scan",
-      `${domainLabel()} is rate-limiting requests right now (10 searches per minute). Wait about a minute, then press ↻ — the analysis below is name-based only.`);
+    // Toast policy: the card already shows source, risk and undeclared counts,
+    // so repeating them as popups was noise stacked over the thing the reader
+    // is trying to read. Only states that are NOT visible on the card are
+    // toasted — a service failure, or a write that did not happen.
+    if (_offStatus === "ratelimited") toast("scan",
+      `${domainLabel()} is rate-limiting requests (10 per minute). Wait a minute, then press ↻.`);
     else if (_offStatus === "network") toast("scan",
-      `${domainLabel()} is unreachable from this browser. The analysis is name-based only — press ↻ to retry.`);
-    else if (_offStatus === "unknown-code") toast("scan",
-      `Barcode ${label} reached ${domainLabel()} but is not in the database yet — a lot of regional products are missing. Search the product by name instead, or add the barcode at openfoodfacts.org to cover it for everyone.`);
-    else toast("scan",
-      `No ${domainLabel()} match for "${label}". The analysis is name-based only; nothing was cached, so ↻ retries fresh.`);
+      `${domainLabel()} is unreachable from this browser — the analysis is name-based only. Press ↻ to retry.`);
+    else if (_offStatus === "unknown-code") {
+      setNewProduct(p => ({ ...p, code: label.replace(/\D/g, "") }));
+      setAddPrompt(true);
+    } else if (_offStatus === "nomatch") {
+      setNewProduct(p => ({ ...p, name: p.name || label }));
+      setAddPrompt(true);
+    }
 
-    if (a.risk === "high") toast("high", `High risk: ${a.allSubs.filter(s=>s.risk==="high").map(s=>s.name).slice(0,2).join(", ")}.`);
-    else if (a.risk === "medium") toast("medium", "Medium risk substances detected.");
+    // A missing ingredient list is the one gap worth interrupting for: every
+    // check the app performs depends on it, and the reader is holding the pack
+    // right now. Raised as a dialog they can fill in on the spot rather than a
+    // toast that scrolls away.
+    const noList = !String(a.offData?.ingredients || "").trim();
+    if (noList) setNoListFor({ name, label, key });
 
-    if (a.undeclared.length > 0) toast("undeclared", `${a.offData?.brand ? a.offData.brand + " — " : ""}"${name}" may contain ${a.undeclared.length} substance${a.undeclared.length!==1?"s":""} not listed on the label: ${a.undeclared.map(s=>s.name).slice(0,3).join(", ")}.`);
     if (history) {
       // The rating is shown for every brand with any prior record, not only
       // bad ones — a brand with a clean record is information too. The record
@@ -4205,6 +4630,252 @@ export default function App() {
     if (selected) loadRatings(selected, nk(selected.name));
   }, [profile, conditions]);
 
+  // ── ADD A PRODUCT THAT IS IN NO DATABASE ──
+  // Regional and small-brand products are missing from every open source. The
+  // reader has the pack in their hand, which makes them a better source than
+  // anything queryable — so they can create the record, and it is then found by
+  // the next person who scans that barcode.
+  //
+  // Community records are marked as such and never silently pass as source
+  // data: their provenance is shown wherever they are used.
+  // Opens the details form focused on the ingredient list. Reached from the
+  // "cannot check" warning, so the person who noticed the gap is one tap from
+  // filling it while the pack is still in their hand.
+  function openIngredientsForm() {
+    setDetailsOpen(true);
+    setIngredientsFocus(true);
+    // Scroll is left to the browser; the form is already in view within the card.
+  }
+
+  // Re-runs the whole analysis from a reader-supplied ingredient list. This is
+  // the point of the feature: adding the list must change the verdict
+  // immediately, not merely store text for someone else later.
+  // Shared by the dialog and the in-card form: takes a target and the text,
+  // rather than reading component state, so it cannot act on a stale selection.
+  async function saveIngredientsFor(target, text) {
+    const key = target.key || nk(target.name);
+    const rec = ghGet(key) || {};
+    const clean = text.trim().slice(0, 4000);
+    const contributions = Array.isArray(rec.contributions) ? [...rec.contributions] : [];
+    const mine = { by: reviewerId(), ingredients: clean, additives: [], quantity: "", category: "", note: "", ts: Date.now() };
+    const idx = contributions.findIndex(c => c.by && c.by === mine.by);
+    if (idx >= 0) contributions[idx] = mine; else contributions.push(mine);
+
+    setScanning(true);
+    try {
+      const base = (selected && nk(selected.name) === key ? selected.offData : rec.offData) || {};
+      // Carry the barcode through. Without it a list added for a product no
+      // database has is unreachable by scanning — the next person points their
+      // camera at the same pack and gets nothing, which defeats the purpose.
+      const scannedCode = String(target.label || "").replace(/\D/g, "");
+      const offData = {
+        ...base,
+        name: target.name,
+        code: base.code || (scannedCode.length >= 8 ? scannedCode : null),
+        ingredients: clean,
+        ingredientsSource: "community",
+        ingredientsBy: reviewerId(),
+        ingredientsAt: Date.now(),
+      };
+      const analysis = await analyzeProduct(offData, target.name);
+      analysis.domain = rec.domain || selected?.domain || DOMAIN;
+      await ghSet(key, { ...rec, contributions, offData }, setDbCount);
+      dropCache("scan", key);
+      commitScan(analysis, target.name);
+      toast("details", "Ingredient list saved. The product has been re-analysed against your profile and the list is now shared.");
+    } catch (e) {
+      console.warn("saveIngredientsFor:", e);
+      toast("details", `Could not re-analyse: ${String(e?.message || e)}`);
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  async function saveIngredientsAndReanalyse() {
+    if (!selected || !myDetails.ingredients.trim()) {
+      toast("details", "Add the ingredient list first.");
+      return;
+    }
+    const key = nk(selected.name);
+    const rec = ghGet(key) || {};
+    const text = myDetails.ingredients.trim().slice(0, 4000);
+
+    // Stored as a contribution AND merged into the product record, because the
+    // hazard engine and the profile checks read offData.ingredients.
+    const contributions = Array.isArray(rec.contributions) ? [...rec.contributions] : [];
+    const mine = { by: reviewerId(), ingredients: text,
+                   additives: myDetails.additives.split(",").map(x=>x.trim()).filter(Boolean),
+                   quantity: "", category: "", note: "", ts: Date.now() };
+    const idx = contributions.findIndex(c => c.by && c.by === mine.by);
+    if (idx >= 0) contributions[idx] = mine; else contributions.push(mine);
+
+    setDetailsOpen(false);
+    setIngredientsFocus(false);
+    setScanning(true);
+    try {
+      const offData = { ...(selected.offData || {}), name: selected.name,
+                        ingredients: text, ingredientsSource: "community" };
+      const analysis = await analyzeProduct(offData, selected.name);
+      analysis.domain = selected.domain || DOMAIN;
+      await ghSet(key, { ...rec, contributions, offData }, setDbCount);
+      dropCache("scan", key);
+      commitScan(analysis, selected.name);
+      toast("details", "Ingredient list saved and the product re-analysed against your profile. Anyone scanning it now gets the same check.");
+    } catch (e) {
+      console.warn("saveIngredientsAndReanalyse:", e);
+      toast("details", `Could not re-analyse: ${String(e?.message || e)}`);
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  async function submitNewProduct() {
+    const f = newProduct;
+    if (!f.name.trim()) { toast("add", "A product name is required."); return; }
+
+    const additives = f.additives.split(",").map(x => x.trim()).filter(Boolean);
+    const offData = {
+      name: f.name.trim(),
+      brand: f.brand.trim() || null,
+      code: f.code.replace(/\D/g, "") || null,
+      ingredients: f.ingredients.trim() || null,
+      quantity: f.quantity.trim() || null,
+      additives,
+      allergens: f.allergens.split(",").map(x => x.trim()).filter(Boolean),
+      labels: f.labels.split(",").map(x => x.trim()).filter(Boolean),
+      categories: f.category.trim() ? [f.category.trim()] : [],
+      nut: {},
+      // Deliberately absent: Nutri-Score, NOVA and Eco-Score are computed by
+      // Open Food Facts from data this form does not collect. Leaving them null
+      // is truthful; guessing them would put a fabricated grade on the card.
+      nutriScore: null, novaGroup: null, ecoScore: null,
+      source: "community",
+      _domain: f.domain,
+      contributedBy: reviewerId(),
+      contributedAt: Date.now(),
+    };
+
+    setAddOpen(false);
+    setScanning(true);
+    try {
+      const analysis = await analyzeProduct(offData, offData.name);
+      analysis.domain = f.domain;
+      commitScan(analysis, offData.name);
+
+      // Uploaded after the record exists, so a failed image never blocks the
+      // product itself from being saved.
+      if (addPhoto) {
+        const key = nk(offData.name);
+        const shared = await ghPutImage(key, addPhoto.base64);
+        if (shared) {
+          const rec = ghGet(key) || {};
+          await ghSet(key, { ...rec, offData: { ...(rec.offData || offData), image: shared } }, setDbCount);
+        } else {
+          saveLocalImage(key, addPhoto.dataUrl);
+        }
+        setAddPhoto(null);
+      }
+      toast("add", `"${offData.name}" added to the shared database${offData.code ? ` under barcode ${offData.code}` : ""}. It will be found by anyone who scans it.`);
+      setNewProduct({ name:"", brand:"", code:"", domain:"food", ingredients:"", additives:"", allergens:"", labels:"", quantity:"", category:"" });
+    } catch (e) {
+      console.warn("submitNewProduct:", e);
+      toast("add", `Could not add the product: ${String(e?.message || e)}`);
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  // Attach a photo to a product. Shared when the deployment can write, kept on
+  // this device otherwise — and the UI says which, rather than implying a photo
+  // reached everyone when it did not.
+  // Scores an image already attached to a product, so a replacement can be
+  // judged against it. Returns null when the existing photo cannot be read —
+  // an old record with no stored score, or a fetch that fails — and the caller
+  // treats that as "unknown" rather than assuming either is better.
+  async function scoreExisting(rec, entry) {
+    if (rec?.imageScore != null) return rec.imageScore;
+    const url = rec?.offData?.image || entry?.offData?.image;
+    if (!url || url.startsWith("data:")) return null;
+    try {
+      const r = await fetch(url, { mode: "cors" });
+      if (!r.ok) return null;
+      const s = await scoreImage(await createImageBitmap(await r.blob()));
+      return s.score;
+    } catch { return null; }
+  }
+
+  async function attachPhoto(file, entry) {
+    if (!file || !entry) return;
+    const key = nk(entry.name);           // database record key (by name)
+    const imgKey = photoKeyFor(entry);    // image file key (by barcode)
+    setPhotoBusy(true);
+    try {
+      // Score the ORIGINAL upload, not the compressed copy — compression is
+      // applied to both photos equally, so judging before it compares what the
+      // camera actually captured.
+      const original = await createImageBitmap(file);
+      const fresh = await scoreImage(original);
+
+      const existingRec = ghGet(key) || {};
+      const hasPhoto = !!(existingRec.offData?.image || entry.offData?.image);
+      if (hasPhoto) {
+        const prev = await scoreExisting(existingRec, entry);
+        // A margin, not a bare comparison: two photos of the same pack score
+        // within noise of each other, and churning the shared image on a 1%
+        // difference is worse than leaving a good one alone.
+        const MARGIN = 0.06;
+        if (prev != null && fresh.score <= prev + MARGIN) {
+          setPhotoBusy(false);
+          toast("photo", `Kept the existing photo — it scores ${prev.toFixed(2)} against ${fresh.score.toFixed(2)} for yours (sharpness ${fresh.sharpness}, exposure ${fresh.exposure}). A sharper or better-lit shot will replace it.`);
+          return;
+        }
+        if (prev == null) {
+          toast("photo", "The existing photo could not be scored, so yours replaces it.");
+        }
+      }
+
+      const img = await compressImage(file);
+
+      // Verify the photo shows this product before it goes anywhere shared. A
+      // sharp, well-lit photo of the wrong pack passes every quality check, so
+      // this is the only step that catches it.
+      setPhotoNote("Checking the photo matches this product…");
+      const check = await verifyPhotoMatches(img.base64, entry.name, entry.offData?.brand);
+      setPhotoNote("");
+      if (check.verdict === "mismatch") {
+        setPhotoBusy(false);
+        toast("photo", `That photo was not saved — it appears to show ${check.seen ? `“${check.seen}”` : "a different product"}, not ${entry.name}. ${check.reason}`);
+        return;
+      }
+
+      const shared = await ghPutImage(imgKey, img.base64);
+      if (shared) {
+        const rec = ghGet(key) || {};
+        const offData = { ...(rec.offData || entry.offData || {}), image: shared };
+        // Stored so the next upload can be compared without re-downloading and
+        // re-analysing the current photo.
+        await ghSet(key, { ...rec, offData, imageScore: fresh.score,
+                           imageMeta: { ...fresh, by: reviewerId(), at: Date.now(),
+                                        imgKey, verified: check.verdict, seen: check.seen } }, setDbCount);
+        setSelected(sel => sel && { ...sel, offData: { ...sel.offData, image: shared } });
+        toast("photo", check.verdict === "match"
+          ? `Photo ${hasPhoto ? "replaced" : "added"} and verified as ${entry.name} (quality ${fresh.score.toFixed(2)}, ${Math.round(img.bytes / 1024)} KB). One photo is kept per barcode.`
+          : `Photo ${hasPhoto ? "replaced" : "added"} (quality ${fresh.score.toFixed(2)}) but not verified — ${check.reason} It is marked unverified for other readers.`);
+      } else {
+        const ok = saveLocalImage(key, img.dataUrl);
+        setSelected(sel => sel && { ...sel, offData: { ...sel.offData, image: img.dataUrl, _localImage: true } });
+        toast("photo", ok
+          ? "Photo saved on this device only — this deployment has no write access, so it is not shared."
+          : "Photo could not be saved: this browser's local storage is full.");
+      }
+    } catch (e) {
+      console.warn("attachPhoto:", e);
+      toast("photo", `Could not process that image: ${String(e?.message || e)}`);
+    } finally {
+      setPhotoBusy(false);
+    }
+  }
+
   async function runDiagnostics() {
     setDiagRunning(true); setDiag(null);
     try { setDiag(await diagnoseSources()); }
@@ -4214,6 +4885,31 @@ export default function App() {
 
   // Switch picker tabs. The other database is queried on first open only, then
   // cached in picker state — reopening a tab never re-requests.
+  // Checks a raw search hit against the profile, using only what the hit
+  // carries. Returns a short label, or null. Deliberately conservative: no
+  // ingredient text means no claim either way, never a reassurance.
+  function profileFlagFor(hit) {
+    if (!profile.length && !conditions.length) return null;
+    const text = asText(hit.ingredients_text);
+    const adds = asList(hit.additives_tags).map(a => String(a).replace(/^en:/, ""));
+    if (!text && !adds.length) return null;
+    const r = productRatings({
+      additives: adds,
+      ingredients: text,
+      allergens: asList(hit.allergens_tags).map(a => String(a).replace(/^en:/, "")),
+      labels: asList(hit.labels_tags),
+      nutriments: {
+        "sugars_100g": hit.nutriments?.["sugars_100g"],
+        "salt_100g": hit.nutriments?.["salt_100g"],
+        "saturated-fat_100g": hit.nutriments?.["saturated-fat_100g"],
+      },
+      profile, conditions,
+    });
+    if (r.personal.hits.length) return r.personal.hits[0].label;
+    const high = r.health.find(h => h.level === "high");
+    return high ? high.label : null;
+  }
+
   async function selectPickerTab(d) {
     setPicker(p => p && { ...p, tab: d });
     setPicker(p => {
@@ -4341,6 +5037,14 @@ export default function App() {
       reviews:   rec.reviews || [],
       profile, conditions,
     }));
+    setCommunityRecord(entry.offData?.source === "community");
+    setPhotoUnverified(!!(entry.offData?.image && rec.imageMeta && rec.imageMeta.verified !== "match"));
+    // A device-only photo lives outside the shared record, so it is restored
+    // here rather than arriving with the product data.
+    if (!entry.offData?.image) {
+      const localImg = getLocalImage(k);
+      if (localImg) setSelected(sel => sel && { ...sel, offData: { ...sel.offData, image: localImg, _localImage: true } });
+    }
     setContributions(rec.contributions || []);
     const mineD = (rec.contributions || []).find(c => c.by === reviewerId());
     setMyDetails({ ingredients: mineD?.ingredients || "", additives: (mineD?.additives || []).join(", "),
@@ -4957,6 +5661,20 @@ export default function App() {
                       <div style={{fontSize:10,color:t.textSub,marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
                         {brand || "Unknown brand"}{p.quantity ? ` · ${p.quantity}` : ""}
                       </div>
+                      {(() => {
+                        // Profile awareness in the RESULT LIST, not just after
+                        // opening a product. Search was previously blind to the
+                        // profile, so a reader avoiding gelatin had to open each
+                        // candidate to find out. Flagged, never hidden — hiding
+                        // a match could conceal the product actually in hand.
+                        const hit = profileFlagFor(p);
+                        if (!hit) return null;
+                        return (
+                          <div style={{fontSize:9,fontWeight:700,color:"#c0392b",marginTop:2}}>
+                            ⚠ {hit}
+                          </div>
+                        );
+                      })()}
                       {/* Named explicitly: a USDA record has no Nutri-Score by
                           design, and without this the missing grade looks like
                           a bug rather than a property of the source. */}
@@ -5003,6 +5721,178 @@ export default function App() {
       {showDbStats && <DbStatsModal/>}
 
       {/* ── HEADER ── */}
+      {/* Offered exactly where the dead end happens, rather than hidden in a menu */}
+      {addPrompt && !addOpen && (
+        <div style={{position:"fixed",left:0,right:0,bottom:0,zIndex:9998,padding:14,
+          background:t.surface,borderTop:`1px solid ${t.border}`,boxShadow:"0 -4px 18px rgba(0,0,0,0.12)"}}>
+          <div style={{maxWidth:560,margin:"0 auto",display:"flex",gap:10,alignItems:"center"}}>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:12,fontWeight:600,color:t.text}}>Not in any database yet</div>
+              <div style={{fontSize:10,color:t.textSub,lineHeight:1.5,marginTop:2}}>
+                You have the pack — adding it means the next person who scans it gets a real analysis.
+              </div>
+            </div>
+            <button onClick={()=>{ setAddOpen(true); setAddPrompt(false); }}
+              style={{flexShrink:0,padding:"9px 14px",fontSize:12,fontWeight:600,borderRadius:8,
+                background:t.accent,color:t.accentFg,border:"none",cursor:"pointer"}}>Add it</button>
+            <button onClick={()=>setAddPrompt(false)}
+              style={{flexShrink:0,padding:"9px 10px",fontSize:12,borderRadius:8,
+                background:"none",color:t.textMuted,border:"none",cursor:"pointer"}}>✕</button>
+          </div>
+        </div>
+      )}
+
+      <input ref={photoRef} type="file" accept="image/*" capture="environment" style={{display:"none"}}
+        onChange={e => { const f = e.target.files?.[0]; e.target.value = ""; attachPhoto(f, selected); }}/>
+
+      {/* ── NO INGREDIENT LIST ── raised immediately, fixable in place ── */}
+      {noListFor && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.6)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:10000,padding:20}}>
+          <div style={{background:t.bg,borderRadius:14,padding:20,maxWidth:460,width:"100%",maxHeight:"85vh",overflowY:"auto",border:"1px solid rgba(192,57,43,0.4)"}}>
+            <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",color:"#c0392b",marginBottom:6}}>
+              Cannot check this product
+            </div>
+            <h2 style={{margin:"0 0 6px",fontSize:16,fontWeight:700,color:t.text}}>
+              No ingredient list for “{noListFor.name}”
+            </h2>
+            <div style={{fontSize:11,color:t.textSub,lineHeight:1.65,marginBottom:12}}>
+              Every check this app performs reads the ingredient list — additives, allergens, your
+              conditions, everything you have chosen to avoid. Without it nothing was examined, so
+              this product is <strong>unrated, not safe</strong>.
+              {profile.length + conditions.length > 0 && (
+                <> Your {profile.length + conditions.length} profile item{profile.length + conditions.length !== 1 ? "s" : ""} could not be checked at all.</>
+              )}
+            </div>
+
+            <textarea value={noListText} onChange={e=>setNoListText(e.target.value)} rows={5}
+              placeholder="Type or paste the ingredient list exactly as printed on the pack…"
+              style={{width:"100%",boxSizing:"border-box",fontSize:12,padding:"10px 11px",borderRadius:8,
+                border:`1px solid ${t.border}`,background:t.bgSub,color:t.text,resize:"vertical",
+                fontFamily:"inherit",lineHeight:1.5,marginBottom:8}}/>
+
+            <div style={{fontSize:9.5,color:t.textMuted,lineHeight:1.6,marginBottom:12}}>
+              Saving re-analyses the product straight away and stores the list for everyone who
+              scans it afterwards. If you do not have the pack to hand, skip — the product stays
+              marked unrated rather than being given a score it has not earned.
+            </div>
+
+            <div style={{display:"flex",gap:6}}>
+              <button onClick={async ()=>{
+                  const text = noListText.trim();
+                  const target = noListFor;
+                  setNoListFor(null); setNoListText("");
+                  if (text) await saveIngredientsFor(target, text);
+                }}
+                disabled={!noListText.trim()}
+                style={{flex:1,padding:"11px 0",fontSize:12,fontWeight:700,borderRadius:8,
+                  cursor:noListText.trim()?"pointer":"default",
+                  background:noListText.trim()?"#c0392b":t.pill,
+                  color:noListText.trim()?"#fff":t.textMuted,border:"none"}}>
+                Save and re-check
+              </button>
+              <button onClick={()=>{ setNoListFor(null); setNoListText(""); }}
+                style={{padding:"11px 16px",fontSize:12,fontWeight:600,borderRadius:8,cursor:"pointer",
+                  background:t.pill,color:t.textSub,border:`1px solid ${t.border}`}}>
+                Not now
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── ADD A PRODUCT ── */}
+      {addOpen && (
+        <div onClick={()=>setAddOpen(false)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
+          <div onClick={e=>e.stopPropagation()} style={{background:t.bg,borderRadius:14,padding:20,maxWidth:520,width:"100%",maxHeight:"88vh",overflowY:"auto",border:`1px solid ${t.border}`}}>
+            <h2 style={{margin:"0 0 4px",fontSize:16,fontWeight:700,color:t.text}}>Add a product</h2>
+            <div style={{fontSize:11,color:t.textSub,lineHeight:1.6,marginBottom:14}}>
+              For products no open database has yet — regional brands, small producers, local
+              formulations. You have the pack in your hand, which makes you a better source than
+              anything we can query. Copy the label as printed.
+            </div>
+
+            <div style={{display:"flex",gap:6,marginBottom:10}}>
+              {[["food","🍽️ Food"],["cosmetics","🧴 Cosmetic"]].map(([k,l]) => (
+                <button key={k} onClick={()=>setNewProduct(p=>({...p,domain:k}))}
+                  style={{flex:1,padding:"8px 0",fontSize:12,fontWeight:600,borderRadius:8,cursor:"pointer",
+                    background:newProduct.domain===k?t.accent:t.pill,
+                    color:newProduct.domain===k?t.accentFg:t.textSub,
+                    border:`1px solid ${newProduct.domain===k?t.accent:t.border}`}}>{l}</button>
+              ))}
+            </div>
+
+            {[["name","Product name (required)","input"],
+              ["brand","Brand","input"],
+              ["code","Barcode digits — lets others find it by scanning","input"],
+              ["quantity","Pack size, e.g. 250 ml","input"],
+              ["category","Category, e.g. greek yogurt / face cream","input"],
+              ["ingredients","Full ingredient list, copied from the pack","textarea"],
+              ["additives","E-numbers or additive names (comma separated)","input"],
+              ["allergens","Declared allergens (comma separated)","input"],
+              ["labels","Claims on the pack: organic, vegan, gluten-free…","input"],
+            ].map(([k,ph,kind]) => kind==="textarea" ? (
+              <textarea key={k} rows={3} value={newProduct[k]} placeholder={ph}
+                onChange={e=>setNewProduct(p=>({...p,[k]:e.target.value}))}
+                style={{width:"100%",boxSizing:"border-box",fontSize:11,padding:"8px 10px",borderRadius:7,
+                  border:`1px solid ${t.border}`,background:t.bgSub,color:t.text,resize:"vertical",
+                  fontFamily:"inherit",marginBottom:7}}/>
+            ) : (
+              <input key={k} value={newProduct[k]} placeholder={ph}
+                inputMode={k==="code"?"numeric":undefined}
+                onChange={e=>setNewProduct(p=>({...p,[k]: k==="code" ? e.target.value.replace(/\D/g,"") : e.target.value}))}
+                style={{width:"100%",boxSizing:"border-box",fontSize:11,padding:"8px 10px",borderRadius:7,
+                  border:`1px solid ${t.border}`,background:t.bgSub,color:t.text,marginBottom:7}}/>
+            ))}
+
+            <input ref={addPhotoRef} type="file" accept="image/*" capture="environment" style={{display:"none"}}
+              onChange={async e => {
+                const f = e.target.files?.[0]; e.target.value = "";
+                if (!f) return;
+                try { setAddPhoto(await compressImage(f)); } catch { /* ignore bad file */ }
+              }}/>
+            {addPhoto ? (
+              <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:8}}>
+                <img src={addPhoto.dataUrl} alt="" style={{width:64,height:64,objectFit:"cover",borderRadius:8,border:`1px solid ${t.border}`}}/>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:11,color:t.text,fontWeight:600}}>Photo attached</div>
+                  <div style={{fontSize:9.5,color:t.textMuted}}>{addPhoto.w}×{addPhoto.h}, {Math.round(addPhoto.bytes/1024)} KB after compression</div>
+                </div>
+                <button onClick={()=>setAddPhoto(null)}
+                  style={{fontSize:11,padding:"6px 10px",borderRadius:7,background:t.pill,color:t.textSub,border:`1px solid ${t.border}`,cursor:"pointer"}}>Remove</button>
+              </div>
+            ) : (
+              <button onClick={()=>addPhotoRef.current?.click()}
+                style={{width:"100%",padding:"9px 0",fontSize:12,fontWeight:600,borderRadius:8,cursor:"pointer",
+                  background:t.pill,color:t.textSub,border:`1px dashed ${t.border}`,marginBottom:8}}>
+                📷 Add a photo of the pack
+              </button>
+            )}
+
+            <div style={{fontSize:9.5,color:t.textMuted,lineHeight:1.6,margin:"6px 0 12px"}}>
+              The ingredient list is what the hazard analysis reads, so it matters most. Nutri-Score
+              and NOVA stay blank — those are computed by Open Food Facts from data this form does
+              not collect, and a guessed grade would be worse than none.
+              <br /><br />
+              Consider also adding it to <strong>openfoodfacts.org</strong>. That benefits every app
+              using the data, not just this one — here it lives only in this database.
+            </div>
+
+            <div style={{display:"flex",gap:6}}>
+              <button onClick={submitNewProduct} disabled={!newProduct.name.trim()}
+                style={{flex:1,padding:"10px 0",fontSize:12,fontWeight:600,borderRadius:8,
+                  cursor:newProduct.name.trim()?"pointer":"default",
+                  background:newProduct.name.trim()?t.accent:t.pill,
+                  color:newProduct.name.trim()?t.accentFg:t.textMuted,border:"none"}}>
+                Add and analyse
+              </button>
+              <button onClick={()=>setAddOpen(false)}
+                style={{padding:"10px 16px",fontSize:12,fontWeight:600,borderRadius:8,cursor:"pointer",
+                  background:t.pill,color:t.textSub,border:`1px solid ${t.border}`}}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── LOCATION PICKER ── */}
       {marketOpen && (
         <div onClick={()=>setMarketOpen(false)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
@@ -5099,7 +5989,7 @@ export default function App() {
           </div>
           <div>
             <div style={{fontSize:9,fontWeight:600,color:t.textMuted,letterSpacing:"0.1em",textTransform:"uppercase",marginBottom:2}}>Hazard Substance Tracker</div>
-            <h1 style={{margin:0,fontSize:"clamp(14px,2vw,19px)",fontWeight:800,color:t.text,letterSpacing:"-0.4px"}}>Safety <span style={{color:t.accent}}>Monitor</span></h1>
+            <h1 style={{margin:0,fontSize:"clamp(14px,2vw,19px)",fontWeight:800,color:t.text,letterSpacing:"-0.4px"}}>{APP_TITLE_LEAD} <span style={{color:t.accent}}>{APP_TITLE_ACCENT}</span></h1>
           </div>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
@@ -5473,9 +6363,11 @@ export default function App() {
               </div>
             ) : selected.offData ? (
               <OFFCard cosmeticAnalysis={selected?.cosmetic} brandStat={brandStat} onOpen={openResult} offData={selected.offData} aiSugarData={selected.aiSugarData} substances={selected.substances} insight={insight} insightLoading={insightLoading} brandCred={brandCred} brandCredLoading={brandCredLoading} alternatives={alternatives} altLoading={altLoading} diet={selected.diet||"unknown"} t={t} dark={dark}
+                onAddPhoto={()=>photoRef.current?.click()} photoBusy={photoBusy}
                 ratingsPanel={<RatingsPanel ratings={ratings} t={t} myStars={myStars} setMyStars={setMyStars}
                   myReview={myReview} setMyReview={setMyReview} myReport={myReport} setMyReport={setMyReport}
-                  onSubmit={submitReview}
+                  onSubmit={submitReview} communityRecord={communityRecord} photoUnverified={photoUnverified} onAddIngredients={openIngredientsForm}
+                  ingredientsFocus={ingredientsFocus} onSaveIngredients={saveIngredientsAndReanalyse}
                   freshness={staleness(selected)} onRefresh={() => refreshProduct(selected)} refreshing={refreshing}
                   contributions={contributions} detailsOpen={detailsOpen} setDetailsOpen={setDetailsOpen}
                   myDetails={myDetails} setMyDetails={setMyDetails} onSubmitDetails={submitDetails}

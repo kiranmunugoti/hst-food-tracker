@@ -1,6 +1,6 @@
 // HST service worker — offline shell + runtime caching.
 // Bumping CACHE invalidates the old one on the next activation.
-const CACHE = "hst-v9.4";
+const CACHE = "hst-v10.3";
 const SHELL = ["/", "/index.html", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png"];
 
 self.addEventListener("install", (e) => {

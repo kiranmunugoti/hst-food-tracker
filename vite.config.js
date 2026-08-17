@@ -1,5 +1,50 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import fs from "node:fs";
+import path from "node:path";
+
+// Reads src/brand.js without importing it, so the config stays plain and does
+// not need a transform step to load an ESM module with JSX siblings.
+function readBrand() {
+  const src = fs.readFileSync(path.resolve("src/brand.js"), "utf8");
+  const pick = (k) => (src.match(new RegExp(`${k}\\s*=\\s*"([^"]*)"`)) || [])[1] || "";
+  return {
+    APP_NAME: pick("APP_NAME"),
+    APP_SHORT: pick("APP_SHORT"),
+    APP_DESCRIPTION: pick("APP_DESCRIPTION"),
+  };
+}
+
+// Injects the name into index.html and the PWA manifest at build time, so
+// renaming the app is a one-line edit in src/brand.js rather than a hunt through
+// five files that had already drifted out of sync.
+function brandPlugin() {
+  return {
+    name: "hst-brand",
+    transformIndexHtml(html) {
+      const b = readBrand();
+      return html.replace(/%APP_NAME%/g, b.APP_NAME)
+                 .replace(/%APP_SHORT%/g, b.APP_SHORT)
+                 .replace(/%APP_DESCRIPTION%/g, b.APP_DESCRIPTION);
+    },
+    // The manifest lives in public/ and is copied verbatim, so it is rewritten
+    // in the output directory after the copy.
+    closeBundle() {
+      try {
+        const b = readBrand();
+        const out = path.resolve("dist/manifest.webmanifest");
+        if (!fs.existsSync(out)) return;
+        const m = JSON.parse(fs.readFileSync(out, "utf8"));
+        m.name = b.APP_NAME;
+        m.short_name = b.APP_SHORT;
+        m.description = b.APP_DESCRIPTION;
+        fs.writeFileSync(out, JSON.stringify(m, null, 2));
+      } catch (e) {
+        this.warn("brand: could not rewrite manifest — " + e.message);
+      }
+    },
+  };
+}
 
 // __GH_TOKEN__ is replaced at build time with the value of the VITE_GH_TOKEN
 // environment variable (set it in Vercel → Project → Settings → Environment
@@ -90,7 +135,7 @@ function attach(server) {
 }
 
 export default defineConfig({
-  plugins: [react(), devApiPlugin()],
+  plugins: [react(), devApiPlugin(), brandPlugin()],
   build: {
     // Ship source maps. Without them a production crash reports only minified
     // frames like `ty/<.children<.children<`, which name nothing and cannot be
