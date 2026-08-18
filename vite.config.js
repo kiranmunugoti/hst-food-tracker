@@ -145,5 +145,7 @@ export default defineConfig({
   },
   define: {
     __GH_TOKEN__: JSON.stringify(process.env.VITE_GH_TOKEN || ""),
+    // Optional server-side decode service. Empty string disables it entirely.
+    __DECODE_URL__: JSON.stringify(process.env.VITE_DECODE_URL || ""),
   },
 });

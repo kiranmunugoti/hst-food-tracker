@@ -568,3 +568,73 @@ compensating pair of errors, which is why the pack remains the authority.
 Requires `ANTHROPIC_API_KEY` on the server. Without it the button reports that it
 is unavailable and the manual field still works — reading is a convenience over
 typing, never the only route.
+
+## v10.6 — on-device OCR, searchable location
+
+### Reading text without the Anthropic API
+
+Tesseract is loaded from a CDN on first use and runs **on the device**:
+
+- no API key, so it works on any deployment
+- no per-request cost, so reading a long ingredient list is free
+- the photo never leaves the phone
+
+Cost: a one-off ~10 MB download of the engine and English data, cached
+afterwards. Loaded lazily, never at startup.
+
+**Two entry points.** "Photograph the ingredient list" appears in the no-list
+dialog and the add-product form — typing a pack's ingredient panel on a phone is
+the single biggest barrier to contributing. And barcode digits are now read
+on-device first, with the Anthropic path used only if on-device OCR finds nothing
+*and* a key is configured.
+
+Both land in an **editable field**, never straight into the database. OCR on
+curved, glossy packaging misreads, and an ingredient it drops is one nobody gets
+warned about. Post-processing rejoins lines wrapped mid-word, repairs hyphen
+breaks and `|`-as-`I`, and collapses whitespace, without altering words.
+
+For digits the character set is restricted to `0123456789`, which stops Tesseract
+reading O for 0, and the run whose **GTIN check digit validates** is preferred over
+the longest one.
+
+### Location picker
+
+Searchable list, with the selection held in a **draft until Save** — closing the
+dialog or tapping around no longer silently changes which market is in force. The
+footer states what is currently applied.
+
+### Profile persistence
+
+Conditions and sensitivities save as you tap and survive a refresh, in
+`localStorage`, never uploaded. What was missing was a way to *clear* them, so the
+profile panel now has **Clear all**.
+
+## v10.7 — optional server-side decode
+
+`server/` holds a FastAPI service using **OpenCV + ZBar + Tesseract**, for the
+barcodes browsers cannot read. Measured on realistic degradations of a real
+EAN-13, through the running API:
+
+| image | plain ZBar | pipeline | via |
+|---|---|---|---|
+| clean | ✓ | ✓ | as-is, 1 attempt |
+| small in a wide frame | ✗ | ✓ | adaptive mean, 4 attempts |
+| foil glare | ✗ | ✓ | upscale ×2, 2 attempts |
+| dark + blurred | ✗ | ✓ | CLAHE, 5 attempts |
+
+Ingredient-panel OCR transcribed a five-line panel **including GELATIN**
+correctly under clean, glare and blur conditions.
+
+The decisive technique is **adaptive** thresholding: a single threshold cannot
+handle a label blown out at one end and shadowed at the other, which is exactly
+what foil does. `cv2.adaptiveThreshold` computes one per neighbourhood.
+
+**Entirely optional.** Set `VITE_DECODE_URL` in Vercel to enable it; leave it
+unset and none of the code runs. It is the last rung — all twenty browser
+strategies are tried first, because a local decode is instant and free while this
+costs a round trip with the photo attached. If the service is down the app
+degrades to its previous behaviour.
+
+Deploy on a container host (Fly.io, Render, Railway). **Not Vercel** — ZBar and
+OpenCV need system libraries its Python runtime cannot install. See
+`server/README.md`.

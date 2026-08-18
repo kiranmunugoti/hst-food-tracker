@@ -2607,6 +2607,120 @@ function loadZXing() {
   return _zxingPromise;
 }
 
+// ─── SERVER-SIDE DECODE (optional) ─────────────────────────────────────────────
+// A container-hosted OpenCV + ZBar + Tesseract service. See server/README.md.
+//
+// Set VITE_DECODE_URL to enable it. Left unset, none of this runs and the app
+// behaves exactly as it did — it is a final rung on the ladder, never a
+// dependency. Every browser strategy is tried first, because a local decode is
+// instant and free while this costs a round trip with the photo attached.
+const DECODE_URL = __DECODE_URL__;
+
+async function serverDecode(blob) {
+  if (!DECODE_URL) return null;
+  const fd = new FormData();
+  fd.append("file", blob, "capture.jpg");
+  const r = await fetch(`${DECODE_URL.replace(/\/$/, "")}/decode`, { method: "POST", body: fd });
+  if (!r.ok) throw new Error("decode service HTTP " + r.status);
+  return r.json();   // { code, symbology, via, attempts, digits, checksum_ok }
+}
+
+async function serverReadText(blob) {
+  if (!DECODE_URL) return null;
+  const fd = new FormData();
+  fd.append("file", blob, "panel.jpg");
+  const r = await fetch(`${DECODE_URL.replace(/\/$/, "")}/read-text`, { method: "POST", body: fd });
+  if (!r.ok) throw new Error("read-text service HTTP " + r.status);
+  return r.json();   // { text, raw }
+}
+
+// ─── ON-DEVICE OCR ─────────────────────────────────────────────────────────────
+// Tesseract, loaded from a CDN on first use. This replaces the Anthropic API as
+// the primary way to turn a photo into text, for three reasons:
+//
+//   - no API key, so it works on any deployment
+//   - no per-request cost, so reading a long ingredient list is free
+//   - the image never leaves the device
+//
+// The cost is a one-off download of the engine and English data (~10 MB), which
+// the browser then caches. That is why it is loaded lazily and never on startup.
+let _ocrPromise = null;
+function loadOCR() {
+  if (_ocrPromise) return _ocrPromise;
+  _ocrPromise = new Promise((resolve, reject) => {
+    if (window.Tesseract) return resolve(window.Tesseract);
+    const el = document.createElement("script");
+    el.src = "https://unpkg.com/tesseract.js@7.0.0/dist/tesseract.min.js";
+    el.async = true;
+    el.onload = () => window.Tesseract ? resolve(window.Tesseract) : reject(new Error("OCR failed to initialise"));
+    el.onerror = () => reject(new Error("Could not load the OCR library"));
+    document.head.appendChild(el);
+  });
+  return _ocrPromise;
+}
+
+// Upscales and hard-thresholds before recognition. Tesseract is far more
+// accurate on high-contrast black-on-white text than on a photograph of a
+// curved, shadowed pack, and ingredient lists are printed small.
+async function prepForOCR(bitmap, { maxEdge = 1600 } = {}) {
+  const scale = Math.min(2, maxEdge / Math.max(bitmap.width, bitmap.height));
+  const w = Math.max(1, Math.round(bitmap.width * scale));
+  const h = Math.max(1, Math.round(bitmap.height * scale));
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+  const th = otsuThreshold(d);
+  for (let i = 0; i < d.length; i += 4) {
+    const g = d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114;
+    // Softer than the barcode threshold: text strokes are thin, so pushing
+    // everything to pure black/white erodes them. A mid-grey floor preserves
+    // letter shapes while still lifting contrast.
+    const v = g > th ? 255 : Math.max(0, g * 0.35);
+    d[i] = d[i+1] = d[i+2] = v;
+  }
+  ctx.putImageData(img, 0, 0);
+  return c;
+}
+
+async function ocrText(bitmap, onProgress) {
+  const T = await loadOCR();
+  const canvas = await prepForOCR(bitmap);
+  const worker = await T.createWorker("eng", 1, {
+    logger: (m) => { if (m.status && onProgress) onProgress(m.status, m.progress || 0); },
+  });
+  try {
+    const { data } = await worker.recognize(canvas);
+    return { text: String(data?.text || "").trim(), confidence: data?.confidence ?? null };
+  } finally {
+    await worker.terminate();
+  }
+}
+
+// Digits only — a much easier problem than free text, so the character set is
+// restricted, which stops Tesseract "helpfully" reading O for 0 and S for 5.
+async function ocrDigits(bitmap, onProgress) {
+  const T = await loadOCR();
+  const canvas = await prepForOCR(bitmap, { maxEdge: 2000 });
+  const worker = await T.createWorker("eng", 1, {
+    logger: (m) => { if (m.status && onProgress) onProgress(m.status, m.progress || 0); },
+  });
+  try {
+    await worker.setParameters({ tessedit_char_whitelist: "0123456789" });
+    const { data } = await worker.recognize(canvas);
+    const runs = String(data?.text || "").match(/\d{6,14}/g) || [];
+    // Prefer a run whose check digit validates; a GTIN that checks out is
+    // almost certainly the right reading.
+    const valid = runs.find(r => /^\d{8}$|^\d{12,14}$/.test(r) && validBarcodeChecksum(r));
+    const best = valid || runs.sort((a, b) => b.length - a.length)[0] || "";
+    return { digits: best, checksumOk: !!valid, candidates: runs, confidence: data?.confidence ?? null };
+  } finally {
+    await worker.terminate();
+  }
+}
+
 // A valid EAN/UPC has a check digit; verifying it rejects most misreads.
 function validBarcodeChecksum(code) {
   if (!/^\d{8}$|^\d{12,14}$/.test(code)) return /^\d{8,14}$/.test(code);
@@ -2825,11 +2939,25 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
   // so the reader confirms against the pack before anything is looked up.
   async function readDigitsFromShot() {
     if (!failedShot?.base64) return;
-    setReadState({ busy: true });
+    setReadState({ busy: true, step: "loading the reader" });
     try {
-      const r = await readBarcodeDigits(failedShot.base64);
-      setReadState(r);
-      if (r.digits) setTypedCode(r.digits);
+      // On-device OCR first: no API key, no cost, and the image stays here.
+      const bmp = await createImageBitmap(await (await fetch(failedShot.url)).blob());
+      const r = await ocrDigits(bmp, (step, p) =>
+        setReadState({ busy: true, step: `${step}${p ? ` ${Math.round(p * 100)}%` : ""}` }));
+
+      if (r.digits) {
+        setReadState({ digits: r.digits, checksumOk: r.checksumOk, via: "on-device",
+                       note: r.candidates.length > 1 ? `Other numbers seen: ${r.candidates.filter(x => x !== r.digits).join(", ")}.` : "" });
+        setTypedCode(r.digits);
+        return;
+      }
+
+      // Only if on-device OCR found nothing, and only when a key is configured.
+      setReadState({ busy: true, step: "trying the cloud reader" });
+      const cloud = await readBarcodeDigits(failedShot.base64);
+      setReadState({ ...cloud, via: "cloud" });
+      if (cloud.digits) setTypedCode(cloud.digits);
     } catch (e) {
       setReadState({ error: String(e?.message || e) });
     }
@@ -3035,8 +3163,36 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
             stills = 99;                     // stand the auto loop down; the user has taken over
             setMessage("Capturing — full scan, this takes a few seconds…");
             try {
-              const code = await decodeStill(detector, await captureStill(), { fast: false, keepOnFail: true });
+              const bmp = await captureStill();
+              const code = await decodeStill(detector, bmp, { fast: false, keepOnFail: false });
               if (code && handle(code)) return;
+
+              // Last rung: the server pipeline, if one is configured. Only
+              // reached after all twenty local strategies have failed.
+              if (DECODE_URL) {
+                setMessage("Sending to the decode service…");
+                try {
+                  const blob = await new Promise(res => {
+                    const c = document.createElement("canvas");
+                    c.width = bmp.width; c.height = bmp.height;
+                    c.getContext("2d").drawImage(bmp, 0, 0);
+                    c.toBlob(res, "image/jpeg", 0.9);
+                  });
+                  const r = await serverDecode(blob);
+                  if (r?.code && handle(r.code)) return;
+                  if (r?.digits) {
+                    keepFailedShot(bmp);
+                    setMessage(r.checksum_ok
+                      ? `The bars were unreadable, but the service read ${r.digits} from the printed digits and the check digit validates. Confirm it below.`
+                      : `The service read ${r.digits} from the printed digits, but the check digit does not validate — correct it below.`);
+                    return;
+                  }
+                } catch (e) {
+                  console.warn("serverDecode:", e);
+                }
+              }
+
+              keepFailedShot(bmp);
               setMessage("No decoder could read that photo — the digits under the barcode can be typed below.");
             } catch (e) {
               setMessage("Capture failed: " + String(e?.message || e));
@@ -3185,7 +3341,7 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
             style={{width:"100%",padding:"9px 0",fontSize:12,fontWeight:600,borderRadius:8,marginBottom:8,
               background:"rgba(255,255,255,0.15)",color:"#fff",
               border:"1px solid rgba(255,255,255,0.35)",cursor:readState?.busy?"default":"pointer"}}>
-            {readState?.busy ? "Reading the digits…" : "Read the number from the photo"}
+            {readState?.busy ? (readState.step ? `${readState.step}…` : "Reading…") : "Read the number from the photo"}
           </button>
 
           {readState && !readState.busy && (
@@ -3196,8 +3352,8 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
                 : !readState.digits
                   ? `No digits were legible. ${readState.note} Type them below.`
                   : readState.checksumOk
-                    ? `Read ${readState.digits} — the check digit validates, so this is very likely correct. Compare it with the pack, then search.`
-                    : `Read ${readState.digits} — but the check digit does NOT validate, so at least one digit is misread. Correct it against the pack before searching.`}
+                    ? `Read ${readState.digits} — the check digit validates, so this is very likely correct. Compare it with the pack, then search. ${readState.note || ""}`
+                    : `Read ${readState.digits} — but the check digit does NOT validate, so at least one digit is misread. Correct it against the pack before searching. ${readState.note || ""}`}
             </div>
           )}
 
@@ -4394,11 +4550,18 @@ export default function App() {
   const newPhotoRef = useRef(null);
   const [noListFor,setNoListFor] = useState(null);   // { name, label, key }
   const [noListText,setNoListText] = useState("");
+  const [ocrState,setOcrState]     = useState(null);
+  const ocrFileRef = useRef(null);
+  // Which field the next OCR result should fill — the dialog and the add form
+  // share one hidden file input, so the target is set at click time.
+  const ocrTargetRef = useRef(null);
   const [newProduct,setNewProduct] = useState({
     name:"", brand:"", code:"", domain:"food",
     ingredients:"", additives:"", allergens:"", labels:"", quantity:"", category:"",
   });
   const [marketOpen,setMarketOpen]     = useState(false);
+  const [marketQuery,setMarketQuery]   = useState("");
+  const [marketDraft,setMarketDraft]   = useState(() => guessMarket());
   const [profilePanel,setProfilePanel] = useState(false);
   const [conditions,setConditions] = useState(() => {
     try { return JSON.parse(window.localStorage.getItem("hst_conditions") || "[]"); } catch { return []; }
@@ -4799,6 +4962,57 @@ export default function App() {
   // immediately, not merely store text for someone else later.
   // Shared by the dialog and the in-card form: takes a target and the text,
   // rather than reading component state, so it cannot act on a stale selection.
+  // Photograph an ingredient list instead of typing it. This is the single
+  // biggest barrier to contributing: a pack's ingredient list runs to dozens of
+  // words in tiny print, and nobody types that on a phone.
+  //
+  // OCR runs on the device, so it needs no API key and the photo never leaves
+  // the phone. The result lands in an EDITABLE box, not straight into the
+  // database — OCR on curved, glossy packaging misreads, and a wrong ingredient
+  // list is worse than none. The reader corrects it against the pack.
+  async function scanIngredientsFromPhoto(file, into) {
+    if (!file) return;
+    setOcrState({ busy: true, step: "preparing" });
+    try {
+      const bmp = await createImageBitmap(file);
+      const r = await ocrText(bmp, (step, p) =>
+        setOcrState({ busy: true, step: `${step}${p ? ` ${Math.round(p * 100)}%` : ""}` }));
+
+      // Tidy the usual OCR artefacts on ingredient panels without changing words.
+      const cleaned = r.text
+        .replace(/\r/g, "")
+        .replace(/[|]/g, "I")
+        .replace(/\s*\n\s*/g, " ")     // lists wrap mid-word across lines
+        .replace(/-\s+/g, "")
+        .replace(/\s{2,}/g, " ")
+        .replace(/\s+([,.;:])/g, "$1")
+        .trim();
+
+      if (!cleaned && DECODE_URL) {
+        // The server pipeline preprocesses far more aggressively than the
+        // browser can, so it is worth one attempt before giving up.
+        setOcrState({ busy: true, step: "trying the decode service" });
+        try {
+          const r = await serverReadText(file);
+          if (r?.text) {
+            into(r.text);
+            setOcrState({ done: true, note: "Read by the decode service. Check every line against the pack before saving." });
+            return;
+          }
+        } catch (e) { console.warn("serverReadText:", e); }
+      }
+      if (!cleaned) {
+        setOcrState({ error: "No text could be read. Try again with the panel filling the frame, flat and evenly lit." });
+        return;
+      }
+      into(cleaned);
+      setOcrState({ done: true, confidence: r.confidence,
+        note: "Check every line against the pack before saving — OCR misreads small print, and an ingredient it drops is one nobody gets warned about." });
+    } catch (e) {
+      setOcrState({ error: String(e?.message || e) });
+    }
+  }
+
   async function saveIngredientsFor(target, text) {
     const key = target.key || nk(target.name);
     const rec = ghGet(key) || {};
@@ -5901,6 +6115,13 @@ export default function App() {
       <input ref={photoRef} type="file" accept="image/*" capture="environment" style={{display:"none"}}
         onChange={e => { const f = e.target.files?.[0]; e.target.value = ""; attachPhoto(f, selected); }}/>
 
+      {/* One hidden file input for all OCR entry points, mounted unconditionally.
+          It previously lived inside the no-list dialog, so the add-product form's
+          button found a null ref and did nothing. */}
+      <input ref={ocrFileRef} type="file" accept="image/*" capture="environment" style={{display:"none"}}
+        onChange={e => { const f = e.target.files?.[0]; e.target.value = "";
+                         scanIngredientsFromPhoto(f, ocrTargetRef.current || ((txt) => setNoListText(txt))); }}/>
+
       {/* ── NO INGREDIENT LIST ── raised immediately, fixable in place ── */}
       {noListFor && (
         <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.6)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:10000,padding:20}}>
@@ -5918,6 +6139,22 @@ export default function App() {
               {profile.length + conditions.length > 0 && (
                 <> Your {profile.length + conditions.length} profile item{profile.length + conditions.length !== 1 ? "s" : ""} could not be checked at all.</>
               )}
+            </div>
+
+            <button onClick={() => { ocrTargetRef.current = (txt) => setNoListText(txt); ocrFileRef.current?.click(); }} disabled={ocrState?.busy}
+              style={{width:"100%",padding:"10px 0",fontSize:12,fontWeight:700,borderRadius:8,marginBottom:8,
+                background:t.accent,color:t.accentFg,border:"none",cursor:ocrState?.busy?"default":"pointer"}}>
+              {ocrState?.busy ? `${ocrState.step}…` : "📷 Photograph the ingredient list"}
+            </button>
+            {ocrState && !ocrState.busy && (
+              <div style={{fontSize:10,lineHeight:1.6,marginBottom:8,
+                color: ocrState.error ? "#c0392b" : "#d97706"}}>
+                {ocrState.error || ocrState.note}
+              </div>
+            )}
+            <div style={{fontSize:9.5,color:t.textMuted,marginBottom:6}}>
+              First use downloads the text reader (~10 MB), then it works offline. Nothing is
+              uploaded — the photo is read on your device.
             </div>
 
             <textarea value={noListText} onChange={e=>setNoListText(e.target.value)} rows={5}
@@ -6024,6 +6261,13 @@ export default function App() {
               </button>
             )}
 
+            <button onClick={() => { ocrTargetRef.current = (txt) => setNewProduct(p => ({ ...p, ingredients: txt })); ocrFileRef.current?.click(); }} disabled={ocrState?.busy}
+              style={{width:"100%",padding:"9px 0",fontSize:12,fontWeight:600,borderRadius:8,marginBottom:7,
+                background:t.pill,color:t.textSub,border:`1px solid ${t.border}`,
+                cursor:ocrState?.busy?"default":"pointer"}}>
+              {ocrState?.busy ? `${ocrState.step}…` : "📷 Photograph the ingredient list instead of typing"}
+            </button>
+
             {/* Photo, in the same form. Adding a product without one leaves an
                 unidentifiable record, and the pack is in the user's hand now. */}
             <input ref={newPhotoRef} type="file" accept="image/*" capture="environment" style={{display:"none"}}
@@ -6060,29 +6304,66 @@ export default function App() {
         </div>
       )}
 
-      {/* ── LOCATION PICKER ── */}
+      {/* ── LOCATION PICKER ── search, select, then Save ── */}
       {marketOpen && (
-        <div onClick={()=>setMarketOpen(false)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
-          <div onClick={e=>e.stopPropagation()} style={{background:t.bg,borderRadius:14,padding:20,maxWidth:420,width:"100%",maxHeight:"80vh",overflowY:"auto",border:`1px solid ${t.border}`}}>
+        <div onClick={()=>{ setMarketOpen(false); setMarketDraft(market); setMarketQuery(""); }}
+          style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
+          <div onClick={e=>e.stopPropagation()} style={{background:t.bg,borderRadius:14,padding:20,maxWidth:440,width:"100%",maxHeight:"85vh",display:"flex",flexDirection:"column",border:`1px solid ${t.border}`}}>
             <h2 style={{margin:"0 0 4px",fontSize:16,fontWeight:700,color:t.text}}>Where do you shop?</h2>
-            <div style={{fontSize:11,color:t.textSub,lineHeight:1.6,marginBottom:14}}>
-              Alternatives and discovery are drawn from this market. Open Food Facts began in
-              France and its coverage still leans European, so without this the suggestions are
-              products you cannot buy. If nothing local matches, the search widens and those
-              results are labelled.
+            <div style={{fontSize:11,color:t.textSub,lineHeight:1.6,marginBottom:12}}>
+              Alternatives, discovery and search results are drawn from this market. If nothing
+              local matches, the search widens and those results are labelled.
             </div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
-              {Object.entries(MARKETS).map(([k,m]) => {
-                const on = market === k;
-                return (
-                  <button key={k} onClick={()=>{ changeMarket(k); setMarketOpen(false); }}
-                    style={{textAlign:"left",padding:"9px 11px",borderRadius:8,fontSize:12,fontWeight:on?700:500,
-                      background:on?t.accent:t.surface,color:on?t.accentFg:t.text,
-                      border:`1px solid ${on?t.accent:t.border}`,cursor:"pointer"}}>
-                    {m.label}
-                  </button>
-                );
-              })}
+
+            <input autoFocus value={marketQuery} onChange={e=>setMarketQuery(e.target.value)}
+              placeholder="Search countries…"
+              style={{width:"100%",boxSizing:"border-box",fontSize:12,padding:"9px 11px",borderRadius:8,
+                border:`1px solid ${t.border}`,background:t.bgSub,color:t.text,marginBottom:8}}/>
+
+            {/* Selection is held in a DRAFT until Save, so closing the dialog or
+                tapping around never silently changes which market is in force. */}
+            <div style={{flex:1,overflowY:"auto",minHeight:120,marginBottom:10,
+              border:`1px solid ${t.border}`,borderRadius:8}}>
+              {Object.entries(MARKETS)
+                .filter(([k,m]) => !marketQuery.trim() ||
+                  m.label.toLowerCase().includes(marketQuery.trim().toLowerCase()) ||
+                  k.toLowerCase() === marketQuery.trim().toLowerCase())
+                .map(([k,m]) => {
+                  const on = marketDraft === k;
+                  return (
+                    <button key={k} onClick={()=>setMarketDraft(k)}
+                      style={{width:"100%",textAlign:"left",padding:"10px 12px",fontSize:12,
+                        fontWeight:on?700:500,background:on?`${t.accent}1e`:"transparent",
+                        color:on?t.accent:t.text,border:"none",borderBottom:`1px solid ${t.border}`,
+                        cursor:"pointer",display:"flex",alignItems:"center",gap:8}}>
+                      <span style={{width:14,flexShrink:0}}>{on ? "✓" : ""}</span>{m.label}
+                    </button>
+                  );
+                })}
+              {Object.entries(MARKETS).filter(([k,m]) =>
+                  m.label.toLowerCase().includes(marketQuery.trim().toLowerCase())).length === 0 && (
+                <div style={{padding:"14px 12px",fontSize:11,color:t.textSub}}>
+                  No market called “{marketQuery}”. Choose <strong>Anywhere</strong> to search without
+                  a location filter.
+                </div>
+              )}
+            </div>
+
+            <div style={{display:"flex",gap:6,alignItems:"center"}}>
+              <button onClick={()=>{ changeMarket(marketDraft); setMarketOpen(false); setMarketQuery(""); }}
+                disabled={marketDraft === market}
+                style={{flex:1,padding:"11px 0",fontSize:12,fontWeight:700,borderRadius:8,
+                  cursor:marketDraft===market?"default":"pointer",
+                  background:marketDraft===market?t.pill:t.accent,
+                  color:marketDraft===market?t.textMuted:t.accentFg,border:"none"}}>
+                {marketDraft === market ? "Saved" : `Save — ${MARKETS[marketDraft]?.label}`}
+              </button>
+              <button onClick={()=>{ setMarketOpen(false); setMarketDraft(market); setMarketQuery(""); }}
+                style={{padding:"11px 16px",fontSize:12,fontWeight:600,borderRadius:8,cursor:"pointer",
+                  background:t.pill,color:t.textSub,border:`1px solid ${t.border}`}}>Cancel</button>
+            </div>
+            <div style={{fontSize:9,color:t.textMuted,marginTop:8,lineHeight:1.6}}>
+              Saved on this device and kept after a refresh. Currently in force: {MARKETS[market]?.label}.
             </div>
           </div>
         </div>
@@ -6142,9 +6423,25 @@ export default function App() {
               a diagnosed allergy or a clinician's dietary limits, those take precedence over
               anything shown here.
             </div>
-            <button onClick={()=>setProfilePanel(false)}
-              style={{marginTop:12,width:"100%",padding:"10px 0",fontSize:12,fontWeight:600,borderRadius:8,
-                background:t.accent,color:t.accentFg,border:"none",cursor:"pointer"}}>Done</button>
+            {/* Selections save as you tap them and survive a refresh, so the
+                missing control was a way to clear them, not a way to keep them. */}
+            <div style={{display:"flex",gap:6,marginTop:12}}>
+              <button onClick={()=>setProfilePanel(false)}
+                style={{flex:1,padding:"10px 0",fontSize:12,fontWeight:600,borderRadius:8,
+                  background:t.accent,color:t.accentFg,border:"none",cursor:"pointer"}}>Done</button>
+              {(conditions.length || profile.length) > 0 && (
+                <button onClick={()=>{
+                    setConditions([]); setProfile([]);
+                    try { window.localStorage.removeItem("hst_conditions"); window.localStorage.removeItem("hst_profile"); } catch { /* private mode */ }
+                    toast("profile", "Profile cleared. Products are no longer checked against conditions or sensitivities.");
+                  }}
+                  style={{padding:"10px 14px",fontSize:12,fontWeight:600,borderRadius:8,cursor:"pointer",
+                    background:t.pill,color:t.textSub,border:`1px solid ${t.border}`}}>Clear all</button>
+              )}
+            </div>
+            <div style={{fontSize:9,color:t.textMuted,marginTop:8,lineHeight:1.6}}>
+              Saved as you tap and kept after a refresh — closing this panel does not undo it.
+            </div>
           </div>
         </div>
       )}
@@ -6168,7 +6465,8 @@ export default function App() {
           </div>
 
           {/* LOCATION — sets which market alternatives are drawn from */}
-          <button onClick={()=>setMarketOpen(true)} title={`Alternatives are drawn from ${MARKETS[market]?.label}`}
+          <button onClick={()=>{ setMarketDraft(market); setMarketQuery(""); setMarketOpen(true); }}
+            title={`Alternatives are drawn from ${MARKETS[market]?.label}`}
             style={{background:t.pill,border:`1px solid ${t.border}`,borderRadius:20,padding:isMobile?"5px 10px":"6px 12px",cursor:"pointer",display:"flex",alignItems:"center",gap:6}}>
             <span style={{fontSize:13}}>🌐</span>
             <span style={{fontSize:11,fontWeight:600,color:t.textSub}}>{MARKETS[market]?.label || "Anywhere"}</span>
