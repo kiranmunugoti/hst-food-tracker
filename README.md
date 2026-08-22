@@ -638,3 +638,118 @@ degrades to its previous behaviour.
 Deploy on a container host (Fly.io, Render, Railway). **Not Vercel** — ZBar and
 OpenCV need system libraries its Python runtime cannot install. See
 `server/README.md`.
+
+## v10.8 — a score card, and an OCR result that refuses to be gibberish
+
+### On-device ingredient OCR was passing noise through as text
+
+A photo of a curved, glossy pack (foil toothpaste tube, a can with a seam)
+could come back with symbols that never appear on an ingredient panel — ©, ¥,
+`\`, stray `=` and `^` — mixed in with real words. Two causes, both in
+`ocrText`:
+
+- Tesseract's default page-segmentation mode (fully automatic layout
+  analysis) tries to split the photo into separate regions before reading
+  them, so a logo in one corner and a barcode in another get interleaved with
+  the ingredient paragraph instead of skipped. An ingredient panel is one
+  block of text, so it is now told that directly: `tessedit_pageseg_mode:
+  "6"` ("assume a single uniform block of text").
+- Nothing restricted which characters a read could contain. `OCR_TEXT_WHITELIST`
+  now limits recognition to letters, digits, spaces and the punctuation that
+  actually appears in an ingredient list (`,.():;%&/'-`) — the same technique
+  already used for barcode digits, applied to free text.
+
+**A quality gate, not a spellchecker.** `looksLikeGibberish()` catches what
+the whitelist doesn't: low Tesseract confidence, a low letter-to-character
+ratio, or a run of one-character "words" — the shape of noise read as text,
+as opposed to a genuine misread word. A result that fails the gate is never
+handed to the reader as if it were the ingredient list; `scanIngredientsFromPhoto`
+falls back to the server decode pipeline where configured (§ v10.7), and if
+that also fails, reports plainly that the photo didn't read clearly and asks
+for a flatter, better-lit, closer shot — rather than filling the field with
+scrambled text someone could miss and save. Legitimate misreads (a wrong
+letter in a real word) still pass through as before, since that is exactly
+what the editable field and the "check every line against the pack" note
+exist to catch.
+
+### An at-a-glance score card
+
+`ScoreSummaryCard`, shown above the existing detailed panels, gives a product
+a single number out of 100 with a colour and a label (Bad / Poor / Good /
+Excellent), then a **Negatives** and **Positives** list — additives, saturated
+fat, sugar, calories, protein, fibre, sodium — each with a coloured dot and a
+tap-to-expand detail line. Visually this is the layout readers already know
+from the popular ingredient-scanner apps.
+
+It is deliberately not a new number. `ratings.js` never averages Safety,
+Expert and Community together — a product can be well reviewed and still
+contain an ingredient CSPI rates "Avoid", and blending would let the former
+mask the latter. Safety is already the headline of the three (see "Ratings"
+above), so the card's score *is* the Safety score, just rendered the way
+readers expect a single score to look, and it inherits that score's `null`
+handling: no ingredient list means "—, not enough data", never a guessed
+number. Every row is read off figures the app already computes for the
+Nutrition Facts table and the CSPI assessment — a second view of existing
+data, not a second source of truth. Hidden entirely for the cosmetics domain,
+where `FormulationCard` already covers this ground.
+
+## v10.9 — closing the iOS/Firefox scanning gap
+
+### What the popular scanner apps actually do differently
+
+A side-by-side against one of them showed their camera view decoding a
+barcode within a second, with no capture button at all — the corner-bracket
+viewfinder carries a `SCANDIT` watermark, meaning that speed comes from a
+commercial native barcode SDK (Scandit), not from anything achievable in a
+browser tab. That is a paid, licensed dependency and out of scope here — but
+comparing the two surfaced a real, fixable gap in this app's own pipeline.
+
+### The gap: two camera code paths, only one of them capable
+
+`BarcodeScanner` has always had two branches: `BarcodeDetector` (Chrome and
+Android — a native, hardware-accelerated API) and ZXing (everyone else —
+every iPhone, since Safari has no `BarcodeDetector`, and Firefox). Only the
+`BarcodeDetector` branch got the good parts:
+
+- **The 20-rung decode ladder** (`decodeLadder`: contrast boost, four
+  rotations, a zoomed crop, three curved-label bands, a magnified centre crop,
+  a 9-tile sweep for a code that is small in the frame) ran against every
+  rung for `BarcodeDetector`. For ZXing it ran once, against the raw,
+  unmodified photo — none of the enhancement that makes the ladder worth
+  having applied to it.
+- **Automatic still-capture escalation** — after ~1.5s of live decoding
+  finding nothing, silently grab a sharper still and try harder, repeating up
+  to 4 times — existed only in the `BarcodeDetector` branch. The ZXing branch
+  had no equivalent: live video decoding, indefinitely, with a manual
+  "Capture" button as the only way out.
+- **The manual Capture button itself**, on the ZXing branch, called
+  `decodeFromImageUrl` once on a single raw frame — again, none of the ladder.
+
+None of this was ZXing being a worse decoder in principle. It was ZXing never
+being given the preprocessing that makes the difference on a real photo —
+curved packaging, small print, a glare spot — and it is exactly why the
+scanner behaved so differently between an Android phone and an iPhone.
+
+### The fix
+
+`decodeLadder` now runs ZXing itself against the same rung variants when no
+native detector is present — 3 rungs for a fast/automatic attempt (so it
+still fits inside the ~2s auto-scan cadence), up to 14 for a deliberate
+Capture. `BarcodeScanner`'s ZXing branch now schedules the same escalation
+(first look at 1.5s, then every 2.5s, up to 4 tries) that the
+`BarcodeDetector` branch already had, and its Capture button now goes through
+the shared `decodeStill`/`decodeLadder` path instead of a single raw-frame
+attempt — so iOS and Firefox get the full pipeline Chrome/Android already
+had. ZXing is also now constructed via `makeZXingReader`, which restricts
+recognition to the formats a grocery product actually carries (EAN-13/8,
+UPC-A/E, Code 128, ITF) through the reader's own `possibleFormats` setter —
+a real per-frame speed win, and the reason it goes through that setter rather
+than a hand-built hints map is that the pinned `@zxing/browser` build does not
+export `DecodeHintType` on its global, only `BarcodeFormat`; verified against
+the actual shipped UMD bundle rather than assumed.
+
+Verified end-to-end against a synthetic camera feed (a generated EAN-13,
+fed in as a fake video device) in both a large-and-centred and a
+small-and-off-centre framing — both decoded correctly through this path with
+no native `BarcodeDetector` present, confirming the ZXing branch's ladder and
+escalation logic actually runs, not just that it compiles.

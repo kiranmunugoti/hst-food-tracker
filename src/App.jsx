@@ -2685,18 +2685,57 @@ async function prepForOCR(bitmap, { maxEdge = 1600 } = {}) {
   return c;
 }
 
+// Characters that legitimately appear on an ingredient panel. Anything else —
+// ©, ¥, \, =, ^ and the like, all of which showed up in real captures — is
+// almost never real text; it is a logo, a border or a barcode's printed
+// digits bleeding into the read. Whitelisting cuts that noise off at the
+// source instead of trying to strip it back out afterwards.
+const OCR_TEXT_WHITELIST =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 " +
+  ",.()%:;&/'-";
+
 async function ocrText(bitmap, onProgress) {
   const T = await loadOCR();
-  const canvas = await prepForOCR(bitmap);
+  const canvas = await prepForOCR(bitmap, { maxEdge: 2000 });
   const worker = await T.createWorker("eng", 1, {
     logger: (m) => { if (m.status && onProgress) onProgress(m.status, m.progress || 0); },
   });
   try {
+    // PSM 6 = "assume a single uniform block of text". The default (fully
+    // automatic layout analysis) tries to split the photo into regions first,
+    // which is what turns a curved pack — logo in one corner, barcode in
+    // another, ingredient paragraph in the middle — into interleaved noise.
+    // An ingredient panel is one block of text, so saying so directly is a
+    // large accuracy gain on exactly the kind of photo that produced garbage.
+    await worker.setParameters({
+      tessedit_pageseg_mode: "6",
+      tessedit_char_whitelist: OCR_TEXT_WHITELIST,
+    });
     const { data } = await worker.recognize(canvas);
     return { text: String(data?.text || "").trim(), confidence: data?.confidence ?? null };
   } finally {
     await worker.terminate();
   }
+}
+
+// A quality gate, not a spellchecker. It exists to tell apart two failure
+// modes that used to look identical to the reader: "misread a word" (still
+// worth showing — corrected against the pack in the editable field) versus
+// "read noise as text" (worth blocking outright — dumping symbol soup into an
+// editable field just moves the garbage into the shared database the moment
+// someone doesn't notice and taps save).
+function looksLikeGibberish(text, confidence) {
+  const body = String(text || "").replace(/\s+/g, "");
+  if (!body) return true;
+  if (confidence != null && confidence < 35) return true;
+  const letters = (body.match(/[A-Za-z]/g) || []).length;
+  if (letters / body.length < 0.55) return true;
+  const words = String(text).split(/\s+/).filter(Boolean);
+  if (words.length >= 6) {
+    const singles = words.filter(w => w.replace(/[^A-Za-z0-9]/g, "").length <= 1).length;
+    if (singles / words.length > 0.35) return true;
+  }
+  return false;
 }
 
 // Digits only — a much easier problem than free text, so the character set is
@@ -2708,7 +2747,7 @@ async function ocrDigits(bitmap, onProgress) {
     logger: (m) => { if (m.status && onProgress) onProgress(m.status, m.progress || 0); },
   });
   try {
-    await worker.setParameters({ tessedit_char_whitelist: "0123456789" });
+    await worker.setParameters({ tessedit_pageseg_mode: "6", tessedit_char_whitelist: "0123456789" });
     const { data } = await worker.recognize(canvas);
     const runs = String(data?.text || "").match(/\d{6,14}/g) || [];
     // Prefer a run whose check digit validates; a GTIN that checks out is
@@ -2782,6 +2821,37 @@ async function transformBitmap(bitmap, { rotate = 0, crop = null, scale = 1 } = 
 // Only after ALL of these fail is the image genuinely unreadable — and then
 // the still is kept rather than discarded, so the reader can type the digits
 // they can plainly see.
+function bitmapToDataUrl(bitmap) {
+  const c = document.createElement("canvas");
+  c.width = bitmap.width; c.height = bitmap.height;
+  c.getContext("2d").drawImage(bitmap, 0, 0);
+  return c.toDataURL("image/png");
+}
+
+// Restricting ZXing to the formats a product actually carries is a real speed
+// win — unrestricted, it tries every 1D and 2D symbology (QR, Data Matrix,
+// Aztec, PDF417…) on every attempt, none of which a grocery barcode ever is.
+// `@zxing/browser`'s UMD build does not export `DecodeHintType`, only
+// `BarcodeFormat` — so this goes through the reader's own `possibleFormats`
+// setter (public API, confirmed present on `BrowserMultiFormatReader` in the
+// pinned 0.1.5 build) rather than constructing a hints Map by hand against an
+// enum that is not actually available on the global. Defensive regardless: if
+// a future CDN version changes this, the catch leaves the unrestricted reader
+// in place rather than breaking barcode reading entirely.
+function makeZXingReader(ZX) {
+  const reader = new ZX.BrowserMultiFormatReader();
+  try {
+    if (ZX.BarcodeFormat) {
+      reader.possibleFormats = [
+        ZX.BarcodeFormat.EAN_13, ZX.BarcodeFormat.EAN_8,
+        ZX.BarcodeFormat.UPC_A, ZX.BarcodeFormat.UPC_E,
+        ZX.BarcodeFormat.CODE_128, ZX.BarcodeFormat.ITF,
+      ];
+    }
+  } catch { /* unrestricted reader already assigned above */ }
+  return reader;
+}
+
 async function decodeLadder(bitmap, detector, onProgress, { fast = false } = {}) {
   const attempts = [
     ["reading", async () => bitmap],
@@ -2815,31 +2885,61 @@ async function decodeLadder(bitmap, detector, onProgress, { fast = false } = {})
     ])),
   ];
 
-  if (detector) {
-    for (const [label, make] of attempts) {
-      onProgress?.(label);
+  // A native BarcodeDetector (Chrome/Android) runs the whole ladder cheaply,
+  // so ZXing there is only the last-resort "second decoder" rung below.
+  //
+  // Without one — every iPhone and every Firefox user, which is most of this
+  // app's reported scanning trouble — ZXing previously got a single attempt
+  // on the raw, unmodified photo. None of the contrast, rotation, crop or
+  // tile rungs above ever ran for those readers, which is the actual gap
+  // between "Chrome/Android scans reliably" and "iOS struggles": not a
+  // weaker decoder so much as a decoder that only ever saw the easy case.
+  // ZXing now shares the same ladder, capped shorter in fast mode (an
+  // automatic background attempt still has to fit inside ~2s) and full-length
+  // on a deliberate Capture.
+  const zxRungs = detector ? 0 : Math.min(attempts.length, fast ? 3 : 14);
+  let zxReaderPromise = null;
+  const zxReader = () => {
+    if (!zxReaderPromise) zxReaderPromise = loadZXing().then(makeZXingReader).catch(() => null);
+    return zxReaderPromise;
+  };
+  const tryZXing = async (variantBitmap) => {
+    const reader = await zxReader();
+    if (!reader) return null;
+    try {
+      const res = await reader.decodeFromImageUrl(bitmapToDataUrl(variantBitmap));
+      return res?.getText?.() || null;
+    } catch { return null; }
+  };
+
+  for (let i = 0; i < attempts.length; i++) {
+    const [label, make] = attempts[i];
+    onProgress?.(label);
+    let variant;
+    try { variant = await make(); } catch { continue; }
+
+    if (detector) {
       try {
-        const found = await detector.detect(await make());
+        const found = await detector.detect(variant);
         if (found?.length) return { code: found[0].rawValue, via: label };
       } catch { /* next rung */ }
+    } else if (i < zxRungs) {
+      const text = await tryZXing(variant);
+      if (text) return { code: text, via: label };
     }
   }
 
   if (fast) return null;
 
-  // Different decoder, same image. This is the rung that most often rescues a
-  // still the native detector has already refused.
-  onProgress?.("trying a second decoder");
-  try {
-    const ZX = await loadZXing();
-    const c = document.createElement("canvas");
-    c.width = bitmap.width; c.height = bitmap.height;
-    c.getContext("2d").drawImage(bitmap, 0, 0);
-    const res = await new ZX.BrowserMultiFormatReader()
-      .decodeFromImageUrl(c.toDataURL("image/png")).catch(() => null);
-    const txt = res?.getText?.();
-    if (txt) return { code: txt, via: "second decoder" };
-  } catch { /* exhausted */ }
+  // Different decoder, same original image — the rung that most often rescues
+  // a still a native detector has already refused. Only meaningful when a
+  // native detector exists; without one, ZXing has already seen every rung
+  // above.
+  if (detector) {
+    onProgress?.("trying a second decoder");
+    const text = await tryZXing(bitmap);
+    if (text) return { code: text, via: "second decoder" };
+  }
 
   return null;
 }
@@ -2976,10 +3076,12 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
   useEffect(() => {
     stopRef.current = false;
     let zxingControls = null;
+    let zxEscalationTimer = null;
 
     const stopAll = () => {
       stopRef.current = true;
       try { zxingControls?.stop(); } catch {}
+      if (zxEscalationTimer) { clearTimeout(zxEscalationTimer); zxEscalationTimer = null; }
       streamRef.current?.getTracks().forEach(tr => tr.stop());
       streamRef.current = null;
     };
@@ -3205,26 +3307,69 @@ function BarcodeScanner({ onDetect, onClose, t, isMobile }) {
       try {
         const ZX = await loadZXing();
         if (stopRef.current) return;
-        const reader = new ZX.BrowserMultiFormatReader();
+        const reader = makeZXingReader(ZX);
+
+        // Every iPhone (no BarcodeDetector at all) and Firefox lands here.
+        // Plain continuous video decoding fights the same motion blur and
+        // downscaled preview the native-detector branch above does — the
+        // difference is that branch also escalates to a sharper still run
+        // through the full enhancement ladder after a couple of seconds, and
+        // this one previously did not, leaving readers with nothing between
+        // "hope the live feed resolves it" and pressing Capture by hand. Same
+        // escalation, same timing (first look at 1.5s, then every 2.5s, up to
+        // 4 tries) — decodeStill with no native detector now runs ZXing over
+        // the ladder itself instead of a single raw-frame attempt.
+        let stills = 0, escalating = false;
+        const scheduleEscalation = () => {
+          if (stopRef.current || stills >= 4) return;
+          zxEscalationTimer = setTimeout(async () => {
+            if (stopRef.current) return;
+            if (escalating || autoBusyRef.current || capturingRef.current) { scheduleEscalation(); return; }
+            stills++; escalating = true; autoBusyRef.current = true;
+            setMessage(`Looking harder (${stills}/4)…`);
+            try {
+              const code = await decodeStill(null, await captureStill(), { fast: true, keepOnFail: false });
+              if (code && handle(code)) return;
+              setMessage(stills >= 4
+                ? "Not readable from the video. Press Capture for a full-strength scan of one photo — or type the digits."
+                : "Reading — keep the barcode in frame.");
+            } catch { /* keep the live loop running */ }
+            finally { escalating = false; autoBusyRef.current = false; scheduleEscalation(); }
+          }, stills === 0 ? 1500 : 2500);
+        };
+        scheduleEscalation();
+
         zxingControls = await reader.decodeFromVideoElement(videoRef.current, (result) => {
           if (result) handle(result.getText());
         });
-        // Capture must work on this path too (Firefox, older Safari), or the
-        // button would be present and silently do nothing.
+
+        // Capture now goes through the same full-strength ladder the native-
+        // detector branch uses (contrast, rotations, crops, tiled sweep — all
+        // run against ZXing here, not just this one raw frame), so a deliberate
+        // press is as capable on iOS/Firefox as it already was on Chrome/Android.
         captureNowRef.current = async () => {
-          if (capturingRef.current) return;
+          if (capturingRef.current) { setMessage("Already scanning that photo…"); return; }
           capturingRef.current = true;
-          setMessage("Capturing…");
+          stills = 99;   // stand the auto loop down; the user has taken over
+          setMessage("Capturing — full scan, this takes a few seconds…");
           try {
-            const v = videoRef.current;
-            if (!v?.videoWidth) throw new Error("Camera not ready");
-            const c = document.createElement("canvas");
-            c.width = v.videoWidth; c.height = v.videoHeight;
-            c.getContext("2d").drawImage(v, 0, 0);
-            const url = c.toDataURL("image/png");
-            const res = await reader.decodeFromImageUrl(url).catch(() => null);
-            const clean = String(res?.getText?.() || "").replace(/\D/g, "");
-            if (clean.length >= 8) { stopAll(); onDetect(clean); return; }
+            const bmp = await captureStill();
+            const code = await decodeStill(null, bmp, { fast: false, keepOnFail: false });
+            if (code && handle(code)) return;
+
+            if (DECODE_URL) {
+              setMessage("Sending to the decode service…");
+              try {
+                const blob = await new Promise(res => {
+                  const c = document.createElement("canvas");
+                  c.width = bmp.width; c.height = bmp.height;
+                  c.getContext("2d").drawImage(bmp, 0, 0);
+                  c.toBlob(res, "image/jpeg", 0.85);
+                });
+                const r = await serverDecode(blob);
+                if (r?.code && handle(r.code)) return;
+              } catch (e) { console.warn("serverDecode:", e); }
+            }
             setMessage("No decoder could read that capture — type the digits below instead.");
           } catch (e) {
             setMessage("Capture failed: " + String(e?.message || e));
@@ -4163,7 +4308,164 @@ function Disclaimer({ t, variant = "full" }) {
   );
 }
 
-function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, brandCred, brandStat, brandCredLoading, alternatives, altLoading, diet, t, dark, onOpen, cosmeticAnalysis, ratingsPanel, onAddPhoto, photoBusy }) {
+// ─── SCORE SUMMARY (at-a-glance card) ──────────────────────────────────────
+// A single score, a colour, and two short "Negatives"/"Positives" lists — the
+// layout readers already know from the popular ingredient-scanner apps —
+// sitting above this app's own, more detailed panels rather than replacing
+// them. The number is the existing Safety score (CSPI additive tiers), not a
+// new blended metric: ratings.js deliberately never averages Safety, Expert
+// and Community together (see RatingsPanel), and Safety is already the
+// headline of the three, so it is what a single "score out of 100" can
+// honestly mean here. Every row below reads off figures already computed for
+// the Nutrition Facts table and the CSPI assessment — a second view of
+// existing data, not a new source of truth.
+function scoreBand(v) {
+  if (v >= 76) return { label: "Excellent", color: "#2e7d52" };
+  if (v >= 51) return { label: "Good",      color: "#4a9060" };
+  if (v >= 26) return { label: "Poor",      color: "#d97706" };
+  return           { label: "Bad",       color: "#c0392b" };
+}
+const TIER_DOT = { avoid:"#c0392b", caution:"#d97706", sensitive:"#b8860b", cutback:"#7a8b3a", safe:"#2e7d52" };
+
+function ScoreSummaryCard({ offData, aiSugarData, ratings, t, dark }) {
+  const [openRow, setOpenRow] = useState(null);
+  if (!ratings?.safety) return null;
+  const { safety } = ratings;
+  const n = offData.nut || {};
+  const totalSugars = n.sugars ?? aiSugarData?.total_sugars ?? null;
+  const hasSrv = !!offData.servingSize;
+  const kcal = hasSrv && n.energy_srv != null ? n.energy_srv : n.energy_kcal;
+  const kcalUnit = hasSrv && n.energy_srv != null ? `per serving (${offData.servingSize})` : "per 100g";
+  const score = safety.unknown || safety.score == null ? null : Math.max(0, Math.min(100, Math.round(safety.score * 10)));
+  const band = score == null ? null : scoreBand(score);
+
+  const attrs = [];
+
+  // Additives: always shown when the label declares any, because "unrated"
+  // is information too (see cspiAssess) — it never gets folded into a green
+  // "fine" the way an unexamined product would be.
+  const additiveTotal = (safety.rated?.length || 0) + (safety.unrated?.length || 0);
+  if (additiveTotal > 0) {
+    const worst = safety.worstTier;
+    attrs.push({
+      key: "additives", icon: "⚗️", label: "Additives", value: String(additiveTotal), bucket: "neg",
+      color: worst ? TIER_DOT[worst] : "#999",
+      sub: worst
+        ? (worst === "safe" ? "Additives with no known risk" : `Additives ${CSPI_TIERS[worst].label.toLowerCase()}`)
+        : "Not in the curated safety list",
+      detail: safety.rated?.length
+        ? `Rated: ${safety.rated.map(r => r.name || r.additive).join(", ")}.`
+        : "None of this product's declared additives are in the curated CSPI subset — coverage, not a clean bill.",
+    });
+  } else if (offData.ingredients) {
+    attrs.push({ key:"additives", icon:"⚗️", label:"Additives", value:"0", bucket:"pos", color:"#2e7d52",
+      sub:"No declared additives", detail:"No additives are declared in this product's ingredient list." });
+  }
+
+  const tl = (key, icon, label, v, negWording, posWording) => {
+    if (v == null) return;
+    const c = tlColor(key, v);
+    attrs.push({ key, icon, label, value:`${fmt(v)}g`, bucket: c === "#2e7d52" ? "pos" : "neg", color:c,
+      sub: c === "#c0392b" ? negWording[0] : c === "#2e7d52" ? posWording : negWording[1],
+      detail: `${fmt(v)}g per 100g.` });
+  };
+  tl("satfat", "💧", "Saturated fat", n.saturated,  ["Too fatty","A bit fatty"], "Low in saturated fat");
+  tl("sugars", "🧊", "Sugar",         totalSugars,  ["Too sweet","A bit sweet"], "Low in sugar");
+
+  if (kcal != null) {
+    const c = kcal >= 400 ? "#c0392b" : kcal >= 150 ? "#d97706" : "#2e7d52";
+    attrs.push({ key:"calories", icon:"🔥", label:"Calories", value:`${Math.round(kcal)} Cal`,
+      bucket: c === "#2e7d52" ? "pos" : "neg", color:c,
+      sub: c === "#c0392b" ? "A bit too caloric" : c === "#d97706" ? "Moderately caloric" : "Reasonably caloric",
+      detail: `${Math.round(kcal)} kcal ${kcalUnit}.` });
+  }
+  if (n.protein > 0) {
+    attrs.push({ key:"protein", icon:"🐟", label:"Protein", value:`${fmt(n.protein)}g`, bucket:"pos", color:"#2e7d52",
+      sub: n.protein >= 8 ? "Good source of protein" : "Some protein", detail:`${fmt(n.protein)}g protein per 100g.` });
+  }
+  if (n.fiber > 0) {
+    attrs.push({ key:"fiber", icon:"🌾", label:"Fiber", value:`${fmt(n.fiber)}g`, bucket:"pos", color:"#2e7d52",
+      sub: n.fiber >= 3 ? "Good source of fiber" : "Some fiber", detail:`${fmt(n.fiber)}g dietary fibre per 100g.` });
+  }
+  if (n.salt != null) {
+    const c = tlColor("salt", n.salt);
+    const mg = Math.round(n.salt * 400);
+    attrs.push({ key:"sodium", icon:"🧂", label:"Sodium", value:`${mg}mg`, bucket: c === "#2e7d52" ? "pos" : "neg", color:c,
+      sub: c === "#c0392b" ? "High sodium" : c === "#2e7d52" ? "Low sodium" : "Moderate sodium",
+      detail: `${fmt(n.salt)}g salt per 100g (≈ ${mg}mg sodium).` });
+  }
+
+  const negatives = attrs.filter(a => a.bucket === "neg");
+  const positives = attrs.filter(a => a.bucket === "pos");
+  if (!negatives.length && !positives.length && score == null) return null;
+
+  const Row = ({ a, last }) => (
+    <div>
+      <div onClick={() => setOpenRow(o => o === a.key ? null : a.key)}
+        style={{display:"flex",alignItems:"center",gap:10,padding:"10px 16px",cursor:"pointer",
+          borderBottom: last && openRow !== a.key ? "none" : `1px solid ${t.border}`}}>
+        <span style={{fontSize:15,width:20,textAlign:"center",flexShrink:0}}>{a.icon}</span>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{fontSize:13,fontWeight:600,color:t.text}}>{a.label}</div>
+          <div style={{fontSize:10,color:t.textSub,marginTop:1}}>{a.sub}</div>
+        </div>
+        <div style={{fontSize:12,color:t.textSub,fontWeight:600,whiteSpace:"nowrap"}}>{a.value}</div>
+        <div style={{width:9,height:9,borderRadius:"50%",background:a.color,flexShrink:0}}/>
+        <span style={{fontSize:9,color:t.textMuted,flexShrink:0,transform:openRow===a.key?"rotate(180deg)":"none",transition:"transform 0.15s"}}>▾</span>
+      </div>
+      {openRow === a.key && (
+        <div style={{padding:"2px 16px 12px 46px",fontSize:11,color:t.textSub,lineHeight:1.6,
+          borderBottom: last ? "none" : `1px solid ${t.border}`, background:t.bgSub}}>
+          {a.detail}
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:12,overflow:"hidden"}}>
+      <div style={{display:"flex",alignItems:"center",gap:14,padding:16}}>
+        {offData.image && (offData.image.startsWith("data:image/") || offData.image.startsWith("http")) ? (
+          <img src={offData.image} alt="" style={{width:52,height:52,objectFit:"contain",borderRadius:8,background:dark?"#1a1c20":"#f8f7f5",flexShrink:0}}/>
+        ) : <div style={{width:52,height:52,borderRadius:8,background:dark?"#1a1c20":"#f8f7f5",flexShrink:0}}/>}
+        <div style={{flex:1,minWidth:0}}>
+          {offData.brand && <div style={{fontSize:10,fontWeight:600,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.05em"}}>{offData.brand}</div>}
+          <div style={{fontSize:14,fontWeight:700,color:t.text,lineHeight:1.3,wordBreak:"break-word"}}>{offData.name}</div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:7,flexShrink:0}}>
+          {band && <div style={{width:11,height:11,borderRadius:"50%",background:band.color}}/>}
+          <div style={{textAlign:"right"}}>
+            <div style={{fontSize:19,fontWeight:800,color:band?band.color:t.textMuted,lineHeight:1}}>
+              {score == null ? "—" : score}<span style={{fontSize:11,fontWeight:600,color:t.textMuted}}>/100</span>
+            </div>
+            <div style={{fontSize:10,fontWeight:600,color:t.textSub}}>{band ? band.label : "Not enough data"}</div>
+          </div>
+        </div>
+      </div>
+
+      {safety.unknown && (
+        <div style={{margin:"0 16px 14px",fontSize:11,color:"#c0392b",background:"rgba(192,57,43,0.07)",border:"1px solid rgba(192,57,43,0.3)",borderRadius:8,padding:"9px 11px",lineHeight:1.6}}>
+          No ingredient list on record, so nothing could be scored. That is not the same as a clean label.
+        </div>
+      )}
+
+      {negatives.length > 0 && (
+        <div>
+          <div style={{padding:"10px 16px 6px",fontSize:11,fontWeight:700,color:t.text}}>Negatives</div>
+          {negatives.map((a,i) => <Row key={a.key} a={a} last={i===negatives.length-1 && !positives.length}/>)}
+        </div>
+      )}
+      {positives.length > 0 && (
+        <div>
+          <div style={{padding:"12px 16px 6px",fontSize:11,fontWeight:700,color:t.text}}>Positives</div>
+          {positives.map((a,i) => <Row key={a.key} a={a} last={i===positives.length-1}/>)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, brandCred, brandStat, brandCredLoading, alternatives, altLoading, diet, t, dark, onOpen, cosmeticAnalysis, ratings, ratingsPanel, onAddPhoto, photoBusy }) {
   const [showIngr, setShowIngr] = useState(false);
   const n = offData.nut;
   const hasSrv = !!offData.servingSize;
@@ -4178,6 +4480,9 @@ function OFFCard({ offData, aiSugarData, substances, insight, insightLoading, br
 
   return (
     <div style={{display:"flex",flexDirection:"column",gap:14}}>
+
+      {/* AT-A-GLANCE SCORE */}
+      {DOMAIN !== "cosmetics" && <ScoreSummaryCard offData={offData} aiSugarData={aiSugarData} ratings={ratings} t={t} dark={dark}/>}
 
       {/* PRODUCT HEADER */}
       <div style={{...card}}>
@@ -4988,21 +5293,28 @@ export default function App() {
         .replace(/\s+([,.;:])/g, "$1")
         .trim();
 
-      if (!cleaned && DECODE_URL) {
+      const gibberish = looksLikeGibberish(cleaned, r.confidence);
+
+      if ((!cleaned || gibberish) && DECODE_URL) {
         // The server pipeline preprocesses far more aggressively than the
-        // browser can, so it is worth one attempt before giving up.
+        // browser can, so it is worth one attempt before giving up — but its
+        // output goes through the same gate, since a second OCR engine can
+        // fail the same way the first one did.
         setOcrState({ busy: true, step: "trying the decode service" });
         try {
-          const r = await serverReadText(file);
-          if (r?.text) {
-            into(r.text);
+          const r2 = await serverReadText(file);
+          if (r2?.text && !looksLikeGibberish(r2.text, null)) {
+            into(r2.text);
             setOcrState({ done: true, note: "Read by the decode service. Check every line against the pack before saving." });
             return;
           }
         } catch (e) { console.warn("serverReadText:", e); }
       }
-      if (!cleaned) {
-        setOcrState({ error: "No text could be read. Try again with the panel filling the frame, flat and evenly lit." });
+      if (!cleaned || gibberish) {
+        // Never hand a scrambled read to the reader as if it were the
+        // ingredient list — a garbled string that gets waved through into the
+        // shared database is worse than an honest "try again".
+        setOcrState({ error: "This didn't read clearly — the text came out scrambled rather than misspelled. Hold the ingredient panel flat and fill the frame with just that panel, avoid glare and shadows, and make sure it's in focus, then capture again." });
         return;
       }
       into(cleaned);
@@ -6827,7 +7139,7 @@ export default function App() {
                 </div>
               </div>
             ) : selected.offData ? (
-              <OFFCard cosmeticAnalysis={selected?.cosmetic} brandStat={brandStat} onOpen={openResult} offData={selected.offData} aiSugarData={selected.aiSugarData} substances={selected.substances} insight={insight} insightLoading={insightLoading} brandCred={brandCred} brandCredLoading={brandCredLoading} alternatives={alternatives} altLoading={altLoading} diet={selected.diet||"unknown"} t={t} dark={dark}
+              <OFFCard cosmeticAnalysis={selected?.cosmetic} brandStat={brandStat} onOpen={openResult} offData={selected.offData} aiSugarData={selected.aiSugarData} substances={selected.substances} insight={insight} insightLoading={insightLoading} brandCred={brandCred} brandCredLoading={brandCredLoading} alternatives={alternatives} altLoading={altLoading} diet={selected.diet||"unknown"} ratings={ratings} t={t} dark={dark}
                 onAddPhoto={()=>photoRef.current?.click()} photoBusy={photoBusy}
                 ratingsPanel={<RatingsPanel ratings={ratings} t={t} myStars={myStars} setMyStars={setMyStars}
                   myReview={myReview} setMyReview={setMyReview} myReport={myReport} setMyReport={setMyReport}
