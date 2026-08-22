@@ -103,6 +103,26 @@ async function usdaSearch(terms, limit) {
   return (d.foods || []).map(fdcToOFF).filter(p => p.product_name && p.product_name !== "Unknown");
 }
 
+// Raw/generic foods — "onion", "cooked rice" — live in FDC's Foundation, SR
+// Legacy and Survey (FNDDS) datasets, not Branded, since a raw ingredient has
+// no packaging to carry a label. Used by the Dish Builder (see
+// components/DishBuilder.jsx) to look up anything not already in the local
+// commonIngredients.js reference table.
+async function usdaSearchGeneric(terms, limit) {
+  let d;
+  try {
+    d = await usdaJson("/foods/search", {
+      query: terms,
+      pageSize: String(Math.min(limit, 25)),
+      dataType: "Foundation,SR Legacy,Survey (FNDDS)",
+    });
+  } catch (e) {
+    if (e instanceof OffNotFound) return [];
+    throw e;
+  }
+  return (d.foods || []).map(fdcToOFF).filter(p => p.product_name && p.product_name !== "Unknown");
+}
+
 // FDC has no barcode endpoint, but gtinUpc is indexed, so searching the digits
 // and confirming an exact match is the supported way to resolve a barcode.
 async function usdaGetByCode(code) {
@@ -114,4 +134,4 @@ async function usdaGetByCode(code) {
   return hits.find(p => norm(p.code) === norm(code)) || null;
 }
 
-export { USDA_PROXY, FDC_NUTRIENTS, usdaJson, fdcToOFF, usdaSearch, usdaGetByCode };
+export { USDA_PROXY, FDC_NUTRIENTS, usdaJson, fdcToOFF, usdaSearch, usdaSearchGeneric, usdaGetByCode };

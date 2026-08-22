@@ -34,6 +34,7 @@ import { RatingsPanel } from "./components/RatingsPanel.jsx";
 import { Disclaimer } from "./components/Disclaimer.jsx";
 import { nutFor } from "./components/NutritionRow.jsx";
 import { OFFCard } from "./components/OFFCard.jsx";
+import { DishBuilder } from "./components/DishBuilder.jsx";
 
 export default function App() {
   const [input,setInput]         = useState("");
@@ -1782,14 +1783,14 @@ export default function App() {
 
       {/* ── ADD A PRODUCT ── */}
       {addOpen && (
-        <div onClick={()=>setAddOpen(false)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
-          <div onClick={e=>e.stopPropagation()} style={{background:t.bg,borderRadius:14,padding:20,maxWidth:520,width:"100%",maxHeight:"88vh",overflowY:"auto",border:`1px solid ${t.border}`}}>
+        <div onClick={()=>setAddOpen(false)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:isMobile?"flex-start":"center",justifyContent:"center",zIndex:9999,padding:isMobile?"10px 10px 0":20}}>
+          <div onClick={e=>e.stopPropagation()} style={{background:t.bg,borderRadius:14,padding:"20px 20px 14px",maxWidth:520,width:"100%",maxHeight:isMobile?"96vh":"88vh",display:"flex",flexDirection:"column",border:`1px solid ${t.border}`}}>
             <h2 style={{margin:"0 0 4px",fontSize:16,fontWeight:700,color:t.text}}>Add a product</h2>
-            <div style={{fontSize:11,color:t.textSub,lineHeight:1.6,marginBottom:14}}>
-              For products no open database has yet — regional brands, small producers, local
-              formulations. You have the pack in your hand, which makes you a better source than
-              anything we can query. Copy the label as printed.
+            <div style={{fontSize:11,color:t.textSub,lineHeight:1.5,marginBottom:12}}>
+              Not in the database yet? Copy the ingredient list exactly as printed on the pack.
             </div>
+
+            <div style={{flex:1,overflowY:"auto",minHeight:0,paddingRight:2}}>
 
             <div style={{display:"flex",gap:6,marginBottom:10}}>
               {[["food","🍽️ Food"],["cosmetics","🧴 Cosmetic"]].map(([k,l]) => (
@@ -1866,16 +1867,15 @@ export default function App() {
               {newPhoto ? `✓ Photo attached (${Math.round(newPhoto.size/1024)} KB) — tap to change` : "📷 Add a photo of the pack"}
             </button>
 
-            <div style={{fontSize:9.5,color:t.textMuted,lineHeight:1.6,margin:"6px 0 12px"}}>
-              The ingredient list is what the hazard analysis reads, so it matters most. Nutri-Score
-              and NOVA stay blank — those are computed by Open Food Facts from data this form does
-              not collect, and a guessed grade would be worse than none.
-              <br /><br />
-              Consider also adding it to <strong>openfoodfacts.org</strong>. That benefits every app
-              using the data, not just this one — here it lives only in this database.
+            <div style={{fontSize:9.5,color:t.textMuted,lineHeight:1.5,margin:"6px 0 4px"}}>
+              The ingredient list matters most — it's what gets analysed. Nutri-Score/NOVA stay
+              blank (those come from Open Food Facts, not this form). Consider also adding it at{" "}
+              <strong>openfoodfacts.org</strong> so other apps benefit too.
             </div>
 
-            <div style={{display:"flex",gap:6}}>
+            </div>
+
+            <div style={{display:"flex",gap:6,paddingTop:10,marginTop:2,borderTop:`1px solid ${t.border}`}}>
               <button onClick={submitNewProduct} disabled={!newProduct.name.trim()}
                 style={{flex:1,padding:"10px 0",fontSize:12,fontWeight:600,borderRadius:8,
                   cursor:newProduct.name.trim()?"pointer":"default",
@@ -2101,6 +2101,7 @@ export default function App() {
         {tabBtn("tracker","Tracker")}
         {tabBtn("alternatives","Alternatives")}
         {tabBtn("brands","Brand Rankings")}
+        {tabBtn("dish","Build a Dish")}
       </div>
 
       {/* ════ TRACKER TAB ════ */}
@@ -2556,6 +2557,9 @@ export default function App() {
           </div>
         );
       })()}
+
+      {/* ════ DISH BUILDER TAB ════ */}
+      {activeTab==="dish" && <DishBuilder t={t} isMobile={isMobile}/>}
 
       {/* ════ ALTERNATIVE FOODS TAB ════ */}
       {activeTab==="alternatives" && (

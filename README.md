@@ -3,7 +3,7 @@
 Scan or search a product and get its additives, contaminants and **undeclared
 substances** — things present in a product that the label does not mention.
 
-Version 10.13.
+Version 10.14.
 
 ---
 
@@ -977,3 +977,65 @@ to manual digit entry) — plus a broader pass over the Alternatives tab,
 Brand Rankings tab, dark mode, and text-based search that hadn't been
 exercised by the earlier rounds' tests. Everything rendered and behaved
 identically to before the split.
+
+## v10.14 — a dish calculator, and the Add-product Save button fixed
+
+Three reports came in together: the "Add a product" form was hard to save
+on mobile because the Save button wasn't reachable, the app has too much
+text on screen, and a way to estimate calories for a home-cooked dish (the
+example given was rice with curry) would be useful — inspired by how clean
+Yuka's product-scoring screen looks, though the ask was explicitly for a
+version grounded in this app's own scientific/reference sourcing rather
+than a copy.
+
+**Add-product Save button fix:** the form's fields and its Save/Cancel
+buttons were all inside one scrolling container, so on a small screen —
+worse once the keyboard was open — Save could end up below the fold with
+no obvious way to reach it. The buttons now sit in a fixed footer outside
+the scrolling field list, so they stay on screen the entire time you're
+filling the form in, the same layout already used successfully by the
+market-picker dialog elsewhere in the app. Confirmed with a 390×660 mobile
+viewport: the Save button's on-screen position never moves, before or after
+typing or scrolling through the fields.
+
+**Text trimmed:** the Add-product form's intro and the Nutri-Score/NOVA
+explainer at the bottom were both cut down substantially — same meaning,
+far fewer words. This round focused on the one screen with direct evidence
+(the form shown in a screenshot); a broader pass over the rest of the app's
+copy is bundled with the fuller Yuka-inspired visual redesign, deliberately
+deferred to its own round rather than rushed alongside this one.
+
+**New: Build a Dish, a calorie/macro calculator for home cooking.** A new
+tab lets you add a dish's ingredients one at a time with their weight in
+grams, and totals the calories, protein, fat, carbs and sugar as you go —
+in total and per serving. Packaged products can be scanned or searched;
+a home-cooked dish has no barcode and no declared ingredient list, so this
+is a different, purpose-built tool rather than a repurposed product search:
+
+- A local reference table (`src/lib/commonIngredients.js`) covers ~45
+  common raw ingredients — rice, dals, vegetables, oils, dairy, common
+  proteins, sweeteners, nuts — with typical per-100g calories and macros,
+  so the common case resolves instantly with no network call.
+- Anything not in that table can be searched against USDA FoodData
+  Central's generic-foods datasets (Foundation / SR Legacy / Survey), added
+  as a new `usdaSearchGeneric` alongside the existing branded-product
+  search — the existing USDA integration only searched packaged/branded
+  foods, which mostly don't carry raw ingredients like "onion" or "cooked
+  rice".
+- If neither turns up a match, manual entry (calories per 100g only) is
+  offered as a last resort, clearly labelled as a custom, unverified figure.
+- The tool is explicit about what it does not do: it does not run this
+  app's additive/hazard safety scoring on the combined dish, because that
+  analysis reads a declared ingredients list and additive tags that a home
+  recipe never has. Showing a guessed safety score would be worse than
+  showing none — the same principle already applied to Nutri-Score/NOVA in
+  the Add-product form.
+
+Verified end-to-end: added "Rice, white, cooked" (195g) and "Cooking oil"
+(14g) to a 2-serving dish and confirmed the totals card showed 377 Cal
+total / 189 Cal per serving with correct protein and sugar per serving;
+confirmed the manual-entry fallback appears for an unmatched ingredient
+name; re-ran the full existing regression suite (add-product flow, tab
+navigation, dark mode, and the barcode scanner's auto-zoom/auto-capture
+flow) to confirm nothing else was disturbed by the new tab or the modal
+restructuring.
