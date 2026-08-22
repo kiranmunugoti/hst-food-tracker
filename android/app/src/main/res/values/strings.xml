@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">HST Ingredient Tracker</string>
+    <string name="title_activity_main">HST Ingredient Tracker</string>
+    <string name="package_name">com.hst.ingredienttracker</string>
+    <string name="custom_url_scheme">com.hst.ingredienttracker</string>
+</resources>

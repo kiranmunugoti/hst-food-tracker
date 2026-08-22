@@ -3,7 +3,7 @@
 Scan or search a product and get its additives, contaminants and **undeclared
 substances** — things present in a product that the label does not mention.
 
-Version 8.0.
+Version 10.13.
 
 ---
 
@@ -753,3 +753,227 @@ fed in as a fake video device) in both a large-and-centred and a
 small-and-off-centre framing — both decoded correctly through this path with
 no native `BarcodeDetector` present, confirming the ZXing branch's ladder and
 escalation logic actually runs, not just that it compiles.
+
+## v10.10 — native scanning (Capacitor + Google ML Kit), for real parity
+
+v10.9 closed the gap *between browsers* (iOS/Firefox now get the same decode
+ladder Chrome/Android already had). It could not close the gap *between a
+browser and a native app* — a website's camera access, on every platform,
+goes through `getUserMedia` into a `<video>` element and then a JS/WASM
+decoder reading canvas pixels. A native app reads the camera's own buffer
+directly through the OS. That second gap is real and browser-side tuning
+cannot reach across it — closing it means actually shipping this as a
+packaged app, not just a better website.
+
+### What changed
+
+- `@capacitor/core`, `@capacitor/cli`, `@capacitor/ios`, `@capacitor/android`
+  and `@capacitor-mlkit/barcode-scanning` added as dependencies.
+  [ML Kit](https://developers.google.com/ml-kit/vision/barcode-scanning) is
+  Google's on-device barcode model — free, offline, actively maintained —
+  wrapped for Capacitor by `@capacitor-mlkit/barcode-scanning`.
+- `openScanner()` (`src/App.jsx`) is the new entry point behind the camera
+  button. `Capacitor.isNativePlatform()` is `false` on the plain website — that
+  build is completely unaffected and keeps using the in-browser `BarcodeScanner`
+  from v10.9. Inside a packaged app it calls `scanNative()` instead: checks/
+  requests camera permission, ensures the Google Play Services barcode module
+  is installed on Android, then calls ML Kit's `scan()` — a ready-made,
+  full-screen native scanning UI, the same category of experience as the
+  commercial scanner apps, at no license cost. A user backing out of that UI
+  (iOS rejects with `"scan canceled."`; Android may resolve with no barcode)
+  is treated as an intentional dismissal, not an error. Any real failure —
+  permission denied, the module still installing on first run — falls back to
+  the in-browser scanner rather than dead-ending.
+- `ios/` and `android/` platform folders added via `npx cap add ios
+  --packagemanager Cocoapods` / `npx cap add android`. CocoaPods, not Swift
+  Package Manager (Capacitor's newer default) — the ML Kit SDK this plugin
+  wraps only ships as a CocoaPod. The required manifest/plist entries are
+  already in place: `NSCameraUsageDescription` and an iOS 15.5 deployment
+  target (`ios/App/Podfile`) for iOS; `CAMERA` permission and the
+  `com.google.mlkit.vision.DEPENDENCIES` meta-data tag
+  (`android/app/src/main/AndroidManifest.xml`) for Android.
+
+### What still has to happen on your own machine
+
+None of this can be finished inside a cloud sandbox — building and running an
+iOS app requires Xcode on a Mac; Android requires the Android SDK (Android
+Studio is the easy way to get it). From the project root, with those tools
+installed:
+
+```bash
+npm install
+npm run build          # regenerates dist/, which cap sync copies into both platforms
+npx cap sync            # iOS: also runs `pod install` if CocoaPods is installed
+```
+
+Then either open `ios/App/App.xcworkspace` in Xcode (**not** the `.xcodeproj`
+— CocoaPods projects only build correctly from the `.xcworkspace`) and run on
+a simulator or a signed device, or open `android/` in Android Studio and run
+it there. A real device is worth it for this specifically: camera behaviour
+is where a simulator diverges most from reality.
+
+Whenever `src/` changes after that, `npm run build && npx cap sync` pushes the
+new web build into both native shells — the platform projects are not
+rebuilt from scratch, just re-synced.
+
+### What this does not change
+
+The website deployment (Vercel) is unaffected — `Capacitor.isNativePlatform()`
+is false there, so it keeps running the v10.9 in-browser scanner exactly as
+before. This is additive: the same source now produces either a website or a
+native app, and only the native app gets ML Kit.
+
+## v10.11 — one card instead of two, and an honest brand score
+
+Two fixes, both reported directly from using the app.
+
+**The Yuka-style summary was a second card.** v10.8 added a standalone score
+card (safety score, negatives, positives) that sat above the existing
+Nutrition Facts card — two blocks of overlapping information stacked on top
+of each other, which read as confusing rather than clean. `ScoreSummaryCard`
+is now `NutritionSafetyRows`, rendered *inside* the Nutrition Facts card,
+directly under its header and above the nutrient table — one card, one
+place to look. The old quick Fat/Sat.fat/Sugars/Salt row it used to sit next
+to is gone too, folded into the same negatives/positives list (a missing
+"Fat" row was added while doing this). Nothing about how the score or the
+per-substance list is computed changed — only where it's displayed.
+
+**A brand's score from one product isn't a verdict on the brand.** Scanning
+"Milk Cake" from Haldiram's — a single product with a documented substance
+not on its label — produced a raw brand score of 0/10. That's an honest
+average of the one data point the app has, but showing it unqualified next
+to "Haldiram's" reads as the app claiming a large, established brand's food
+safety is uniformly terrible, which it has no basis to claim from one
+product. The app already had a convention for this: Expert accolades and
+Community reviews get flagged `thin` and shown with a caveat when the
+sample is under a threshold (fewer than 3 for accolades, fewer than 5 for
+reviews). Brand scores now follow the same rule — `brandScoreOf()` marks a
+brand `thin` when it has fewer than 3 tracked products, and every place a
+brand score is shown (the product credibility card, the Brand Rankings tab,
+the scan-completion toast) greys out the number and adds "Too few products
+to be a verdict — indicative only" instead of presenting it as settled fact.
+The Brand Rankings "Concerning" count also now excludes thin brands, so one
+early product doesn't drag a brand into a "concerning" bucket it hasn't
+earned yet. The score itself is unchanged and still counts toward the
+brand's running average — it's the *framing* that changes until enough
+products are in.
+
+Verified end-to-end: added a test "Milk Cake" product under Haldiram's with
+three flagged additives and confirmed in a live render that (a) the safety
+score, negatives, and positives now appear inside the single Nutrition
+Facts card with no duplicate card above it, and (b) the brand row shows
+"2.3/10" in muted grey with the "too few products" caveat rather than a
+bare, alarming score.
+
+## v10.12 — the Capture button is gone; the scanner drives itself
+
+Reported: "the capture button in the app is not working." Rather than debug
+one button, the fix removes the whole idea of a button — the scanner was
+already capable of reading a barcode without help, it just wasn't being
+allowed to try hard enough on its own before waiting on a press.
+
+**What changed:**
+
+- **No more manual zoom slider.** Zoom is now stepped automatically: while
+  the scanner is escalating through its retry attempts (see below), it also
+  widens the camera's optical/digital zoom a little further with each one —
+  from whatever the lens is holding up to its maximum — so a small or
+  distant barcode gets more sensor detail without anyone dragging a slider.
+  A small read-only "Auto-zoom 2.3×" line appears once it's kicked in, purely
+  as a heads-up.
+- **No more manual Capture button.** The auto-retry ladder that was already
+  running in the background (a fast still shot every ~2.5 seconds if the
+  live video isn't resolving the code) now runs its final, full-strength
+  attempt automatically instead of waiting for a press — the same ladder of
+  contrast boosts, rotations, crops and a tiled sweep that Capture used to
+  trigger by hand.
+- **Fixed the actual dead end.** Two real bugs were found while building
+  this: first, the scanner's live status text ("Looking harder (2/4)…",
+  "Capturing — full scan…") was being set the whole time but never rendered
+  anywhere — the screen looked frozen during every retry, button or no
+  button, which is very likely why Capture *felt* broken even when it was
+  working. Second, on iPhone and Firefox specifically (the ZXing code path,
+  as opposed to Chrome/Android's native `BarcodeDetector`), the last-resort
+  "type the digits by hand" panel never actually appeared after a failed
+  capture — the message said to type the digits below, but nothing below
+  ever showed up. Both are fixed: the status line now shows live progress,
+  and the manual-digit-entry panel now appears on both code paths when the
+  automatic scan genuinely can't read a barcode.
+
+Verified end-to-end with a fake camera device and a captured copy of the
+ZXing library (this sandbox can't reach unpkg.com to load it live): opened
+the scanner, watched the status line progress through "Reading — keep the
+barcode in frame." → "Looking harder (3/4)…" → "Capturing — full scan, this
+takes a few seconds…" → the full-strength ladder's own step names, entirely
+without a button press, ending in the manual-digit-entry panel appearing on
+its own. Confirmed zero "Capture" buttons and zero zoom sliders remain
+anywhere in the DOM.
+
+## v10.13 — splitting the single 7,500-line file into modules
+
+Requested: "rewrite the whole code removing the patches." After clarifying
+scope, the chosen goal was the lowest-risk reading of that ask — not a
+rewrite of any logic, but breaking the single `src/App.jsx` (which had grown
+to roughly 7,500 lines across ten rounds of scanner, scoring and OCR fixes)
+into an organized set of files, and clearing out stale patch comments and
+dead code along the way. Behavior was required to stay identical.
+
+**What changed:**
+
+- `App.jsx` is now ~2,700 lines (imports plus the main `App` component) and
+  everything else moved out into about 24 files:
+  - `src/lib/` — config/constants (`config.js`), theme/formatting helpers
+    (`theme.js`), and the local hazard/additive/sugar reference data
+    (`hazards.js`).
+  - `src/engine/` — the cosmetics analysis engine, brand-scoring/credibility
+    logic, and the main product-analysis pipeline.
+  - `src/api/` — Open Food Facts, USDA, GitHub-backed product database,
+    Claude AI calls, market detection, filtered/cloud search, and source
+    diagnostics, each in its own file instead of interleaved together.
+  - `src/scanning/` — barcode decoding (native, ZXing, OCR, the retry
+    ladder), photo verification, and the `BarcodeScanner` component itself.
+  - `src/components/` — the product card, nutrition/safety rows, ratings
+    panel, credibility card, and other UI pieces that were previously
+    nested functions inside the one file.
+- No feature, scoring rule, or UI behavior was intentionally changed. This
+  was a structural move, not a rewrite — the same functions do the same
+  things, just organized by what they're responsible for instead of stacked
+  in declaration order in one file.
+- Stale comments and dead code left over from earlier patch rounds were
+  removed during the split (e.g. a few unused imports flagged by a
+  dependency check: `CSPI_TIERS` and a leftover `GH_TOKEN` import in
+  `App.jsx`, an unused `HEALTH_CONDITIONS` import in the ratings panel, and
+  an unused helper import in the scanner component).
+
+**Two real bugs found and fixed while verifying the split** (both were
+introduced by the mechanical extraction — cross-file dependencies that
+weren't obvious until the app was actually run):
+
+- `theme.js`'s `normKey` helper reads the current domain (food vs.
+  cosmetics) but the extracted file never imported it, so switching domains
+  threw `ReferenceError: DOMAIN is not defined`. Fixed by importing it from
+  `config.js`.
+- Two components (`NutritionSafetyRows`, the row-expand state in the main
+  product card) use React's `useState` internally but the import was
+  dropped during extraction, throwing `ReferenceError: useState is not
+  defined` the moment either rendered. Fixed by importing it from `react`
+  in both files.
+
+A handful of smaller missing-import issues (in the source-diagnostics,
+nutrition-row, ratings-panel and barcode-scanner files) were caught the same
+way, before they could surface as runtime errors, using a small
+dependency-checking script written for this pass.
+
+Verified end-to-end after the split: a clean production build (`vite
+build`, same bundle size as before the split, 453.6 kB); a full static
+check of every new file's imports against everything it actually
+references (including React hooks, which is how the two `useState` bugs
+above were caught); and the same Playwright smoke tests used to verify
+v10.11 and v10.12 — add a product and confirm the merged Nutrition Facts
+card with inline safety score/negatives/positives, confirm a thin brand's
+score still shows the "too few products" caveat, and run the full
+barcode-scanner flow (auto-zoom, auto-capture, live status text, fallback
+to manual digit entry) — plus a broader pass over the Alternatives tab,
+Brand Rankings tab, dark mode, and text-based search that hadn't been
+exercised by the earlier rounds' tests. Everything rendered and behaved
+identically to before the split.
